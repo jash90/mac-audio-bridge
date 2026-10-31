@@ -2,13 +2,30 @@ import AVFoundation
 import BridgeCore
 import Foundation
 import os
+import Synchronization
+
+/// Output gain applied to every sample before packetization: the virtual
+/// device's volume scalar, zeroed when muted. Written from the main actor
+/// (device listeners), read on the converter queue — a plain atomic, no locks
+/// on the drain path. This is how the Mac's volume keys control the iPhone's
+/// loudness: the null driver discards audio, so the tap delivers full-scale
+/// samples and the attenuation happens here.
+final class VolumeGate: @unchecked Sendable {
+    private let gain = Atomic<Float>(1)
+
+    var value: Float {
+        get { gain.load(ordering: .relaxed) }
+        set { gain.store(newValue, ordering: .relaxed) }
+    }
+}
 
 /// Drains the tap's ring buffer on a dedicated serial queue (timer every 2.5 ms),
-/// resamples to 48 kHz with `AVAudioConverter` when the tap rate differs, and emits
-/// fixed 10 ms frames as `AudioPacket`s (PCM16, 1920-byte payload). A frame is
-/// emitted in the same tick it completes — no extra queueing — and sequence and
-/// sample time advance continuously for the app's lifetime; the first packet of
-/// every run carries `.discontinuity` so the receiver resets its jitter buffer.
+/// resamples to 48 kHz with `AVAudioConverter` when the tap rate differs, applies
+/// the virtual device's volume (see `VolumeGate`), and emits fixed 10 ms frames
+/// as `AudioPacket`s (PCM16, 1920-byte payload). A frame is emitted in the same
+/// tick it completes — no extra queueing — and sequence and sample time advance
+/// continuously for the app's lifetime; the first packet of every run carries
+/// `.discontinuity` so the receiver resets its jitter buffer.
 ///
 /// Each tick drains EVERYTHING the ring holds (loop until empty), so a late
 /// timer — App Nap or timer coalescing — costs latency, not audio: the next
@@ -24,10 +41,14 @@ final class FrameConverter: @unchecked Sendable {
     var onFrame: (@Sendable (AudioPacket) -> Void)?
 
     /// Called once on the converter queue when the tap delivered only exact-zero
-    /// samples for `captureGraceInterval` after start while the default output
-    /// device was running — the signature of a denied "System Audio Recording"
+    /// samples for `captureGraceInterval` after start while the virtual device
+    /// was running somewhere — the signature of a denied "System Audio Recording"
     /// grant. Set before `start`, never swapped while running.
     var onCaptureStalled: (@Sendable () -> Void)?
+
+    /// Gain applied to emitted samples (volume scalar of the virtual device,
+    /// 0 when muted). Safe to update any time, including while running.
+    let volumeGate = VolumeGate()
 
     private static let queueLabel = "dev.jash90.MacAudioBridge.frame-converter"
     private static let inputCapacityFrames = 8_192
@@ -158,16 +179,17 @@ final class FrameConverter: @unchecked Sendable {
             self.timer = timer
 
             // Denial detection: if nothing but zeros arrives within the grace
-            // period while the default output device is playing somewhere, the
-            // "System Audio Recording" grant was denied. Runs on this queue, not
-            // in the IOProc. The generation check no-ops checks from prior runs.
+            // period while the virtual device is running somewhere (some app is
+            // playing to it), the "System Audio Recording" grant was denied.
+            // Runs on this queue, not in the IOProc. The generation check
+            // no-ops checks from prior runs.
             let generation = self.runGeneration
             self.queue.asyncAfter(deadline: .now() + Self.captureGraceInterval) { [weak self] in
                 guard let self,
                     self.isRunning,
                     self.runGeneration == generation,
                     !self.sawNonZeroSamples,
-                    isDefaultOutputDeviceRunningSomewhere()
+                    BridgeDevice.isRunningSomewhere()
                 else { return }
                 self.logger.error(
                     "Tap delivered only silence for \(Self.captureGraceInterval, privacy: .public) s — capture denied?")
@@ -304,9 +326,11 @@ final class FrameConverter: @unchecked Sendable {
         }
     }
 
-    /// Chops the staging buffer into whole 10 ms frames and hands one
-    /// `AudioPacket` per frame to `onFrame`.
+    /// Chops the staging buffer into whole 10 ms frames, applies the volume
+    /// gate's gain, and hands one `AudioPacket` per frame to `onFrame`.
     private func emitCompleteFrames() {
+        // One relaxed atomic load per drain; mute yields gain 0 (zeros out).
+        let gain = volumeGate.value
         var frameStart = 0
         while staging.count - frameStart >= Self.samplesPerFrame {
             let flags: AudioPacketFlags = pendingDiscontinuity ? [.discontinuity] : []
@@ -314,7 +338,7 @@ final class FrameConverter: @unchecked Sendable {
             let sampleTime = nextSampleTime
             let packet = staging.withUnsafeBufferPointer { buffer in
                 Self.encodeFrame(
-                    samples: buffer, offset: frameStart, flags: flags,
+                    samples: buffer, offset: frameStart, gain: gain, flags: flags,
                     sequence: sequence, sampleTime: sampleTime)
             }
             onFrame?(packet)
@@ -329,17 +353,18 @@ final class FrameConverter: @unchecked Sendable {
     }
 
     /// Converts one frame of interleaved Float32 into a PCM16 `AudioPacket`
-    /// with a little-endian Int16 payload.
+    /// with a little-endian Int16 payload, scaled by `gain` first.
     private static func encodeFrame(
         samples: UnsafeBufferPointer<Float>,
         offset: Int,
+        gain: Float,
         flags: AudioPacketFlags,
         sequence: UInt32,
         sampleTime: UInt64
     ) -> AudioPacket {
         var payload = Data(capacity: samplesPerFrame * MemoryLayout<Int16>.size)
         for i in offset..<(offset + samplesPerFrame) {
-            let clamped = min(1, max(-1, samples[i]))
+            let clamped = min(1, max(-1, samples[i] * gain))
             let value = UInt16(bitPattern: Int16(clamped * 32767)).littleEndian
             withUnsafeBytes(of: value) { bytes in
                 payload.append(contentsOf: bytes)
