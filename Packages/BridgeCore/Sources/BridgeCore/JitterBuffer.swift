@@ -16,6 +16,23 @@ public struct JitterBufferConfig: Sendable {
     public var overflowFrames = 16
 
     public init() {}
+
+    /// Low-latency preset for the 48 kHz PCM bridge stream: a 30 ms minimum
+    /// cushion, an 80 ms ceiling, and an overflow resync at 120 ms.
+    ///
+    /// `overflowFrames` (12) is an interim drift guard: until the receiver
+    /// resamples playout to the output audio clock (separate task), the
+    /// sender's and the receiver's clocks drift apart and the buffered depth
+    /// slowly ramps in one direction. The overflow drop periodically resyncs
+    /// the depth to the target, trading a small glitch for bounded latency
+    /// instead of unbounded growth.
+    public static let lowLatency: JitterBufferConfig = {
+        var config = JitterBufferConfig()
+        config.minTargetFrames = 3
+        config.maxTargetFrames = 8
+        config.overflowFrames = 12
+        return config
+    }()
 }
 
 /// One playout slot of output from the jitter buffer.
@@ -32,6 +49,8 @@ public enum JitterBufferOutput: Sendable, Equatable {
 public struct JitterBufferStats: Sendable, Equatable {
     /// Packets handed to `insert` (including duplicates and late ones).
     public var received = 0
+    /// Playout slots that returned a packet.
+    public var played = 0
     /// Frames reported missing at playout time.
     public var lost = 0
     /// Packets discarded because their playout slot had already passed.
@@ -70,7 +89,10 @@ public struct JitterBufferStats: Sendable, Equatable {
 /// and falls at most one frame per two seconds of playout.
 ///
 /// Cushion: the buffer tracks how far playout lags the newest arrival (the
-/// cushion). When a risen target demands more cushion than the current
+/// cushion), measured against an epoch anchor captured at the first insert
+/// after each reset — the sender's media clock and the receiver's arrival
+/// clock have unrelated epochs, so only the cushion's growth since the reset
+/// is meaningful. When a risen target demands more cushion than the current
 /// playing run started with, the buffer returns to `.buffering` and rebuilds
 /// it; the rebuild ends as soon as the cushion reaches
 /// `(target - 1) * frameDuration`, so the audible gap stays short. Rising
@@ -113,8 +135,13 @@ public final class JitterBuffer: @unchecked Sendable {
         var anchorMediaTime: TimeInterval = 0
         /// Arrival time of the newest insert minus the media time of the
         /// playback reference (the expected sequence while playing, the
-        /// lowest buffered sequence while rebuffering): the cushion.
+        /// lowest buffered sequence while rebuffering), relative to the epoch
+        /// offset anchored at the first insert after a reset: the cushion.
         var cushionEstimate: TimeInterval = 0
+        /// `arrival - media time` of the first insert after a reset. Sender
+        /// media time and the receiver's arrival clock have unrelated epochs,
+        /// so only the growth of the cushion since this anchor is meaningful.
+        var cushionOffset: TimeInterval?
         /// Insert counter, and the count at which a pending cushion rebuild
         /// first became due; the rebuild is debounced by insert count so a
         /// rising staircase of targets collapses into one rebuild.
@@ -238,6 +265,7 @@ public final class JitterBuffer: @unchecked Sendable {
 
             if let packet = state.buffered.removeValue(forKey: expected) {
                 state.consecutiveEmptyPops = 0
+                state.counters.played += 1
                 state.nextExpected = expected &+ 1
                 return .packet(packet)
             }
@@ -336,6 +364,11 @@ public final class JitterBuffer: @unchecked Sendable {
     /// newest arrival); while rebuffering, it is the sequence playback will
     /// restart from, so the estimate is a safe lower bound for the cushion
     /// the restart will have.
+    ///
+    /// The estimate is anchored: the epoch offset between the two clocks is
+    /// captured at the first insert after a reset and subtracted, so the
+    /// cushion measures the wall-time growth of buffered audio since the
+    /// reset regardless of when each side started its clock.
     private func updateCushionEstimate(_ state: inout State, arrivalTime: TimeInterval) {
         guard let anchorSequence = state.anchorSequence else { return }
         func mediaTime(of sequence: UInt32) -> TimeInterval {
@@ -349,7 +382,12 @@ public final class JitterBuffer: @unchecked Sendable {
             reference = lowestSequence(state.buffered)
         }
         guard let reference else { return }
-        state.cushionEstimate = arrivalTime - mediaTime(of: reference)
+        if let offset = state.cushionOffset {
+            state.cushionEstimate = arrivalTime - mediaTime(of: reference) - offset
+        } else {
+            state.cushionOffset = arrivalTime - mediaTime(of: reference)
+            state.cushionEstimate = 0
+        }
     }
 
     /// Lowest buffered sequence, wrap-around aware. Linear scan; the depth is
@@ -378,6 +416,7 @@ public final class JitterBuffer: @unchecked Sendable {
         state.anchorSequence = nil
         state.anchorMediaTime = 0
         state.cushionEstimate = 0
+        state.cushionOffset = nil
         state.pendingRiseInsert = nil
     }
 }

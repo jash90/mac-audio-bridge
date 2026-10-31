@@ -3,17 +3,20 @@ import BridgeCore
 import Foundation
 import os
 
-/// Drains the tap's ring buffer on a dedicated serial queue (timer every 5 ms),
+/// Drains the tap's ring buffer on a dedicated serial queue (timer every 2.5 ms),
 /// resamples to 48 kHz with `AVAudioConverter` when the tap rate differs, and emits
-/// fixed 10 ms frames as interleaved little-endian Int16 `Data` (1920 bytes).
+/// fixed 10 ms frames as `AudioPacket`s (PCM16, 1920-byte payload). A frame is
+/// emitted in the same tick it completes — no extra queueing — and sequence and
+/// sample time advance continuously for the app's lifetime; the first packet of
+/// every run carries `.discontinuity` so the receiver resets its jitter buffer.
 ///
 /// All mutable state is confined to `queue`. Must be started/stopped from the main
 /// actor (like all owners in this app).
 final class FrameConverter: @unchecked Sendable {
-    /// Called on the converter queue with one complete frame. `@Sendable` so the
-    /// closure carries no actor isolation when invoked off the main actor.
-    /// Set before `start`, never swapped while running.
-    var onFrame: (@Sendable (Data) -> Void)?
+    /// Called on the converter queue with one complete packetized frame.
+    /// `@Sendable` so the closure carries no actor isolation when invoked off
+    /// the main actor. Set before `start`, never swapped while running.
+    var onFrame: (@Sendable (AudioPacket) -> Void)?
 
     /// Called once on the converter queue when the tap delivered only exact-zero
     /// samples for `captureGraceInterval` after start while the default output
@@ -23,7 +26,9 @@ final class FrameConverter: @unchecked Sendable {
 
     private static let queueLabel = "dev.jash90.MacAudioBridge.frame-converter"
     private static let inputCapacityFrames = 8_192
-    private static let timerIntervalMs = 5
+    /// 2.5 ms drain tick: a 10 ms frame waits at most one extra tick once complete.
+    private static let timerInterval = DispatchTimeInterval.milliseconds(2_500)
+    private static let timerLeeway = DispatchTimeInterval.microseconds(500)
     private static let captureGraceInterval: TimeInterval = 3
 
     private let queue = DispatchQueue(label: FrameConverter.queueLabel)
@@ -41,6 +46,12 @@ final class FrameConverter: @unchecked Sendable {
     private var inputCapacitySamples = 0
     private var outputBuffer: AVAudioPCMBuffer?
     private var staging = [Float]()
+    /// Sequence/sample time of the next emitted packet. Never reset between
+    /// runs, so the stream is continuous across restarts; restarts are marked
+    /// with `.discontinuity` instead.
+    private var nextSequence: UInt32 = 0
+    private var nextSampleTime: UInt64 = 0
+    private var pendingDiscontinuity = false
 
     /// Samples (interleaved) per emitted frame: 480 frames × 2 channels.
     private static let samplesPerFrame = AudioFormat.samplesPerFrame * AudioFormat.channelCount
@@ -62,6 +73,8 @@ final class FrameConverter: @unchecked Sendable {
             self.sawNonZeroSamples = false
             self.runGeneration += 1
             self.staging.removeAll(keepingCapacity: true)
+            // The first packet of every run tells the receiver to reset.
+            self.pendingDiscontinuity = true
 
             let targetFormat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,
@@ -116,9 +129,9 @@ final class FrameConverter: @unchecked Sendable {
             self.isRunning = true
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(
-                deadline: .now() + .milliseconds(Self.timerIntervalMs),
-                repeating: .milliseconds(Self.timerIntervalMs),
-                leeway: .milliseconds(1))
+                deadline: .now() + Self.timerInterval,
+                repeating: Self.timerInterval,
+                leeway: Self.timerLeeway)
             timer.setEventHandler { [weak self] in
                 self?.drainOnce()
             }
@@ -235,14 +248,23 @@ final class FrameConverter: @unchecked Sendable {
         }
     }
 
-    /// Chops the staging buffer into whole 10 ms frames and hands them to `onFrame`.
+    /// Chops the staging buffer into whole 10 ms frames and hands one
+    /// `AudioPacket` per frame to `onFrame`.
     private func emitCompleteFrames() {
         var frameStart = 0
         while staging.count - frameStart >= Self.samplesPerFrame {
-            let frameData = staging.withUnsafeBufferPointer { buffer in
-                Self.encodeFrame(samples: buffer, offset: frameStart)
+            let flags: AudioPacketFlags = pendingDiscontinuity ? [.discontinuity] : []
+            let sequence = nextSequence
+            let sampleTime = nextSampleTime
+            let packet = staging.withUnsafeBufferPointer { buffer in
+                Self.encodeFrame(
+                    samples: buffer, offset: frameStart, flags: flags,
+                    sequence: sequence, sampleTime: sampleTime)
             }
-            onFrame?(frameData)
+            onFrame?(packet)
+            nextSequence = nextSequence &+ 1
+            nextSampleTime &+= UInt64(AudioFormat.samplesPerFrame)
+            pendingDiscontinuity = false
             frameStart += Self.samplesPerFrame
         }
         if frameStart > 0 {
@@ -250,16 +272,28 @@ final class FrameConverter: @unchecked Sendable {
         }
     }
 
-    /// Converts one frame of interleaved Float32 into little-endian Int16 `Data`.
-    private static func encodeFrame(samples: UnsafeBufferPointer<Float>, offset: Int) -> Data {
-        var data = Data(capacity: samplesPerFrame * MemoryLayout<Int16>.size)
+    /// Converts one frame of interleaved Float32 into a PCM16 `AudioPacket`
+    /// with a little-endian Int16 payload.
+    private static func encodeFrame(
+        samples: UnsafeBufferPointer<Float>,
+        offset: Int,
+        flags: AudioPacketFlags,
+        sequence: UInt32,
+        sampleTime: UInt64
+    ) -> AudioPacket {
+        var payload = Data(capacity: samplesPerFrame * MemoryLayout<Int16>.size)
         for i in offset..<(offset + samplesPerFrame) {
             let clamped = min(1, max(-1, samples[i]))
             let value = UInt16(bitPattern: Int16(clamped * 32767)).littleEndian
             withUnsafeBytes(of: value) { bytes in
-                data.append(contentsOf: bytes)
+                payload.append(contentsOf: bytes)
             }
         }
-        return data
+        return AudioPacket(
+            codec: .pcm16,
+            flags: flags,
+            sequence: sequence,
+            sampleTime: sampleTime,
+            payload: payload)
     }
 }

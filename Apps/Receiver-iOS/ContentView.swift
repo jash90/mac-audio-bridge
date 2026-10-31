@@ -1,8 +1,9 @@
+import AVFoundation
 import BridgeCore
-import Combine
 import SwiftUI
 
-/// Wires the UDP receiver to the audio output and exposes UI state.
+/// Wires the UDP receiver and audio output to the shared jitter buffer and
+/// exposes UI state.
 @MainActor
 final class ReceiverModel: ObservableObject {
     enum Phase: Equatable {
@@ -13,18 +14,24 @@ final class ReceiverModel: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var ipAddress: String?
-    @Published private(set) var packetsPerSecond = 0
-    @Published private(set) var bufferedMilliseconds = 0
+    @Published private(set) var bufferMilliseconds = 0
+    @Published private(set) var targetMilliseconds = 0
+    @Published private(set) var outputMilliseconds = 0
+    @Published private(set) var totalMilliseconds = 0
+    @Published private(set) var lostPercent: Double = 0
+    @Published private(set) var lateCount = 0
+    @Published private(set) var rebufferCount = 0
     @Published private(set) var underrunCount = 0
+    @Published private(set) var malformedCount = 0
+    @Published private(set) var outputRoute: String?
 
-    /// ≥ 1 s of 48 kHz interleaved stereo.
-    private let ring = SPSCRingBuffer(capacity: 131_072)
+    private let jitterBuffer = JitterBuffer(config: .lowLatency)
     private let receiver: UDPReceiver
     private let output: AudioOutput
 
     init() {
-        receiver = UDPReceiver(ring: ring)
-        output = AudioOutput(ring: ring)
+        receiver = UDPReceiver(jitterBuffer: jitterBuffer)
+        output = AudioOutput(jitterBuffer: jitterBuffer)
     }
 
     /// Starts listening and audio playback (called automatically on launch).
@@ -40,13 +47,29 @@ final class ReceiverModel: ObservableObject {
         }
     }
 
-    /// Pulls counter snapshots for the UI — call ~1 Hz.
+    /// Pulls latency and loss snapshots for the UI — call 4×/s.
     func refreshStats() {
-        packetsPerSecond = receiver.takePerSecondPackets()
-        bufferedMilliseconds = Int(
-            Double(ring.availableToRead / AudioFormat.channelCount)
-                / AudioFormat.sampleRate * 1000)
-        underrunCount = output.underrunCount
+        let stats = jitterBuffer.stats
+        let session = AVAudioSession.sharedInstance()
+
+        // Jitter-buffer depth plus the frame currently being rendered.
+        let bufferFrames = Double(stats.depthFrames) + output.partiallyPlayedFrames
+        bufferMilliseconds = Int(
+            (bufferFrames * Double(AudioFormat.frameDurationMs)).rounded())
+        targetMilliseconds = stats.targetFrames * AudioFormat.frameDurationMs
+        // On Bluetooth this includes the headphone link's own latency.
+        let outputSeconds = session.outputLatency + session.ioBufferDuration
+        outputMilliseconds = Int((outputSeconds * 1000).rounded())
+        totalMilliseconds = bufferMilliseconds + outputMilliseconds
+
+        let playoutSlots = stats.played + stats.lost
+        lostPercent = playoutSlots > 0
+            ? Double(stats.lost) / Double(playoutSlots) * 100 : 0
+        lateCount = stats.late
+        rebufferCount = stats.rebuffers
+        underrunCount = stats.underruns
+        malformedCount = receiver.malformedCount
+        outputRoute = session.currentRoute.outputs.first?.portName
     }
 
     /// The device's Wi-Fi IPv4 address (interface en0), shown so the user can type
@@ -108,7 +131,7 @@ struct ContentView: View {
         .task {
             model.start()
         }
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+        .onReceive(Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()) { _ in
             model.refreshStats()
         }
     }
@@ -129,9 +152,18 @@ struct ContentView: View {
 
     private var stats: some View {
         VStack(spacing: 6) {
-            statRow("Packets", "\(model.packetsPerSecond)/s")
-            statRow("Buffered", "\(model.bufferedMilliseconds) ms")
+            statRow("Buffer", "\(model.bufferMilliseconds) ms")
+            statRow("Target", "\(model.targetMilliseconds) ms")
+            statRow("Output", "\(model.outputMilliseconds) ms")
+            statRow("Total", "≈\(model.totalMilliseconds) ms (+ network)")
+            statRow("Lost", String(format: "%.1f %%", model.lostPercent))
+            statRow("Late", "\(model.lateCount)")
+            statRow("Rebuffers", "\(model.rebufferCount)")
             statRow("Underruns", "\(model.underrunCount)")
+            statRow("Malformed", "\(model.malformedCount)")
+            if let route = model.outputRoute {
+                statRow("Route", route)
+            }
         }
         .font(.callout.monospacedDigit())
     }

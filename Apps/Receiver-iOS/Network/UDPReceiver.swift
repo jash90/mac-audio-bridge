@@ -4,44 +4,37 @@ import Network
 import os
 import Synchronization
 
-/// Packet counter shared between the network queue (writer) and the UI (reader).
-final class PacketStats: @unchecked Sendable {
-    private let packets = Atomic<Int>(0)
-
-    func add() {
-        packets.wrappingAdd(1, ordering: .relaxed)
-    }
-
-    /// Returns the count since the last call and resets it to zero.
-    func takePerSecondCount() -> Int {
-        packets.exchange(0, ordering: .acquiringAndReleasing)
-    }
-}
-
-/// Listens for UDP datagrams on port 49000. Each datagram is one 10 ms frame of
-/// interleaved little-endian Int16; it is decoded to Float32 and appended to the
-/// shared ring buffer. Start/stop run on the main actor, callbacks are confined
-/// to one serial queue.
+/// Listens for UDP datagrams on port 49000. Each datagram is one `AudioPacket`
+/// (10 ms of interleaved little-endian Int16 PCM); decoded packets are inserted
+/// into the jitter buffer stamped with a monotonic arrival time. Datagrams that
+/// fail `AudioPacket.decode`, or that carry an unexpected codec or payload
+/// size, are dropped and counted as malformed. Start/stop run on the main
+/// actor, callbacks are confined to one serial queue.
 final class UDPReceiver: @unchecked Sendable {
     static let port: UInt16 = 49_000
+    /// Expected payload of one PCM16 stereo frame: 480 frames × 2 channels × 2 bytes.
+    private static let expectedPayloadBytes =
+        AudioFormat.samplesPerFrame * AudioFormat.channelCount * MemoryLayout<Int16>.size
 
-    private let ring: SPSCRingBuffer
+    private let jitterBuffer: JitterBuffer
     private let queue = DispatchQueue(label: "dev.jash90.MacAudioBridge.udp-receiver")
     private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "udp-receiver")
-    let packetStats = PacketStats()
+    private let malformedDatagrams = Atomic<Int>(0)
+    /// Arrival-clock epoch. `ContinuousClock` never goes backwards, which the
+    /// jitter buffer's interarrival estimates rely on.
+    private let clockStart = ContinuousClock.now
 
     // State confined to `queue`:
     private var listener: NWListener?
     private var connections: [NWConnection] = []
-    private var decodeScratch: UnsafeMutablePointer<Float>?
-    private static let scratchSamples = 4_096
 
-    init(ring: SPSCRingBuffer) {
-        self.ring = ring
+    init(jitterBuffer: JitterBuffer) {
+        self.jitterBuffer = jitterBuffer
     }
 
-    deinit {
-        decodeScratch?.deallocate()
+    /// Datagrams dropped since launch because they were not a valid audio packet.
+    var malformedCount: Int {
+        malformedDatagrams.load(ordering: .relaxed)
     }
 
     func start() throws {
@@ -71,11 +64,6 @@ final class UDPReceiver: @unchecked Sendable {
             connections.forEach { $0.cancel() }
             connections.removeAll()
         }
-    }
-
-    /// Returns and resets the packets-per-second count for the UI.
-    func takePerSecondPackets() -> Int {
-        packetStats.takePerSecondCount()
     }
 
     // MARK: - Queue-confined implementation
@@ -119,21 +107,28 @@ final class UDPReceiver: @unchecked Sendable {
     }
 
     private func ingest(_ data: Data) {
-        packetStats.add()
-        let sampleCount = data.count / MemoryLayout<Int16>.size
-        guard sampleCount > 0 else { return }
-        if decodeScratch == nil {
-            decodeScratch = UnsafeMutablePointer<Float>.allocate(capacity: Self.scratchSamples)
-            decodeScratch?.initialize(repeating: 0, count: Self.scratchSamples)
+        let packet: AudioPacket
+        do {
+            packet = try AudioPacket.decode(data)
+        } catch {
+            countMalformed()
+            return
         }
-        guard let scratch = decodeScratch else { return }
-        let toDecode = min(sampleCount, Self.scratchSamples)
-        data.withUnsafeBytes { raw in
-            for i in 0..<toDecode {
-                let rawValue = raw.loadUnaligned(fromByteOffset: i * MemoryLayout<Int16>.size, as: Int16.self)
-                scratch[i] = Float(Int16(littleEndian: rawValue)) / 32768
-            }
+        guard packet.codec == .pcm16, packet.payload.count == Self.expectedPayloadBytes else {
+            countMalformed()
+            return
         }
-        ring.write(scratch, count: toDecode)
+        jitterBuffer.insert(packet, arrivalTime: elapsedSeconds())
+    }
+
+    private func countMalformed() {
+        malformedDatagrams.wrappingAdd(1, ordering: .relaxed)
+    }
+
+    /// Seconds elapsed on the monotonic arrival clock.
+    private func elapsedSeconds() -> TimeInterval {
+        let elapsed = ContinuousClock.now - clockStart
+        return Double(elapsed.components.seconds)
+            + Double(elapsed.components.attoseconds) * 1e-18
     }
 }

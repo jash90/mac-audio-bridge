@@ -56,6 +56,16 @@ struct JitterBufferTests {
 
     // MARK: - Buffering and playback
 
+    @Test("lowLatency preset is valid: min ≤ max < overflow")
+    func lowLatencyPresetIsValid() {
+        let config = JitterBufferConfig.lowLatency
+        #expect(config.minTargetFrames == 3)
+        #expect(config.maxTargetFrames == 8)
+        #expect(config.overflowFrames == 12)
+        #expect(config.minTargetFrames <= config.maxTargetFrames)
+        #expect(config.maxTargetFrames < config.overflowFrames)
+    }
+
     @Test("Stays in buffering until the depth reaches the target")
     func staysBufferingUntilDepthReachesTarget() {
         let buffer = JitterBuffer()
