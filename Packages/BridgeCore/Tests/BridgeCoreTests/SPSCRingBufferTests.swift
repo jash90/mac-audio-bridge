@@ -91,6 +91,48 @@ struct SPSCRingBufferTests {
         #expect(read(4, from: ring) == [1, 2, 3, 4])
     }
 
+    // MARK: - Drop counters
+
+    @Test
+    func overflowedWritesCountDroppedSamples() {
+        let ring = SPSCRingBuffer(capacity: 4)
+        #expect(write([1, 2, 3], to: ring) == 3)
+        // One slot free: two of the three offered samples are dropped.
+        #expect(write([4, 5, 6], to: ring) == 1)
+
+        #expect(ring.writeCallCount == 2)
+        #expect(ring.storedSampleCount == 4)
+        #expect(ring.droppedSampleCount == 2)
+        // Captured = stored + dropped is everything the producer offered.
+        #expect(ring.storedSampleCount + ring.droppedSampleCount == 6)
+    }
+
+    @Test("A write into a full ring counts the whole chunk as dropped")
+    func fullWriteCountsWholeChunkDropped() {
+        let ring = SPSCRingBuffer(capacity: 8)
+        let input: [Float] = (0..<8).map(Float.init)
+        #expect(write(input, to: ring) == 8)
+        // Ring full: everything is dropped, stored stays put.
+        #expect(write([9, 10, 11, 12], to: ring) == 0)
+
+        #expect(ring.writeCallCount == 2)
+        #expect(ring.storedSampleCount == 8)
+        #expect(ring.droppedSampleCount == 4)
+    }
+
+    @Test("A consumer keeping pace keeps the drop counter at zero")
+    func steadyStreamingDropsNothing() {
+        let ring = SPSCRingBuffer(capacity: 8)
+        for batch in 0..<10 {
+            let input: [Float] = (0..<4).map { Float(batch * 4 + $0) }
+            #expect(write(input, to: ring) == 4)
+            #expect(read(4, from: ring) == input)
+        }
+        #expect(ring.writeCallCount == 10)
+        #expect(ring.storedSampleCount == 40)
+        #expect(ring.droppedSampleCount == 0)
+    }
+
     // MARK: - Reset
 
     @Test

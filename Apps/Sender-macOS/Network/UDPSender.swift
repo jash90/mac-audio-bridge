@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import os
+import Synchronization
 
 /// Sends one UDP datagram per audio frame to `host:49000`. Recreates the connection
 /// when the host changes. Thread-safe: `send` runs on the converter queue, the other
@@ -14,6 +15,10 @@ final class UDPSender: @unchecked Sendable {
     private var host: String?
     private var isReady = false
     private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "udp-sender")
+    /// Cumulative datagrams/bytes handed to the connection (diagnostics for
+    /// the stats log; relaxed readouts).
+    private let sentDatagrams = Atomic<Int>(0)
+    private let sentBytes = Atomic<Int>(0)
 
     /// Points the sender at `host`, recreating the connection when it changes.
     /// An empty string tears the connection down.
@@ -65,9 +70,18 @@ final class UDPSender: @unchecked Sendable {
         let connection = isReady ? connection : nil
         lock.unlock()
         guard let connection else { return }
+        sentDatagrams.wrappingAdd(1, ordering: .relaxed)
+        sentBytes.wrappingAdd(data.count, ordering: .relaxed)
         connection.send(content: data, completion: .contentProcessed { _ in
             // Errors surface through the state handler; per-frame logging would spam.
         })
+    }
+
+    /// Datagrams and bytes sent since the last call, then resets the counters.
+    func takeSentCounts() -> (datagrams: Int, bytes: Int) {
+        let datagrams = sentDatagrams.exchange(0, ordering: .acquiringAndReleasing)
+        let bytes = sentBytes.exchange(0, ordering: .acquiringAndReleasing)
+        return (datagrams, bytes)
     }
 
     func cancel() {
