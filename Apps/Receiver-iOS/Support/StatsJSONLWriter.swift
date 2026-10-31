@@ -34,6 +34,21 @@ struct StatsLine: Codable, Sendable {
     var latencyMode: String
     /// Datagrams dropped as malformed since launch.
     var malformed: Int
+    /// Frames skipped by the jitter buffer's latency trim since launch.
+    var trimmed: Int
+    /// Whether the audio engine's IO is running at the sample time.
+    var engineRunning: Bool
+    /// Render callbacks per second (0 = nothing pulls the jitter buffer).
+    var renderCallsPerSec: Int
+    /// Successful engine restarts since launch (all causes, watchdog included).
+    var engineRestarts: Int
+    /// Hardware sample rate the session runs at (48000 = no resampling).
+    var sessionSampleRate: Double
+    /// IO buffer duration the session granted, ms.
+    var ioBufferMs: Double
+    /// Audio route changes and interruptions since launch.
+    var routeChanges: Int
+    var interruptions: Int
 }
 
 /// Appends one JSON line per second to `Documents/stats.jsonl` on a utility

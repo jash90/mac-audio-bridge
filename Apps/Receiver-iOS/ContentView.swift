@@ -25,10 +25,14 @@ final class ReceiverModel: ObservableObject {
     @Published private(set) var malformedCount = 0
     @Published private(set) var outputRoute: String?
     @Published private(set) var latencyMode: JitterLatencyMode = .balanced
+    @Published private(set) var engineRunning = false
+    @Published private(set) var engineRestarts = 0
 
     private let jitterBuffer = JitterBuffer(config: .latency(.balanced))
     private let receiver: UDPReceiver
-    private let output: AudioOutput
+    /// Owns the audio engine and keeps it running across interruptions,
+    /// route changes and media-services resets.
+    private let playback: PlaybackController
     private let statsWriter = StatsJSONLWriter()
 
     /// Model-owned stats loop (4 Hz UI refresh, 1 Hz JSONL line). It must NOT
@@ -43,7 +47,7 @@ final class ReceiverModel: ObservableObject {
 
     init() {
         receiver = UDPReceiver(jitterBuffer: jitterBuffer)
-        output = AudioOutput(jitterBuffer: jitterBuffer)
+        playback = PlaybackController(jitterBuffer: jitterBuffer)
     }
 
     deinit {
@@ -51,11 +55,14 @@ final class ReceiverModel: ObservableObject {
     }
 
     /// Starts listening and audio playback (called automatically on launch).
+    /// Playback never fails the start: the controller retries on its own, so
+    /// a session that cannot be activated right now (locked launch, call in
+    /// progress) recovers without user action.
     func start() {
         guard phase != .running else { return }
         ipAddress = Self.wiFiIPv4Address()
+        playback.start()
         do {
-            try output.start()
             try receiver.start()
             phase = .running
             startStatsLoop()
@@ -99,7 +106,7 @@ final class ReceiverModel: ObservableObject {
         let session = AVAudioSession.sharedInstance()
 
         // Jitter-buffer depth plus the frame currently being rendered.
-        let bufferFrames = Double(stats.depthFrames) + output.partiallyPlayedFrames
+        let bufferFrames = Double(stats.depthFrames) + playback.partiallyPlayedFrames
         bufferMilliseconds = Int(
             (bufferFrames * Double(AudioFormat.frameDurationMs)).rounded())
         targetMilliseconds = stats.targetFrames * AudioFormat.frameDurationMs
@@ -116,6 +123,8 @@ final class ReceiverModel: ObservableObject {
         underrunCount = stats.underruns
         malformedCount = receiver.malformedCount
         outputRoute = session.currentRoute.outputs.first?.portName
+        engineRunning = playback.isEngineRunning
+        engineRestarts = playback.snapshot.engineRestarts
     }
 
     /// Writes one JSON line of telemetry to `Documents/stats.jsonl` — called
@@ -126,6 +135,7 @@ final class ReceiverModel: ObservableObject {
         let stats = jitterBuffer.stats
         let session = AVAudioSession.sharedInstance()
         let outputSeconds = session.outputLatency + session.ioBufferDuration
+        let audio = playback.snapshot
         statsWriter.append(
             StatsLine(
                 timestamp: Date().timeIntervalSince1970,
@@ -149,7 +159,15 @@ final class ReceiverModel: ObservableObject {
                 outputMs: outputSeconds * 1000,
                 route: session.currentRoute.outputs.first?.portName ?? "",
                 latencyMode: latencyMode.rawValue,
-                malformed: receiver.malformedCount
+                malformed: receiver.malformedCount,
+                trimmed: stats.trimmed,
+                engineRunning: audio.engineRunning,
+                renderCallsPerSec: audio.renderCallsPerSecond,
+                engineRestarts: audio.engineRestarts,
+                sessionSampleRate: audio.sessionSampleRate,
+                ioBufferMs: audio.ioBufferMilliseconds,
+                routeChanges: audio.routeChanges,
+                interruptions: audio.interruptions
             )
         )
     }
@@ -253,6 +271,9 @@ struct ContentView: View {
             statRow("Rebuffers", "\(model.rebufferCount)")
             statRow("Underruns", "\(model.underrunCount)")
             statRow("Malformed", "\(model.malformedCount)")
+            statRow(
+                "Audio engine",
+                "\(model.engineRunning ? "running" : "stopped") (restarts \(model.engineRestarts))")
             if let route = model.outputRoute {
                 statRow("Route", route)
             }

@@ -254,6 +254,7 @@ struct JitterBufferSimulationTests {
                 + "rebuffers(after warm-up)=\(rebuffers), "
                 + "bufferingPops(after warm-up)=\(bufferingPops), "
                 + "finalTarget=\(report.final.targetFrames), "
+                + "trimmed=\(report.final.trimmed), "
                 + "jitter=\(String(format: "%.4f", report.final.jitterSeconds)) s"
         )
 
@@ -318,6 +319,38 @@ struct JitterBufferSimulationTests {
         #expect(latePercent <= 1.0)
     }
 
+    @Test("After a 0-200 ms transient calms down, target and real depth both return to the floor")
+    func transientDecaysTargetAndDepth() {
+        // 10 s of 0-200 ms jitter, then 80 s of 0-10 ms jitter, balanced mode.
+        let report = simulate(
+            seed: 0x5EED_C0FF_EE05,
+            maxDelay: 0.200,
+            dropRate: 0.01,
+            duration: 90,
+            stepAt: 10,
+            maxDelayAfterStep: 0.010,
+            config: .latency(.balanced)
+        )
+        let framesAfterGrace = report.framesSent - report.graceFrame
+        let lateAfterGrace = report.final.late - report.atGrace.late
+        let latePercent = Double(lateAfterGrace) / Double(framesAfterGrace) * 100
+
+        print(
+            "simulation[transient]: maxTarget=\(report.maxTargetAfterWarmUp), "
+                + "finalTarget=\(report.final.targetFrames), "
+                + "finalDepth=\(report.final.depthFrames), "
+                + "trimmed=\(report.final.trimmed), "
+                + "late(after grace)=\(lateAfterGrace) (\(String(format: "%.3f", latePercent))%)"
+        )
+
+        let floor = JitterBufferConfig.latency(.balanced).minTargetFrames
+        #expect(report.maxTargetAfterWarmUp >= 18)  // the transient did raise it
+        #expect(report.final.targetFrames == floor)
+        // The latency itself follows: depth within target + trim slack.
+        #expect(report.final.depthFrames <= floor + 2)
+        #expect(latePercent <= 0.5)
+    }
+
     @Test("Wi-Fi power-save bursts (100 ms batches, 60-120 ms holds) survive in balanced mode")
     func wiFiBurstDeliverySurvives() {
         let report = simulateWiFiBurst(seed: 0x5EED_C0FF_EE04)
@@ -337,6 +370,7 @@ struct JitterBufferSimulationTests {
                 + "rebuffers(after warm-up)=\(report.final.rebuffers - report.atWarmUp.rebuffers), "
                 + "bufferingPops(after warm-up)=\(report.final.bufferingPops - report.atWarmUp.bufferingPops), "
                 + "finalTarget=\(report.final.targetFrames), "
+                + "trimmed=\(report.final.trimmed), "
                 + "jitter=\(String(format: "%.4f", report.final.jitterSeconds)) s"
         )
 
