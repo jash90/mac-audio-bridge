@@ -35,8 +35,15 @@ struct MenuView: View {
 
             qualityPicker
 
+            remoteStatus
+
             if controller.defaultOutputIsOurs {
-                Button("Switch back to \(controller.previousDeviceName ?? "previous device")") {
+                if controller.releasedHold {
+                    Button("Resume streaming to iPhone") {
+                        controller.resumeAfterRelease()
+                    }
+                }
+                Button("Switch back to \(controller.previousDeviceName ?? "built-in output")") {
                     controller.switchBackToPreviousOutput()
                 }
                 .disabled(!controller.hasPreviousDevice)
@@ -60,6 +67,37 @@ struct MenuView: View {
         }
         .padding(12)
         .frame(width: 340)
+    }
+
+    // MARK: - Remote control
+
+    /// Who controls the stream: a phone, or another Mac that took it over.
+    @ViewBuilder
+    private var remoteStatus: some View {
+        if let phone = controller.controllingPhone, controller.isStreaming {
+            Label("Controlled from \(phone)", systemImage: "iphone.radiowaves.left.and.right")
+                .font(.footnote)
+                .foregroundStyle(.green)
+        }
+        if let other = controller.usedBy {
+            Label("iPhone used by \(other)", systemImage: "arrow.left.arrow.right")
+                .font(.footnote)
+                .foregroundStyle(.orange)
+        }
+        switch controller.controlServerStatus {
+        case .localNetworkDenied:
+            Text("The iPhone cannot find this Mac — allow Local Network for Mac Audio Bridge in System Settings")
+                .font(.footnote)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        case .failed(let message):
+            Text("Remote control unavailable: \(message)")
+                .font(.footnote)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        case .starting, .advertising:
+            EmptyView()
+        }
     }
 
     // MARK: - Receiver picker

@@ -75,6 +75,10 @@ struct StatsLine: Codable, Sendable {
     /// by Opus packet-loss concealment, since launch.
     var decodeErrors: Int
     var opusPlcFrames: Int
+    /// Name of the active Mac ("" = none).
+    var source: String
+    /// Datagrams from non-active Macs dropped since launch.
+    var foreignDropped: Int
 }
 
 /// Appends one JSON line per second to `Documents/stats.jsonl` on a utility

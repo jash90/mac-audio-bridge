@@ -29,6 +29,12 @@ private let receiverKeepaliveEnabled = true
 /// carry an unexpected payload size for their codec, are dropped and counted
 /// as malformed. Start/stop run on the main actor, callbacks are confined to one
 /// serial queue.
+///
+/// Exactly one source plays: every datagram carries its Mac's source tag
+/// and passes the `SourceGate` (mode set by the main actor from the
+/// `SourceArbiter`). Datagrams of other sources are dropped and counted;
+/// the first datagram of a newly admitted source has its primary marked as a
+/// discontinuity, so the jitter buffer resets and the reader crossfades.
 final class UDPReceiver: @unchecked Sendable {
     static let port: UInt16 = ReceiverService.preferredPort
     private static let listenerRestartDelay: TimeInterval = 2
@@ -60,6 +66,13 @@ final class UDPReceiver: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dev.jash90.MacAudioBridge.udp-receiver", qos: .userInteractive)
     private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "udp-receiver")
     private let malformedDatagrams = Atomic<Int>(0)
+    /// Datagrams dropped because they came from a non-active source.
+    private let foreignDatagrams = Atomic<Int>(0)
+    /// Source filter; locked briefly on the receive queue and by `setGateMode`.
+    private let gate = Mutex(SourceGate())
+    /// Called on the receive queue when the gate adopted a stream by itself
+    /// (nothing was active). Set before `start`, never swapped afterwards.
+    var onSourceAdopted: (@Sendable (UInt32) -> Void)?
     /// Arrival-clock epoch. `ContinuousClock` never goes backwards, which the
     /// jitter buffer's interarrival estimates rely on.
     private let clockStart = ContinuousClock.now
@@ -103,6 +116,23 @@ final class UDPReceiver: @unchecked Sendable {
     /// Datagrams dropped since launch because they were not a valid audio packet.
     var malformedCount: Int {
         malformedDatagrams.load(ordering: .relaxed)
+    }
+
+    /// Datagrams dropped since launch because another source is active.
+    var foreignCount: Int {
+        foreignDatagrams.load(ordering: .relaxed)
+    }
+
+    /// Which source tags are let through (from the arbiter, main actor).
+    func setGateMode(_ mode: SourceGateMode) {
+        gate.withLock { $0.setMode(mode) }
+    }
+
+    /// Seconds since the last accepted audio datagram (nil = none yet).
+    func secondsSinceLastAudio() -> TimeInterval? {
+        queue.sync {
+            lastPacketArrival.map { elapsedSeconds() - $0 }
+        }
     }
 
     func start() throws {
@@ -310,8 +340,23 @@ final class UDPReceiver: @unchecked Sendable {
             countMalformed()
             return false
         }
+        let admission = gate.withLock { $0.admit(tag: datagram.source, hasPrimary: datagram.hasPrimary) }
+        guard case .accept(let newStream, let adopted) = admission else {
+            foreignDatagrams.wrappingAdd(1, ordering: .relaxed)
+            return false
+        }
+        if adopted {
+            onSourceAdopted?(datagram.source)
+        }
         let arrival = elapsedSeconds()
-        let packets = datagram.packets()
+        var packets = datagram.packets()
+        if newStream {
+            // Another Mac's stream (or the first one): a fresh sequence
+            // space — reset the buffer, crossfade at the reader.
+            for index in packets.indices where !packets[index].isRedundant {
+                packets[index].flags.insert(.discontinuity)
+            }
+        }
         if packets.contains(where: { !$0.isRedundant }) {
             if let last = lastPacketArrival {
                 maxInterArrivalGap = max(maxInterArrivalGap, arrival - last)

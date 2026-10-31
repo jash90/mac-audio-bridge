@@ -8,7 +8,7 @@ Now nothing has to be typed and the stream follows the phone.
 
 - **Receiver advertises** (`Apps/Receiver-iOS/Network/UDPReceiver.swift`): the UDP
   `NWListener` (port 49000, any free port if taken; `serviceClass = .interactiveVoice`)
-  publishes Bonjour `_macaudiobridge._udp` with TXT `v=2` (wire protocol 2: 5 ms frames, redundancy). The name is
+  publishes Bonjour `_macaudiobridge._udp` with TXT `v=3` (wire protocol 3: 5 ms frames, redundancy, source tag — see remote-control.md). The name is
   `UIDevice.current.name` (generic "iPhone" on iOS 16+) plus a random 4-character
   suffix persisted on first launch (`ReceiverIdentity`), e.g. `iPhone 7KQ2` — stable
   across launches, unique per phone. A failed listener is recreated with the same

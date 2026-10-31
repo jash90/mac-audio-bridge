@@ -31,6 +31,11 @@ final class ReceiverModel: ObservableObject {
     @Published private(set) var latencyMode: JitterLatencyMode = .balanced
     @Published private(set) var engineRunning = false
     @Published private(set) var engineRestarts = 0
+    /// Datagrams dropped because another Mac is the active source.
+    @Published private(set) var foreignCount = 0
+
+    /// The Macs, the control connections and source arbitration.
+    let sources: SourcesModel
 
     private let jitterBuffer = JitterBuffer(config: .latency(.balanced))
     private let receiver: UDPReceiver
@@ -52,6 +57,7 @@ final class ReceiverModel: ObservableObject {
     init() {
         receiver = UDPReceiver(jitterBuffer: jitterBuffer)
         playback = PlaybackController(jitterBuffer: jitterBuffer)
+        sources = SourcesModel(receiver: receiver)
     }
 
     deinit {
@@ -69,6 +75,7 @@ final class ReceiverModel: ObservableObject {
         do {
             try receiver.start()
             phase = .running
+            sources.start()
             startStatsLoop()
         } catch {
             phase = .failed("Start failed: \(error.localizedDescription)")
@@ -130,6 +137,7 @@ final class ReceiverModel: ObservableObject {
         concealedCount = audio.concealment.concealedFrames
         codecDescription = audio.stream?.displayName
         malformedCount = receiver.malformedCount
+        foreignCount = receiver.foreignCount
         outputRoute = session.currentRoute.outputs.first?.portName
         engineRunning = playback.isEngineRunning
         engineRestarts = audio.engineRestarts
@@ -191,7 +199,9 @@ final class ReceiverModel: ObservableObject {
                     $0.payloadBytes * 8 / AudioFormat.frameDurationMs
                 } ?? 0,
                 decodeErrors: audio.concealment.decodeErrors,
-                opusPlcFrames: audio.concealment.opusPlcFrames
+                opusPlcFrames: audio.concealment.opusPlcFrames,
+                source: sources.active?.name ?? "",
+                foreignDropped: receiver.foreignCount
             )
         )
     }
@@ -230,31 +240,43 @@ final class ReceiverModel: ObservableObject {
 struct ContentView: View {
     @StateObject private var model = ReceiverModel()
     @AppStorage("latencyMode") private var latencyMode: JitterLatencyMode = .balanced
+    @AppStorage("detailsExpanded") private var detailsExpanded = false
 
     var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "headphones")
-                .font(.system(size: 44))
-                .foregroundStyle(.tint)
+        ScrollView {
+            VStack(spacing: 20) {
+                HStack(spacing: 10) {
+                    Image(systemName: "headphones")
+                        .font(.title2)
+                        .foregroundStyle(.tint)
+                    Text("Mac Audio Bridge")
+                        .font(.title2.bold())
+                }
 
-            Text("Mac Audio Bridge")
-                .font(.title2.bold())
+                SourcesView(model: model.sources)
 
-            address
+                DisclosureGroup(isExpanded: $detailsExpanded) {
+                    VStack(spacing: 16) {
+                        address
+                        latencyPicker
+                        stats
+                    }
+                    .padding(.top, 12)
+                } label: {
+                    Text("Latency & details")
+                        .font(.headline)
+                }
 
-            latencyPicker
-
-            stats
-
-            if case .failed(let message) = model.phase {
-                Text(message)
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
+                if case .failed(let message) = model.phase {
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                }
             }
+            .padding(24)
+            .frame(maxWidth: .infinity)
         }
-        .padding(24)
-        .frame(maxWidth: .infinity)
         .task {
             model.setLatencyMode(latencyMode)
             model.start()
@@ -298,6 +320,7 @@ struct ContentView: View {
             statRow("Recovered", "\(model.recoveredCount)")
             statRow("Concealed", "\(model.concealedCount) × \(AudioFormat.frameDurationMs) ms")
             statRow("Malformed", "\(model.malformedCount)")
+            statRow("Other Macs (dropped)", "\(model.foreignCount)")
             statRow(
                 "Audio engine",
                 "\(model.engineRunning ? "running" : "stopped") (restarts \(model.engineRestarts))")

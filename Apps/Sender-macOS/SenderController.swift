@@ -60,6 +60,12 @@ final class FrameStats: @unchecked Sendable {
 final class RedundancyPackerBox: @unchecked Sendable {
     private var packer = RedundancyPacker()
 
+    /// `sourceTag` goes into every datagram, so the phone can tell this
+    /// Mac's stream from another Mac's.
+    init(sourceTag: UInt32) {
+        packer.sourceTag = sourceTag
+    }
+
     func pack(_ frame: AudioPacket) -> [Data] {
         packer.pack(frame)
     }
@@ -150,7 +156,7 @@ final class SenderController: ObservableObject {
     @Published private(set) var packetsPerSecond = 0
     @Published private(set) var currentSequence: UInt32 = 0
     @Published private(set) var captureWarning: String?
-    @Published private(set) var failureMessage: String?
+    @Published var failureMessage: String?
     /// Receiver currently streamed to (service name or host; "" when idle).
     @Published private(set) var activeReceiver = ""
     /// Bonjour receivers currently visible, sorted.
@@ -172,8 +178,39 @@ final class SenderController: ObservableObject {
     /// Bytes sent per second (all datagrams), in kB/s, for the menu.
     @Published private(set) var kilobytesPerSecond: Double = 0
 
-    private var selection: ReceiverSelection
-    private var activeTarget: ReceiverTarget?
+    // MARK: Remote control state (see SenderController+Remote.swift)
+
+    /// Phone currently controlling the stream (its control session targets
+    /// the receiver we stream to) — "Controlled from iPhone …".
+    @Published var controllingPhone: String?
+    /// The Mac that took the phone over from us — "iPhone used by …".
+    @Published var usedBy: String?
+    /// Released by the phone while there was no other output to switch to:
+    /// the output stays ours but streaming is paused until an explicit
+    /// action (menu "Resume", phone connect, re-selecting the output).
+    @Published var releasedHold = false
+    @Published var controlServerStatus: ControlServer.Status = .starting
+    /// Name of the current default output device (for the phone).
+    var outputDeviceName: String?
+    /// Name this Mac is advertised under (Bonjour may rename on a conflict).
+    var advertisedName = SourceIdentity.computerName()
+    var controlServer: ControlServer?
+    /// Hello per open control session (nil until the phone sent it).
+    var sessions: [ControlServer.SessionID: PhoneHello?] = [:]
+    var lastSentStatus: [ControlServer.SessionID: (status: SourceStatus, at: TimeInterval)] = [:]
+    /// Output switch memory + takeover detection.
+    var outputModel: OutputRestoreModel
+    /// Set when the user selected our output on the Mac; the claim goes to
+    /// the phone once streaming to it has started (expires after 10 s).
+    var pendingClaimSince: TimeInterval?
+    /// The next "became ours" transition is ours (phone connect), not a
+    /// user action: no claim until this uptime.
+    var suppressClaimUntil: TimeInterval = 0
+    static let rememberedOutputUIDKey = "rememberedOutputUID"
+    static let rememberedOutputNameKey = "rememberedOutputName"
+
+    private(set) var selection: ReceiverSelection
+    private(set) var activeTarget: ReceiverTarget?
     private var browser: ReceiverBrowser?
 
     /// The 1 Hz state loop, owned by the controller itself: the menu's
@@ -203,11 +240,22 @@ final class SenderController: ObservableObject {
             storedSelection: storedService,
             manualHost: manualEnabled ? host : "",
             now: Self.uptime())
+        outputModel = OutputRestoreModel(
+            bridgeUID: BridgeDevice.uid,
+            remembered: defaults.string(forKey: Self.rememberedOutputUIDKey).map { uid in
+                OutputDeviceInfo(
+                    uid: uid, name: defaults.string(forKey: Self.rememberedOutputNameKey) ?? uid,
+                    isBuiltIn: false)
+            })
         converter.qualityGate.value = quality
         // Bonjour browsing runs for the whole app lifetime, from launch.
         let browser = Self.makeBrowser(controller: self)
         self.browser = browser
         browser.start()
+        // Phones find this Mac as a source and control it from launch on.
+        let server = Self.makeControlServer(controller: self, serviceName: advertisedName)
+        controlServer = server
+        server.start()
         // Main-actor task loop (the class is @MainActor, so the task inherits
         // the main actor): one immediate pass — streaming starts within this
         // first evaluate when our device is the default output and a receiver
@@ -224,10 +272,11 @@ final class SenderController: ObservableObject {
     deinit {
         stateLoop?.cancel()
         browser?.stop()
+        controlServer?.stop()
     }
 
     private let tap = DeviceAudioTap()
-    private let converter = FrameConverter()
+    let converter = FrameConverter()
     private let udpSender = UDPSender()
     private let frameStats = FrameStats()
     private let captureWarningMailbox = WarningMailbox()
@@ -250,7 +299,6 @@ final class SenderController: ObservableObject {
     /// Device ID the current listener registrations are bound to (device IDs
     /// change when coreaudiod restarts, e.g. on driver install/uninstall).
     private var observedDeviceID: AudioObjectID?
-    private var previousDeviceID: AudioObjectID?
 
     var isStreaming: Bool { mode == .streaming }
     /// Device volume as a whole percent for the menu.
@@ -265,6 +313,7 @@ final class SenderController: ObservableObject {
         quality = newQuality
         UserDefaults.standard.set(newQuality.rawValue, forKey: Self.qualityKey)
         converter.qualityGate.value = newQuality
+        remoteStateChanged()
     }
 
     // MARK: - Receiver selection
@@ -326,31 +375,61 @@ final class SenderController: ObservableObject {
     }
 
     /// Monotonic seconds for the selection's grace timing.
-    private static func uptime() -> TimeInterval {
+    static func uptime() -> TimeInterval {
         ProcessInfo.processInfo.systemUptime
     }
 
     // MARK: - Output-device actions
 
-    /// Makes "iPhone (Mac Audio Bridge)" the default output, remembering the
+    /// Makes "iPhone (Mac Audio Bridge)" the default output (an explicit
+    /// Mac-side action: the phone switches to this Mac), remembering the
     /// device used before so `switchBackToPreviousOutput` can restore it.
     func useIPhoneAsOutput() {
         guard let deviceID = BridgeDevice.deviceID(),
             let currentDefault = BridgeDevice.defaultOutputDeviceID(),
             currentDefault != deviceID
         else { return }
-        previousDeviceID = currentDefault
-        previousDeviceName = BridgeDevice.deviceName(currentDefault)
-        hasPreviousDevice = true
+        observeOutput(BridgeDevice.outputDeviceInfo(currentDefault))
         _ = BridgeDevice.setDefaultOutputDevice(deviceID)
         evaluate()
     }
 
-    /// Restores the output device used before ours was selected.
+    /// Restores the output device used before ours was selected (or the
+    /// built-in output when that one is gone).
     func switchBackToPreviousOutput() {
-        guard let previous = previousDeviceID else { return }
-        _ = BridgeDevice.setDefaultOutputDevice(previous)
+        _ = restorePreviousOutput()
         evaluate()
+    }
+
+    /// Switches the default output to `outputModel.restoreTarget`; false
+    /// when there is no other output device.
+    func restorePreviousOutput() -> Bool {
+        let available = BridgeDevice.outputDevices()
+        guard let target = outputModel.restoreTarget(available: available.map(\.info)),
+            let id = available.first(where: { $0.info.uid == target.uid })?.id
+        else { return false }
+        return BridgeDevice.setDefaultOutputDevice(id)
+    }
+
+    /// Feeds the default output into the switch model; persists the
+    /// remembered device and reacts to takeovers. Returns the transition.
+    @discardableResult
+    func observeOutput(_ device: OutputDeviceInfo?) -> OutputRestoreModel.Transition {
+        let before = outputModel.remembered
+        let transition = outputModel.observeDefaultOutput(device)
+        if let remembered = outputModel.remembered, remembered != before {
+            UserDefaults.standard.set(remembered.uid, forKey: Self.rememberedOutputUIDKey)
+            UserDefaults.standard.set(remembered.name, forKey: Self.rememberedOutputNameKey)
+        }
+        if previousDeviceName != outputModel.remembered?.name {
+            previousDeviceName = outputModel.remembered?.name
+        }
+        if !hasPreviousDevice {
+            // The model always has a fallback (built-in) to switch back to.
+            hasPreviousDevice = true
+        }
+        handleOutputTransition(transition)
+        return transition
     }
 
     // MARK: - Automatic start/stop
@@ -373,6 +452,8 @@ final class SenderController: ObservableObject {
         guard let deviceID else {
             if mode == .streaming { stopStreaming() }
             defaultOutputIsOurs = false
+            outputDeviceName = BridgeDevice.defaultOutputDeviceID().flatMap(BridgeDevice.deviceName)
+            remoteStateChanged()
             return
         }
 
@@ -381,17 +462,17 @@ final class SenderController: ObservableObject {
 
         // Keep "previous device" meaningful: whenever the user routes the
         // output to something that is not ours, that becomes the device to
-        // switch back to.
-        if let defaultID, defaultID != deviceID, defaultID != previousDeviceID {
-            previousDeviceID = defaultID
-            previousDeviceName = BridgeDevice.deviceName(defaultID)
-            hasPreviousDevice = true
-        }
+        // switch back to. A switch to ours is a takeover (claim).
+        let defaultInfo = defaultID.flatMap(BridgeDevice.outputDeviceInfo)
+        outputDeviceName = defaultInfo?.name
+        observeOutput(defaultInfo)
 
         updateVolume(deviceID: deviceID)
 
+        // A release with nowhere to switch to keeps the output but pauses.
+        let shouldStream = defaultOutputIsOurs && !releasedHold
         let target = selection.target
-        switch (defaultOutputIsOurs, target, mode) {
+        switch (shouldStream, target, mode) {
         case (true, let target?, .waiting):
             startStreaming(target: target, deviceID: deviceID)
         case (true, let target?, .streaming) where target != activeTarget:
@@ -403,6 +484,7 @@ final class SenderController: ObservableObject {
         default:
             break
         }
+        remoteStateChanged()
     }
 
     private func setActiveTarget(_ target: ReceiverTarget?) {
@@ -436,12 +518,13 @@ final class SenderController: ObservableObject {
         }
 
         tapSampleRate = tap.sampleRate
+        converter.audibility.reset()
         captureWarning = nil
         failureMessage = nil
         frameStats.reset()
         // Both callbacks run on the converter queue: they are @Sendable, capture
         // only Sendable state (no self), and never touch UI state directly.
-        let packer = RedundancyPackerBox()
+        let packer = RedundancyPackerBox(sourceTag: SourceIdentity.tag)
         converter.onFrame = { [udpSender, frameStats] packet in
             // Primary datagram first (Opus: carrying the previous 4 frames),
             // then any redundancy-only datagram (PCM16's delayed copy, see
@@ -489,7 +572,7 @@ final class SenderController: ObservableObject {
     /// converter's gain (mute → zeros). The volume keys and the menu-bar
     /// slider change the device control, the listener calls `evaluate`, and
     /// the new gain applies from the next drain tick.
-    private func updateVolume(deviceID: AudioObjectID) {
+    func updateVolume(deviceID: AudioObjectID) {
         let volume = BridgeDevice.volumeScalar(deviceID) ?? 1
         let muted = BridgeDevice.isMuted(deviceID) ?? false
         deviceVolume = volume

@@ -25,9 +25,10 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_macaudiobridge._udp</string>
+		<string>_macaudiosrc._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Mac Audio Bridge uses the local network so your Mac can find this iPhone and stream audio to it.</string>
+	<string>Mac Audio Bridge uses the local network to find your Macs, control them, and receive their audio.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
