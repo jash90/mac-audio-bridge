@@ -1,13 +1,14 @@
 import AppKit
-import Combine
 import SwiftUI
 
 /// Menu bar window: receiver IP, output-device switcher, status. Streaming is
 /// automatic — it runs while "iPhone (Mac Audio Bridge)" is the selected
-/// output device and an address is set (see SenderController.evaluate).
+/// output device and an address is set (see SenderController.evaluate). The
+/// controller (created in SenderApp) owns the 1 Hz loop; this view owns no
+/// timers and only reads published state.
 struct MenuView: View {
     @AppStorage("receiverHost") private var host = ""
-    @StateObject private var controller = SenderController()
+    @ObservedObject var controller: SenderController
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -52,13 +53,6 @@ struct MenuView: View {
         }
         .padding(12)
         .frame(width: 340)
-        .onAppear {
-            controller.setHost(host)
-            controller.refreshStats()
-        }
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
-            controller.refreshStats()
-        }
     }
 
     @ViewBuilder

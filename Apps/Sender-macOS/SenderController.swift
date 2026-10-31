@@ -122,6 +122,35 @@ final class SenderController: ObservableObject {
         didSet { evaluate() }
     }
 
+    /// The 1 Hz state loop, owned by the controller itself: the menu's
+    /// SwiftUI lifetime only spans an open menu, so nothing view-side may
+    /// drive evaluation or stats.
+    private var stateLoop: Task<Void, Never>?
+
+    /// UserDefaults key shared with the menu's `@AppStorage` text field.
+    private static let hostKey = "receiverHost"
+
+    init() {
+        // The persisted receiver address — read here so streaming can start
+        // at launch with the menu never opened.
+        receiverHost = Self.loadPersistedHost()
+        // Main-actor task loop (the class is @MainActor, so the task inherits
+        // the main actor): one immediate pass — streaming starts within this
+        // first evaluate when our device is the default output and a host is
+        // set — then refresh every second.
+        stateLoop = Task { [weak self] in
+            self?.evaluate()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                self?.refreshStats()
+            }
+        }
+    }
+
+    deinit {
+        stateLoop?.cancel()
+    }
+
     private let tap = DeviceAudioTap()
     private let converter = FrameConverter()
     private let udpSender = UDPSender()
@@ -154,9 +183,18 @@ final class SenderController: ObservableObject {
     /// True while no receiver address is configured (drives the waiting text).
     var receiverHostIsEmpty: Bool { receiverHost.isEmpty }
 
-    /// The receiver address, kept in sync with the menu's text field.
+    /// The receiver address, kept in sync with the menu's text field (and
+    /// persisted so a relaunch streams without the menu being opened).
     func setHost(_ host: String) {
-        receiverHost = host.trimmingCharacters(in: .whitespaces)
+        let trimmed = host.trimmingCharacters(in: .whitespaces)
+        guard trimmed != receiverHost else { return }
+        receiverHost = trimmed
+        UserDefaults.standard.set(trimmed, forKey: Self.hostKey)
+    }
+
+    private static func loadPersistedHost() -> String {
+        (UserDefaults.standard.string(forKey: hostKey) ?? "")
+            .trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: - Output-device actions
