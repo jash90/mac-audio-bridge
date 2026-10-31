@@ -19,10 +19,91 @@ final class VolumeGate: @unchecked Sendable {
     }
 }
 
+/// The stream quality picked in the menu, read once per drain tick on the
+/// converter queue — a plain atomic, like `VolumeGate`. A change applies from
+/// the next frame (within one 2.5 ms tick).
+final class QualityGate: @unchecked Sendable {
+    private let index = Atomic<Int>(StreamQuality.allCases.firstIndex(of: .default) ?? 0)
+
+    var value: StreamQuality {
+        get { StreamQuality.allCases[index.load(ordering: .relaxed)] }
+        set { index.store(StreamQuality.allCases.firstIndex(of: newValue) ?? 0, ordering: .relaxed) }
+    }
+}
+
+/// Per-second encoder telemetry: recorded per frame on the converter queue,
+/// drained ~1 Hz by the stats loop. The duration buffer is preallocated and
+/// capped, so recording never allocates on the drain path.
+final class EncoderStats: @unchecked Sendable {
+    struct Snapshot: Sendable {
+        /// Codec of the last frame encoded (nil = no frame this second).
+        var codec: BridgeCore.AudioCodec?
+        var frames: Int
+        var payloadBytes: Int
+        /// p99 of the per-frame encode time (ms) over the second.
+        var encodeMsP99: Double
+
+        var averagePayloadBytes: Double {
+            frames > 0 ? Double(payloadBytes) / Double(frames) : 0
+        }
+    }
+
+    private static let capacity = 1_024
+
+    private struct State {
+        var codec: BridgeCore.AudioCodec?
+        var frames = 0
+        var payloadBytes = 0
+        var encodeNanos: [UInt64]
+    }
+
+    private let state: Mutex<State>
+
+    init() {
+        var durations: [UInt64] = []
+        durations.reserveCapacity(Self.capacity)
+        state = Mutex(State(encodeNanos: durations))
+    }
+
+    func record(codec: BridgeCore.AudioCodec, payloadBytes: Int, encodeNanos: UInt64) {
+        state.withLock { state in
+            state.codec = codec
+            state.frames += 1
+            state.payloadBytes += payloadBytes
+            if state.encodeNanos.count < Self.capacity {
+                state.encodeNanos.append(encodeNanos)
+            }
+        }
+    }
+
+    /// The second's counters, then resets them.
+    func take() -> Snapshot {
+        var durations: [UInt64] = []
+        let snapshot = state.withLock { state -> Snapshot in
+            durations = state.encodeNanos
+            let snapshot = Snapshot(
+                codec: state.frames > 0 ? state.codec : nil, frames: state.frames,
+                payloadBytes: state.payloadBytes, encodeMsP99: 0)
+            state.frames = 0
+            state.payloadBytes = 0
+            state.encodeNanos.removeAll(keepingCapacity: true)
+            return snapshot
+        }
+        guard !durations.isEmpty else { return snapshot }
+        durations.sort()
+        let index = min(durations.count - 1, Int((Double(durations.count - 1) * 0.99).rounded()))
+        var result = snapshot
+        result.encodeMsP99 = Double(durations[index]) / 1_000_000
+        return result
+    }
+}
+
 /// Drains the tap's ring buffer on a dedicated serial `.userInteractive` queue
 /// (strict timer every 2.5 ms), resamples to 48 kHz with `AVAudioConverter` when
 /// the tap rate differs, applies the virtual device's volume (see `VolumeGate`),
-/// and emits fixed 5 ms frames as `AudioPacket`s (PCM16, 960-byte payload). A frame is emitted in the same
+/// and emits fixed 5 ms frames as `AudioPacket`s in the quality picked in the menu
+/// (`QualityGate`: Opus 192/128 kbit/s CBR or PCM16, encoded by `StreamFrameEncoder`
+/// right here on the drain path, switching live from one frame to the next). A frame is emitted in the same
 /// tick it completes — no extra queueing — and sequence and sample time advance
 /// continuously for the app's lifetime; the first packet of every run carries
 /// `.discontinuity` so the receiver resets its jitter buffer.
@@ -49,6 +130,13 @@ final class FrameConverter: @unchecked Sendable {
     /// Gain applied to emitted samples (volume scalar of the virtual device,
     /// 0 when muted). Safe to update any time, including while running.
     let volumeGate = VolumeGate()
+
+    /// Stream quality (codec / bitrate) of emitted frames. Safe to update any
+    /// time, including while running.
+    let qualityGate = QualityGate()
+
+    /// Encoder telemetry for the stats line.
+    let encoderStats = EncoderStats()
 
     private static let queueLabel = "dev.jash90.MacAudioBridge.frame-converter"
     private static let inputCapacityFrames = 8_192
@@ -82,6 +170,8 @@ final class FrameConverter: @unchecked Sendable {
     private var inputCapacitySamples = 0
     private var outputBuffer: AVAudioPCMBuffer?
     private var staging = [Float]()
+    /// Opus / PCM16 frame encoder (queue-confined, preallocated).
+    private let frameEncoder = StreamFrameEncoder()
     /// Sequence/sample time of the next emitted packet. Never reset between
     /// runs, so the stream is continuous across restarts; restarts are marked
     /// with `.discontinuity` instead.
@@ -115,8 +205,10 @@ final class FrameConverter: @unchecked Sendable {
             self.staging.removeAll(keepingCapacity: true)
             self.lastTickTime = nil
             self.maxTickInterval = 0
-            // The first packet of every run tells the receiver to reset.
+            // The first packet of every run tells the receiver to reset; the
+            // run's first Opus frame starts a fresh Opus stream.
             self.pendingDiscontinuity = true
+            self.frameEncoder.reset()
 
             let targetFormat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,
@@ -332,20 +424,26 @@ final class FrameConverter: @unchecked Sendable {
     }
 
     /// Chops the staging buffer into whole 5 ms frames, applies the volume
-    /// gate's gain, and hands one `AudioPacket` per frame to `onFrame`.
+    /// gate's gain, encodes each in the selected quality, and hands one
+    /// `AudioPacket` per frame to `onFrame`.
     private func emitCompleteFrames() {
-        // One relaxed atomic load per drain; mute yields gain 0 (zeros out).
+        // One relaxed atomic load each per drain; mute yields gain 0 (zeros out).
         let gain = volumeGate.value
+        let quality = qualityGate.value
         var frameStart = 0
         while staging.count - frameStart >= Self.samplesPerFrame {
             let flags: AudioPacketFlags = pendingDiscontinuity ? [.discontinuity] : []
             let sequence = nextSequence
             let sampleTime = nextSampleTime
+            let started = DispatchTime.now().uptimeNanoseconds
             let packet = staging.withUnsafeBufferPointer { buffer in
-                Self.encodeFrame(
-                    samples: buffer, offset: frameStart, gain: gain, flags: flags,
+                frameEncoder.encode(
+                    buffer.baseAddress! + frameStart, gain: gain, quality: quality, flags: flags,
                     sequence: sequence, sampleTime: sampleTime)
             }
+            encoderStats.record(
+                codec: packet.codec, payloadBytes: packet.payload.count,
+                encodeNanos: DispatchTime.now().uptimeNanoseconds - started)
             onFrame?(packet)
             nextSequence = nextSequence &+ 1
             nextSampleTime &+= UInt64(AudioFormat.samplesPerFrame)
@@ -355,31 +453,5 @@ final class FrameConverter: @unchecked Sendable {
         if frameStart > 0 {
             staging.removeFirst(frameStart)
         }
-    }
-
-    /// Converts one frame of interleaved Float32 into a PCM16 `AudioPacket`
-    /// with a little-endian Int16 payload, scaled by `gain` first.
-    private static func encodeFrame(
-        samples: UnsafeBufferPointer<Float>,
-        offset: Int,
-        gain: Float,
-        flags: AudioPacketFlags,
-        sequence: UInt32,
-        sampleTime: UInt64
-    ) -> AudioPacket {
-        var payload = Data(capacity: samplesPerFrame * MemoryLayout<Int16>.size)
-        for i in offset..<(offset + samplesPerFrame) {
-            let clamped = min(1, max(-1, samples[i] * gain))
-            let value = UInt16(bitPattern: Int16(clamped * 32767)).littleEndian
-            withUnsafeBytes(of: value) { bytes in
-                payload.append(contentsOf: bytes)
-            }
-        }
-        return AudioPacket(
-            codec: .pcm16,
-            flags: flags,
-            sequence: sequence,
-            sampleTime: sampleTime,
-            payload: payload)
     }
 }

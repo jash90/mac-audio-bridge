@@ -13,39 +13,76 @@ public struct ConcealmentStats: Sendable, Equatable {
     /// Resumes into real audio after concealment or silence (crossfaded or
     /// faded in).
     public var fadeIns = 0
-    /// Splices inside real audio (latency trim, overflow resync) that were
-    /// crossfaded.
+    /// Splices inside real audio (latency trim, overflow resync, codec
+    /// switch) that were crossfaded.
     public var crossfades = 0
+    /// Slots synthesized by Opus packet-loss concealment (the decoder's own
+    /// continuation of an Opus stream).
+    public var opusPlcFrames = 0
+    /// Frames whose payload could not be decoded (concealed instead).
+    public var decodeErrors = 0
 
     public init() {}
 }
 
+/// The codec and frame size of the stream being played, for the UI.
+public struct PlayoutStream: Sendable, Equatable {
+    public var codec: AudioCodec
+    /// Payload bytes of the last frame played.
+    public var payloadBytes: Int
+
+    public init(codec: AudioCodec, payloadBytes: Int) {
+        self.codec = codec
+        self.payloadBytes = payloadBytes
+    }
+
+    /// "Opus 192 kbit/s" / "PCM (uncompressed)".
+    public var displayName: String {
+        StreamQuality.receiverDescription(codec: codec, payloadBytes: payloadBytes)
+    }
+}
+
 /// Serves arbitrary-size reads of interleaved stereo Float samples from the
-/// jitter buffer's 5 ms playout slots, decoding PCM16 and concealing every
-/// gap so that the output never jumps: no step between audio and silence,
-/// no hard splice.
+/// jitter buffer's 5 ms playout slots, decoding PCM16 and Opus (per frame,
+/// following each frame's codec) and concealing every gap so that the output
+/// never jumps: no step between audio and silence, no hard splice.
 ///
-/// Realtime contract: all storage is preallocated at init; `read(into:)`
-/// performs no allocation, uses no Swift concurrency, and meets no locks of
-/// its own (the source — the jitter buffer's realtime `pop` — copies the
-/// payload into the reader's buffers under its short unfair lock). `read`
-/// must be called from a single thread (the render thread); the stats and
-/// `partiallyPlayedFrames` may be read from any thread.
+/// Realtime contract: all storage — including the Opus decoder state — is
+/// preallocated at init; `read(into:)` performs no allocation, uses no Swift
+/// concurrency, and meets no locks of its own (the source — the jitter
+/// buffer's realtime `pop` — copies the payload into the reader's buffers
+/// under its short unfair lock). `read` must be called from a single thread
+/// (the render thread); the stats and `partiallyPlayedFrames` may be read
+/// from any thread.
+///
+/// Why Opus is decoded here, on the render thread, and not on packet
+/// arrival: the decoder is stateful and must see the frames in playout
+/// order, with a concealment call exactly where a frame is missing. Arrival
+/// order is not playout order (reordering, redundant copies filling earlier
+/// slots, late frames, trims), and whether a slot is lost is only known at
+/// playout time. libopus decode / PLC never allocates (stack scratch via
+/// `USE_ALLOCA`) and takes no locks; one 5 ms frame costs ≈ 40–50 µs.
 ///
 /// Playout rules, one slot at a time:
 /// - a frame continuing the previous one is played as is;
 /// - a frame after the latency trim skipped its predecessor is crossfaded
 ///   from the skipped frame over the whole 5 ms slot (both ends stay
 ///   continuous with their real neighbours);
-/// - a frame after any other skip (overflow resync) is crossfaded from a
-///   concealment continuation over 5 ms;
-/// - a loss / underrun / buffering slot after audio starts concealment:
-///   the last 10–20 ms of output are looped (loop length chosen by
+/// - a frame after any other skip (overflow resync), or of another codec
+///   or a restarted Opus stream, is crossfaded from a continuation of the
+///   old stream over 5 ms;
+/// - a loss / underrun / buffering slot after audio starts concealment.
+///   PCM16: the last 10–20 ms of output are looped (loop length chosen by
 ///   autocorrelation, loop seam blended), joined to the last output sample
 ///   with a 2 ms offset correction, held at full level for 10 ms and then
-///   faded to silence with a raised cosine over 40 ms;
+///   faded to silence with a raised cosine over 40 ms. Opus: the decoder's
+///   own PLC continues the signal, at full level for 20 ms and then under
+///   the same 40 ms fade (a short gap is pure Opus PLC; only a long one
+///   fades);
 /// - the first frame after concealment is crossfaded from the (still
-///   running) concealment over 5 ms; after silence it fades in over 5 ms.
+///   running) concealment over 5 ms — after Opus PLC, the decoded frame
+///   already continues the PLC signal, so only the fade gain ramps back to
+///   1; after silence it fades in over 5 ms.
 public final class PCMFrameReader: @unchecked Sendable {
     /// Supplies the next playout slot, copying the payload (and a trimmed
     /// predecessor's payload) into the given buffers. Called exactly once per
@@ -62,9 +99,11 @@ public final class PCMFrameReader: @unchecked Sendable {
     private static let slotFrames = AudioFormat.samplesPerFrame
     /// Fade-in / resume / splice crossfade length: one whole slot (5 ms).
     public static let fadeFrames = AudioFormat.samplesPerFrame
-    /// Concealment holds full level for 10 ms …
+    /// Loop concealment (PCM16) holds full level for 10 ms …
     public static let concealHoldFrames = 480
-    /// … then fades to silence over 40 ms (total 50 ms of concealment).
+    /// … Opus PLC for 20 ms (it is a real continuation, not a loop) …
+    public static let opusConcealHoldFrames = 960
+    /// … then both fade to silence over 40 ms (50 / 60 ms of concealment).
     public static let concealDecayFrames = 1_920
     /// Output history kept for the concealment loop (42.7 ms).
     private static let historyFrames = 2_048
@@ -93,8 +132,19 @@ public final class PCMFrameReader: @unchecked Sendable {
     private let fadeTable: UnsafeMutablePointer<Float>
     private let seamTable: UnsafeMutablePointer<Float>
     private let decayTable: UnsafeMutablePointer<Float>
+    /// Opus decoder (render thread only); nil only if libopus failed to
+    /// create one, in which case Opus frames are concealed.
+    private let opus: OpusDecoderBox?
 
     // State confined to the render thread.
+    /// What generates concealment samples.
+    private enum ConcealSource {
+        /// Loop of the output history (PCM16 streams).
+        case loop
+        /// The Opus decoder's packet-loss concealment.
+        case opusPlc
+    }
+
     private enum Mode {
         /// Silence (start, after a reset, or after concealment decayed).
         case silent
@@ -120,6 +170,12 @@ public final class PCMFrameReader: @unchecked Sendable {
     private var concealPosition = 0
     private var correctionLeft: Float = 0
     private var correctionRight: Float = 0
+    private var concealSource = ConcealSource.loop
+    /// Full-level part of the running concealment (loop or Opus hold).
+    private var holdFrames = PCMFrameReader.concealHoldFrames
+    /// Codec of the last frame decoded (nil before the first): the stream
+    /// the Opus decoder state belongs to.
+    private var streamCodec: AudioCodec?
 
     /// Remaining interleaved samples of the frame being played, published for
     /// the latency readout. Relaxed and approximate by design.
@@ -129,6 +185,11 @@ public final class PCMFrameReader: @unchecked Sendable {
     private let fadeOuts = Atomic<Int>(0)
     private let fadeIns = Atomic<Int>(0)
     private let crossfades = Atomic<Int>(0)
+    private let opusPlcFrames = Atomic<Int>(0)
+    private let decodeErrors = Atomic<Int>(0)
+    /// `AudioCodec` raw value of the last frame played; `UInt8.max` = none.
+    private let lastCodec = Atomic<UInt8>(.max)
+    private let lastPayloadBytes = Atomic<Int>(0)
 
     public init(source: @escaping Source) {
         self.source = source
@@ -144,6 +205,7 @@ public final class PCMFrameReader: @unchecked Sendable {
         fadeTable = .allocate(capacity: Self.fadeFrames)
         seamTable = .allocate(capacity: Self.seamFrames)
         decayTable = .allocate(capacity: Self.concealDecayFrames)
+        opus = try? OpusDecoderBox()
         for buffer in [current, skippedFrame, scratch] {
             buffer.initialize(repeating: 0, count: slot)
         }
@@ -190,7 +252,17 @@ public final class PCMFrameReader: @unchecked Sendable {
         stats.fadeOuts = fadeOuts.load(ordering: .relaxed)
         stats.fadeIns = fadeIns.load(ordering: .relaxed)
         stats.crossfades = crossfades.load(ordering: .relaxed)
+        stats.opusPlcFrames = opusPlcFrames.load(ordering: .relaxed)
+        stats.decodeErrors = decodeErrors.load(ordering: .relaxed)
         return stats
+    }
+
+    /// Codec and frame size of the last frame played; nil before the first
+    /// (relaxed snapshot).
+    public var stream: PlayoutStream? {
+        AudioCodec(rawValue: lastCodec.load(ordering: .relaxed)).map {
+            PlayoutStream(codec: $0, payloadBytes: lastPayloadBytes.load(ordering: .relaxed))
+        }
     }
 
     /// Fills exactly `sampleCount` interleaved samples from the playout
@@ -228,42 +300,90 @@ public final class PCMFrameReader: @unchecked Sendable {
 
     private func advance() {
         cursor = 0
-        switch source(payload, skippedPayload) {
-        case .frame(let frame) where frame.codec == .pcm16:
-            decode(payload, byteCount: frame.byteCount, into: current)
+        if case .frame(let frame) = source(payload, skippedPayload) {
             play(frame)
-        case .frame, .lost, .underrun, .buffering:
-            // Non-PCM frames are concealed until a decoder exists for them.
+        } else {
             conceal()
         }
         appendToHistory(current)
     }
 
+    /// How a frame joins the output before it.
+    private enum Join {
+        /// Continues the previous frame exactly.
+        case asIs
+        /// From silence: 5 ms fade-in.
+        case fadeIn
+        /// After a trimmed frame: crossfade from the skipped frame.
+        case trim
+        /// Crossfade from a continuation of the old stream (`scratch`).
+        case continuation
+        /// After Opus PLC of the same stream: the decoded frame continues the
+        /// PLC signal, only the concealment gain ramps back to 1.
+        case rampFromPlc
+    }
+
     private func play(_ frame: PlayoutFrame) {
+        // A fresh Opus stream (codec switch, or a sender restart) needs a
+        // fresh decoder; either way the old stream's state does not continue.
+        let restartsOpus = frame.codec == .opus
+            && (streamCodec != .opus || frame.flags.contains(.discontinuity))
+        let switchesStream = streamCodec != nil && (frame.codec != streamCodec || restartsOpus)
+
+        let join: Join
         switch mode {
+        case .silent:
+            join = .fadeIn
         case .audio:
             if frame.skippedByteCount > 0, let previous = previousSequence,
-                frame.sequence == previous &+ 2
+                frame.sequence == previous &+ 2, !switchesStream, frame.skippedCodec == frame.codec
             {
-                // Latency trim: the skipped frame continues the last output
-                // exactly; crossfade it into this one across the slot.
-                decode(skippedPayload, byteCount: frame.skippedByteCount, into: skippedFrame)
-                crossfade(from: skippedFrame)
-                crossfades.add(1, ordering: .relaxed)
-            } else if let previous = previousSequence, frame.sequence != previous &+ 1 {
-                // Any other jump: crossfade from a continuation of the old
-                // stream.
-                startConcealment()
-                generate(into: scratch, frames: Self.fadeFrames)
-                crossfade(from: scratch)
-                crossfades.add(1, ordering: .relaxed)
+                join = .trim
+            } else if let previous = previousSequence, frame.sequence == previous &+ 1, !switchesStream {
+                join = .asIs
+            } else {
+                join = .continuation
             }
         case .concealing:
-            // Resume: the concealment keeps running under the crossfade.
+            join = concealSource == .opusPlc && frame.codec == .opus && !restartsOpus
+                ? .rampFromPlc : .continuation
+        }
+
+        // The continuation is generated BEFORE the new frame is decoded: an
+        // Opus PLC continuation must come from the old decoder state.
+        if join == .continuation {
+            if mode == .audio {
+                startConcealment()
+            }
             generate(into: scratch, frames: Self.fadeFrames)
-            crossfade(from: scratch)
-            fadeIns.add(1, ordering: .relaxed)
-        case .silent:
+        }
+        if restartsOpus {
+            opus?.reset()
+        }
+        if join == .trim, !decode(frame.skippedCodec, skippedPayload, frame.skippedByteCount, into: skippedFrame) {
+            // The skipped frame continues the last output exactly; when it
+            // cannot be decoded, conceal it instead (Opus: PLC, which keeps
+            // the decoder in step).
+            decodeErrors.add(1, ordering: .relaxed)
+            startConcealment()
+            generate(into: skippedFrame, frames: Self.fadeFrames)
+        }
+        guard decode(frame.codec, payload, frame.byteCount, into: current) else {
+            decodeErrors.add(1, ordering: .relaxed)
+            if restartsOpus {
+                // The decoder was just reset: its PLC would be silence, so
+                // conceal from the output history instead.
+                streamCodec = nil
+            }
+            conceal()
+            return
+        }
+        streamCodec = frame.codec
+
+        switch join {
+        case .asIs:
+            break
+        case .fadeIn:
             for i in 0..<Self.fadeFrames {
                 let gain = fadeTable[i]
                 current[2 * i] *= gain
@@ -272,11 +392,35 @@ public final class PCMFrameReader: @unchecked Sendable {
             if hasStarted {
                 fadeIns.add(1, ordering: .relaxed)
             }
+        case .trim:
+            // Latency trim: the skipped frame continues the last output
+            // exactly; crossfade it into this one across the slot.
+            crossfade(from: skippedFrame)
+            crossfades.add(1, ordering: .relaxed)
+        case .continuation:
+            crossfade(from: scratch)
+            if mode == .audio {
+                crossfades.add(1, ordering: .relaxed)
+            } else {
+                fadeIns.add(1, ordering: .relaxed)
+            }
+        case .rampFromPlc:
+            let gain = envelopeGain(at: concealPosition)
+            if gain < 1 {
+                for i in 0..<Self.fadeFrames {
+                    let weight = gain + (1 - gain) * fadeTable[i]
+                    current[2 * i] *= weight
+                    current[2 * i + 1] *= weight
+                }
+            }
+            fadeIns.add(1, ordering: .relaxed)
         }
         mode = .audio
         hasStarted = true
         previousSequence = frame.sequence
         currentIsAudio = true
+        lastCodec.store(frame.codec.rawValue, ordering: .relaxed)
+        lastPayloadBytes.store(frame.byteCount, ordering: .relaxed)
     }
 
     private func conceal() {
@@ -297,7 +441,7 @@ public final class PCMFrameReader: @unchecked Sendable {
             return
         }
         generate(into: current, frames: Self.slotFrames)
-        if concealPosition >= Self.concealHoldFrames + Self.concealDecayFrames {
+        if concealPosition >= holdFrames + Self.concealDecayFrames {
             mode = .silent
             fadeOuts.add(1, ordering: .relaxed)
         }
@@ -324,11 +468,35 @@ public final class PCMFrameReader: @unchecked Sendable {
         return history[index * Self.channels + channel]
     }
 
+    /// Starts a concealment of the current stream at full level: Opus PLC
+    /// for an Opus stream (the decoder continues the signal), the history
+    /// loop otherwise.
+    private func startConcealment() {
+        concealPosition = 0
+        if streamCodec == .opus, opus != nil {
+            concealSource = .opusPlc
+            holdFrames = Self.opusConcealHoldFrames
+        } else {
+            buildLoop()
+            concealSource = .loop
+            holdFrames = Self.concealHoldFrames
+        }
+    }
+
+    /// Concealment gain at `position` frames into the concealment: 1 during
+    /// the hold, then the raised-cosine decay, then 0.
+    @inline(__always)
+    private func envelopeGain(at position: Int) -> Float {
+        if position < holdFrames { return 1 }
+        let decayIndex = position - holdFrames
+        return decayIndex < Self.concealDecayFrames ? decayTable[decayIndex] : 0
+    }
+
     /// Builds the loop from the output history: the last `loopLength`
     /// frames, with the seam blended towards the period before so that the
     /// loop wraps without a step, and an offset correction that joins the
     /// first generated sample to the last output sample.
-    private func startConcealment() {
+    private func buildLoop() {
         let length = findLoopLength()
         loopLength = length
         for j in 0..<length {
@@ -350,22 +518,30 @@ public final class PCMFrameReader: @unchecked Sendable {
         correctionLeft = lastLeft - loop[(length - 1) * Self.channels]
         correctionRight = lastRight - loop[(length - 1) * Self.channels + 1]
         loopPhase = 0
-        concealPosition = 0
     }
 
     /// Writes `frames` concealment frames (interleaved) into `out`.
     private func generate(into out: UnsafeMutablePointer<Float>, frames: Int) {
-        let end = Self.concealHoldFrames + Self.concealDecayFrames
+        let end = holdFrames + Self.concealDecayFrames
+        if concealSource == .opusPlc, let opus, frames == Self.slotFrames {
+            if opus.conceal(into: out) == frames {
+                opusPlcFrames.add(1, ordering: .relaxed)
+                for i in 0..<frames {
+                    let gain = envelopeGain(at: concealPosition)
+                    out[2 * i] *= gain
+                    out[2 * i + 1] *= gain
+                    concealPosition = min(concealPosition + 1, end)
+                }
+                return
+            }
+            // PLC failed (should not happen): fall back to the loop.
+            decodeErrors.add(1, ordering: .relaxed)
+            buildLoop()
+            concealSource = .loop
+        }
         for i in 0..<frames {
             let position = concealPosition
-            let gain: Float
-            if position < Self.concealHoldFrames {
-                gain = 1
-            } else if position < end {
-                gain = decayTable[position - Self.concealHoldFrames]
-            } else {
-                gain = 0
-            }
+            let gain = envelopeGain(at: position)
             var left = loop[loopPhase * Self.channels]
             var right = loop[loopPhase * Self.channels + 1]
             if position < Self.seamFrames {
@@ -460,9 +636,27 @@ public final class PCMFrameReader: @unchecked Sendable {
         }
     }
 
+    /// Decodes one frame of `codec` into `out` (one whole slot); false when
+    /// the payload is not a valid frame.
+    private func decode(
+        _ codec: AudioCodec, _ bytes: UnsafeMutableRawBufferPointer, _ byteCount: Int,
+        into out: UnsafeMutablePointer<Float>
+    ) -> Bool {
+        switch codec {
+        case .pcm16:
+            decodePCM16(bytes, byteCount: byteCount, into: out)
+            return true
+        case .opus:
+            guard let opus, let base = bytes.baseAddress, byteCount > 0, byteCount <= bytes.count else {
+                return false
+            }
+            return opus.decode(base, count: byteCount, into: out) == Self.slotFrames
+        }
+    }
+
     /// Decodes little-endian Int16 interleaved bytes into `out`, zero-filling
     /// any shortfall (defensive against short payloads).
-    private func decode(_ bytes: UnsafeMutableRawBufferPointer, byteCount: Int, into out: UnsafeMutablePointer<Float>) {
+    private func decodePCM16(_ bytes: UnsafeMutableRawBufferPointer, byteCount: Int, into out: UnsafeMutablePointer<Float>) {
         let bytesPerSample = MemoryLayout<Int16>.size
         let toDecode = min(min(byteCount, bytes.count) / bytesPerSample, interleavedPerSlot)
         for i in 0..<toDecode {

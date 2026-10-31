@@ -67,6 +67,14 @@ struct StatsLine: Codable, Sendable {
     var crossfades: Int
     /// Playout frame length in ms (5 since M2.8; depth/target are in frames).
     var frameMs: Int
+    /// Codec being played: "opus" / "pcm16" ("" before the first frame).
+    var codec: String
+    /// Its payload bitrate in kbit/s (Opus CBR: from the frame size).
+    var codecKbps: Int
+    /// Frames that failed to decode (concealed instead), and slots produced
+    /// by Opus packet-loss concealment, since launch.
+    var decodeErrors: Int
+    var opusPlcFrames: Int
 }
 
 /// Appends one JSON line per second to `Documents/stats.jsonl` on a utility

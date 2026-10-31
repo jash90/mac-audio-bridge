@@ -21,11 +21,13 @@ private let receiverKeepaliveEnabled = true
 /// and re-resolves it when the Wi-Fi address changes. A failed listener is
 /// recreated (same name, same port), so a sender keeps working across it.
 ///
-/// Each datagram is one `AudioDatagram` (5 ms frames of interleaved
-/// little-endian Int16 PCM: a primary and/or redundant copies); every frame
-/// is inserted into the jitter buffer stamped with a monotonic arrival time. Datagrams that fail `AudioDatagram.decode`, or
-/// that carry an unexpected codec or payload size, are dropped and counted as
-/// malformed. Start/stop run on the main actor, callbacks are confined to one
+/// Each datagram is one `AudioDatagram` (5 ms frames — interleaved
+/// little-endian Int16 PCM, or one Opus packet per entry: a primary and/or
+/// redundant copies); every frame is inserted into the jitter buffer stamped
+/// with a monotonic arrival time, undecoded (the playout reader decodes Opus
+/// in playout order). Datagrams that fail `AudioDatagram.decode`, or that
+/// carry an unexpected payload size for their codec, are dropped and counted
+/// as malformed. Start/stop run on the main actor, callbacks are confined to one
 /// serial queue.
 final class UDPReceiver: @unchecked Sendable {
     static let port: UInt16 = ReceiverService.preferredPort
@@ -35,6 +37,8 @@ final class UDPReceiver: @unchecked Sendable {
     private static let idlePeerTimeout: TimeInterval = 30
     /// Expected payload of one PCM16 stereo frame: 240 frames × 2 channels × 2 bytes.
     private static let expectedPayloadBytes = AudioFormat.pcm16FrameBytes
+    /// Accepted Opus packet sizes: one byte up to what a jitter-buffer slot holds.
+    private static let opusPayloadBytes = 1...min(OpusSettings.maxPacketBytes, JitterBuffer.maxFramePayloadBytes)
     /// Keepalive cadence, and how recently the last packet must have arrived
     /// for keepalives to keep flowing ("while playing").
     private static let keepaliveInterval: TimeInterval = 0.020
@@ -295,9 +299,14 @@ final class UDPReceiver: @unchecked Sendable {
             countMalformed()
             return false
         }
-        guard datagram.codec == .pcm16,
-            datagram.entries.allSatisfy({ $0.payload.count == Self.expectedPayloadBytes })
-        else {
+        let validSizes: Bool
+        switch datagram.codec {
+        case .pcm16:
+            validSizes = datagram.entries.allSatisfy { $0.payload.count == Self.expectedPayloadBytes }
+        case .opus:
+            validSizes = datagram.entries.allSatisfy { Self.opusPayloadBytes.contains($0.payload.count) }
+        }
+        guard validSizes else {
             countMalformed()
             return false
         }
