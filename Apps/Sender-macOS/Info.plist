@@ -24,6 +24,12 @@
 	<true/>
 	<key>NSAppSleepDisabled</key>
 	<true/>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_macaudiobridge._udp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Mac Audio Bridge uses the local network to find your iPhone and stream audio to it.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Mac Audio Bridge streams your Mac's audio to your iPhone.</string>
 </dict>

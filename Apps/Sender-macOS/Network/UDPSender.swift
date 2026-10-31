@@ -1,66 +1,89 @@
+import BridgeCore
 import Foundation
 import Network
 import os
 import Synchronization
 
-/// Sends one UDP datagram per audio frame to `host:49000`. Recreates the connection
-/// when the host changes. Thread-safe: `send` runs on the converter queue, the other
-/// methods on the main actor.
+/// Sends one UDP datagram per audio frame to the current `ReceiverTarget` —
+/// a Bonjour service (resolved by the system on every new connection) or a
+/// manual host on port 49000.
+///
+/// Liveness: the receiver answers with a 16-byte "MABK" keepalive every
+/// 20 ms while packets arrive. A timer on the connection queue (every
+/// 500 ms, independent of the UI) feeds the keepalive / send timestamps into
+/// `ReceiverLiveness`; after 3 s of unanswered sends, or 3 s without a ready
+/// path, the connection is cancelled and recreated, which re-resolves the
+/// service — this is what follows the iPhone to a new DHCP address.
+///
+/// Thread-safety: `send` runs on the converter queue (one lock read plus
+/// relaxed atomics — no buffering, no extra hop: datagrams go straight to
+/// `NWConnection.send`), `setTarget`/`cancel`/`linkSnapshot` on the main
+/// actor, framework callbacks and the liveness timer on `stateQueue`.
 final class UDPSender: @unchecked Sendable {
-    static let port: UInt16 = 49_000
+    /// Point-in-time view of the link for the menu and the stats line.
+    struct LinkSnapshot: Sendable {
+        var target: ReceiverTarget?
+        /// NWConnection state name ("none" without a connection).
+        var connectionState: String
+        var link: ReceiverLiveness.State?
+        var keepaliveAge: TimeInterval?
+        /// Connections recreated by the liveness check since launch.
+        var reconnects: Int
+    }
+
+    private static let livenessCheckInterval: DispatchTimeInterval = .milliseconds(500)
+    /// First four bytes of the receiver keepalive ("MABK").
+    private static let keepaliveMagic: [UInt8] = [0x4D, 0x41, 0x42, 0x4B]
+    private static let keepaliveLength = 16
 
     private let stateQueue = DispatchQueue(label: "dev.jash90.MacAudioBridge.udp-sender")
-    private let lock = NSLock()
-    private var connection: NWConnection?
-    private var host: String?
-    private var isReady = false
     private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "udp-sender")
+
+    // Guarded by `lock`:
+    private let lock = NSLock()
+    private var target: ReceiverTarget?
+    private var connection: NWConnection?
+    /// Bumped on every new connection; callbacks of older ones are ignored.
+    private var generation: UInt64 = 0
+    private var isReady = false
+    private var connectionState = "none"
+    private var connectionStartNanos: UInt64 = 0
+    private var lastLinkState: ReceiverLiveness.State?
+    private var reconnectCount = 0
+    private var livenessTimer: DispatchSourceTimer?
+
+    /// Uptime (ns) of the last keepalive on the current connection, 0 = none.
+    private let lastKeepaliveNanos = Atomic<UInt64>(0)
+    /// Uptime (ns) of the first datagram sent after the last keepalive,
+    /// 0 = nothing unanswered.
+    private let unansweredSinceNanos = Atomic<UInt64>(0)
     /// Cumulative datagrams/bytes handed to the connection (diagnostics for
     /// the stats log; relaxed readouts).
     private let sentDatagrams = Atomic<Int>(0)
     private let sentBytes = Atomic<Int>(0)
 
-    /// Points the sender at `host`, recreating the connection when it changes.
-    /// An empty string tears the connection down.
-    func setHost(_ host: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard host != self.host else { return }
-        self.host = host
-        if let oldConnection = connection {
-            oldConnection.cancel()
-            connection = nil
-        }
-        isReady = false
-        guard !host.isEmpty else { return }
+    // MARK: - Control (main actor)
 
-        let endpoint = NWEndpoint.Host(host)
-        let port = NWEndpoint.Port(rawValue: Self.port)!
-        let parameters = NWParameters.udp
-        // WMM voice access class: keeps the stream in the AP's voice queue
-        // and out of best-effort contention, and helps iOS power-save
-        // scheduling on the receiving side.
-        parameters.serviceClass = .interactiveVoice
-        let newConnection = NWConnection(host: endpoint, port: port, using: parameters)
-        newConnection.stateUpdateHandler = { [weak self] state in
-            self?.handleState(state, host: host)
-            if case .ready = state {
-                self?.drainReceive(on: newConnection)
+    /// Points the sender at `target`, recreating the connection when it
+    /// changes; nil tears it down.
+    func setTarget(_ newTarget: ReceiverTarget?) {
+        lock.withLock {
+            guard newTarget != target else { return }
+            target = newTarget
+            reconnectLocked(reason: "target changed")
+            if newTarget == nil {
+                stopLivenessTimerLocked()
+            } else {
+                startLivenessTimerLocked()
             }
         }
-        newConnection.start(queue: stateQueue)
-        connection = newConnection
-        logger.info("Connecting to \(host, privacy: .public):\(Self.port)")
     }
 
-    /// Consumes incoming datagrams silently. The receiver replies with 16-byte
-    /// keepalive datagrams (and anything else that is not a valid audio packet
-    /// for this sender role) — they are dropped here, without per-datagram
-    /// logging; errors surface through the state handler.
-    private func drainReceive(on connection: NWConnection) {
-        connection.receiveMessage { [weak self] _, _, _, error in
-            guard error == nil else { return }
-            self?.drainReceive(on: connection)
+    func cancel() {
+        lock.withLock {
+            target = nil
+            reconnectLocked(reason: "cancelled")
+            stopLivenessTimerLocked()
         }
     }
 
@@ -70,6 +93,10 @@ final class UDPSender: @unchecked Sendable {
         let connection = isReady ? connection : nil
         lock.unlock()
         guard let connection else { return }
+        if unansweredSinceNanos.load(ordering: .relaxed) == 0 {
+            _ = unansweredSinceNanos.compareExchange(
+                expected: 0, desired: Self.nowNanos(), ordering: .relaxed)
+        }
         sentDatagrams.wrappingAdd(1, ordering: .relaxed)
         sentBytes.wrappingAdd(data.count, ordering: .relaxed)
         connection.send(content: data, completion: .contentProcessed { _ in
@@ -84,31 +111,214 @@ final class UDPSender: @unchecked Sendable {
         return (datagrams, bytes)
     }
 
-    func cancel() {
-        lock.lock()
-        defer { lock.unlock() }
-        connection?.cancel()
-        connection = nil
-        host = nil
-        isReady = false
+    func linkSnapshot() -> LinkSnapshot {
+        let keepalive = lastKeepaliveNanos.load(ordering: .relaxed)
+        let keepaliveAge = keepalive == 0 ? nil : Self.seconds(since: keepalive)
+        return lock.withLock {
+            LinkSnapshot(
+                target: target,
+                connectionState: connectionState,
+                link: connection == nil ? nil : lastLinkState,
+                keepaliveAge: connection == nil ? nil : keepaliveAge,
+                reconnects: reconnectCount)
+        }
     }
 
-    private func handleState(_ state: NWConnection.State, host: String) {
+    // MARK: - Connection lifecycle (lock held)
+
+    /// Cancels the current connection and, when a target is set, starts a
+    /// fresh one (a fresh connection resolves the Bonjour service again).
+    private func reconnectLocked(reason: String) {
+        connection?.cancel()
+        connection = nil
+        isReady = false
+        lastLinkState = nil
+        generation &+= 1
+        lastKeepaliveNanos.store(0, ordering: .relaxed)
+        unansweredSinceNanos.store(0, ordering: .relaxed)
+        guard let target else {
+            connectionState = "none"
+            return
+        }
+        let newConnection = Self.makeConnection(to: target)
+        newConnection.stateUpdateHandler = Self.makeStateHandler(
+            sender: self, connection: newConnection, generation: generation)
+        connection = newConnection
+        connectionState = "setup"
+        connectionStartNanos = Self.nowNanos()
+        lastLinkState = .connecting
+        newConnection.start(queue: stateQueue)
+        logger.info(
+            "Connecting to \(target.displayName, privacy: .public) (\(reason, privacy: .public))")
+    }
+
+    private func startLivenessTimerLocked() {
+        guard livenessTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: stateQueue)
+        timer.schedule(
+            deadline: .now() + Self.livenessCheckInterval,
+            repeating: Self.livenessCheckInterval)
+        timer.setEventHandler(handler: Self.makeLivenessHandler(sender: self))
+        timer.resume()
+        livenessTimer = timer
+    }
+
+    private func stopLivenessTimerLocked() {
+        livenessTimer?.cancel()
+        livenessTimer = nil
+    }
+
+    // MARK: - Framework callbacks (stateQueue)
+
+    private func handleState(_ state: NWConnection.State, generation: UInt64) {
+        let ready: Bool
         lock.lock()
+        guard generation == self.generation else {
+            lock.unlock()
+            return
+        }
+        let name = target?.displayName ?? "?"
         switch state {
+        case .setup:
+            connectionState = "setup"
+        case .preparing:
+            connectionState = "preparing"
         case .ready:
+            connectionState = "ready"
             isReady = true
         case .waiting(let error):
+            connectionState = "waiting"
             isReady = false
-            logger.info("Waiting for path to \(host, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            logger.info(
+                "Waiting for path to \(name, privacy: .public): \(error.localizedDescription, privacy: .public)")
         case .failed(let error):
+            connectionState = "failed"
             isReady = false
-            logger.error("Connection to \(host, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            logger.error(
+                "Connection to \(name, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
         case .cancelled:
+            connectionState = "cancelled"
             isReady = false
-        default:
+        @unknown default:
             break
         }
+        ready = isReady
+        let connection = self.connection
         lock.unlock()
+        if ready, case .ready = state, let connection {
+            receiveLoop(on: connection, generation: generation)
+        }
+    }
+
+    /// Reads the receiver's replies. 16-byte "MABK" keepalives refresh the
+    /// liveness clock; anything else is dropped silently (no per-datagram
+    /// logging). Errors end the loop; the state handler reports them.
+    private func receiveLoop(on connection: NWConnection, generation: UInt64) {
+        connection.receiveMessage(
+            completion: Self.makeReceiveHandler(
+                sender: self, connection: connection, generation: generation))
+    }
+
+    private func handleReceive(
+        _ data: Data?, error: NWError?, connection: NWConnection, generation: UInt64
+    ) {
+        guard error == nil else { return }
+        let current = lock.withLock { generation == self.generation }
+        guard current else { return }
+        if let data, Self.isKeepalive(data) {
+            lastKeepaliveNanos.store(Self.nowNanos(), ordering: .relaxed)
+            unansweredSinceNanos.store(0, ordering: .relaxed)
+        }
+        receiveLoop(on: connection, generation: generation)
+    }
+
+    /// Liveness check, every 500 ms on `stateQueue`.
+    private func checkLiveness() {
+        let now = Self.nowNanos()
+        let keepalive = lastKeepaliveNanos.load(ordering: .relaxed)
+        let unanswered = unansweredSinceNanos.load(ordering: .relaxed)
+        lock.withLock {
+            guard target != nil, connection != nil else { return }
+            let assessment = ReceiverLiveness.assess(
+                connectionAge: Self.seconds(from: connectionStartNanos, to: now),
+                isReady: isReady,
+                keepaliveAge: keepalive == 0 ? nil : Self.seconds(from: keepalive, to: now),
+                unansweredSendAge: unanswered == 0 ? nil : Self.seconds(from: unanswered, to: now))
+            if assessment.decision == .reconnect {
+                reconnectCount += 1
+                logger.info(
+                    "No keepalive from \(self.target?.displayName ?? "?", privacy: .public) — recreating the connection")
+                reconnectLocked(reason: "liveness timeout")
+                lastLinkState = .noResponse
+            } else if assessment.state == .connecting, lastLinkState == .noResponse {
+                // Recreated after a timeout: keep reporting "no response"
+                // until a keepalive actually arrives on the new connection.
+            } else {
+                lastLinkState = assessment.state
+            }
+        }
+    }
+
+    // MARK: - Nonisolated factories (capture only Sendable state)
+
+    nonisolated private static func makeConnection(to target: ReceiverTarget) -> NWConnection {
+        let parameters = NWParameters.udp
+        // WMM voice access class: keeps the stream in the AP's voice queue
+        // and out of best-effort contention, and helps iOS power-save
+        // scheduling on the receiving side.
+        parameters.serviceClass = .interactiveVoice
+        let endpoint: NWEndpoint
+        switch target {
+        case .service(let name):
+            endpoint = .service(
+                name: name, type: ReceiverService.type, domain: ReceiverService.domain,
+                interface: nil)
+        case .host(let host):
+            endpoint = .hostPort(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(rawValue: ReceiverService.preferredPort)!)
+        }
+        return NWConnection(to: endpoint, using: parameters)
+    }
+
+    nonisolated private static func makeStateHandler(
+        sender: UDPSender, connection: NWConnection, generation: UInt64
+    ) -> @Sendable (NWConnection.State) -> Void {
+        { [weak sender] state in
+            sender?.handleState(state, generation: generation)
+        }
+    }
+
+    nonisolated private static func makeReceiveHandler(
+        sender: UDPSender, connection: NWConnection, generation: UInt64
+    ) -> @Sendable (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void {
+        { [weak sender] data, _, _, error in
+            sender?.handleReceive(data, error: error, connection: connection, generation: generation)
+        }
+    }
+
+    nonisolated private static func makeLivenessHandler(sender: UDPSender) -> @Sendable () -> Void {
+        { [weak sender] in
+            sender?.checkLiveness()
+        }
+    }
+
+    // MARK: - Helpers
+
+    private static func isKeepalive(_ data: Data) -> Bool {
+        data.count == keepaliveLength && data.prefix(keepaliveMagic.count).elementsEqual(keepaliveMagic)
+    }
+
+    /// Monotonic uptime in nanoseconds (never 0 in practice; 0 is "none").
+    private static func nowNanos() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
+    }
+
+    private static func seconds(since start: UInt64) -> TimeInterval {
+        seconds(from: start, to: nowNanos())
+    }
+
+    private static func seconds(from start: UInt64, to end: UInt64) -> TimeInterval {
+        end > start ? Double(end - start) / 1_000_000_000 : 0
     }
 }
