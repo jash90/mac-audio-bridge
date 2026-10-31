@@ -372,6 +372,54 @@ struct JitterBufferTests {
         #expect(buffer.pop() == .packet(packet(sequence: 0, streamFrame: 0)))
     }
 
+    // MARK: - Latency trim
+
+    @Test("Surplus depth above target + slack is trimmed one frame per second")
+    func surplusDepthIsTrimmed() {
+        var config = JitterBufferConfig()
+        config.minTargetFrames = 3
+        config.maxTargetFrames = 12
+        let buffer = JitterBuffer(config: config)
+
+        // On-time arrivals (target stays at 3) but playout started 15 frames
+        // behind — the depth a decayed transient leaves behind.
+        var lastPlayed: UInt32?
+        var inOrder = true
+        var trimmedAfter5s = 0
+        for frame in 0..<2000 {
+            insert(buffer, sequence: UInt32(frame), streamFrame: UInt64(frame))
+            guard frame >= 15 else { continue }
+            if case .packet(let packet) = buffer.pop() {
+                if let lastPlayed, !sequenceIsAfter(packet.sequence, lastPlayed) { inOrder = false }
+                lastPlayed = packet.sequence
+            }
+            if frame == 515 { trimmedAfter5s = buffer.stats.trimmed }
+        }
+        let stats = buffer.stats
+        #expect(inOrder)
+        #expect(stats.targetFrames == 3)
+        // Rate limit: at most one frame per second of playout.
+        #expect(trimmedAfter5s <= 5)
+        // Converged: peak depth within target + slack, nothing lost or late.
+        #expect(stats.depthFrames <= 3 + 2)
+        #expect(stats.trimmed >= 10)
+        #expect(stats.lost == 0)
+        #expect(stats.late == 0)
+    }
+
+    @Test("Depth within target + slack is never trimmed")
+    func depthWithinSlackIsNotTrimmed() {
+        var config = JitterBufferConfig()
+        config.minTargetFrames = 3
+        config.maxTargetFrames = 12
+        let buffer = JitterBuffer(config: config)
+        for frame in 0..<1000 {
+            insert(buffer, sequence: UInt32(frame), streamFrame: UInt64(frame))
+            if frame >= 4 { _ = buffer.pop() }
+        }
+        #expect(buffer.stats.trimmed == 0)
+    }
+
     @Test("applyConfig resets buffered audio and applies the new range immediately")
     func applyConfigResetsAndApplies() {
         let buffer = JitterBuffer(config: .latency(.balanced))

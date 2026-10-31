@@ -20,9 +20,15 @@ import Synchronization
 ///   linear fade to silence across the frame.
 /// - second and later `.lost` in a streak: silence.
 /// - `.buffering`: silence.
+/// - a `.packet` that does not continue the previous slot's packet (the
+///   jitter buffer's latency trim skipped a frame): the first
+///   `spliceRampFrames` frames ramp linearly from the last output sample into
+///   the new audio, so the splice does not click.
 public final class PCMFrameReader: @unchecked Sendable {
     /// Interleaved samples per playout frame (480 frames × 2 channels).
     private let samplesPerFrame = AudioFormat.samplesPerFrame * AudioFormat.channelCount
+    /// Length of the splice ramp after a skipped frame (1 ms at 48 kHz).
+    public static let spliceRampFrames = 48
 
     /// Supplies the next playout output; called exactly once per playout
     /// frame consumed.
@@ -40,6 +46,9 @@ public final class PCMFrameReader: @unchecked Sendable {
     private var currentIsAudio = false
     private var hasLastGood = false
     private var lossStreak = 0
+    /// Sequence of the packet decoded into `current`, when the previous slot
+    /// was a packet; nil after a loss, buffering or reset.
+    private var previousPacketSequence: UInt32?
     /// Remaining interleaved samples of the frame being played, published for
     /// the latency readout. Relaxed and approximate by design.
     private let pendingSamples = Atomic<Int>(0)
@@ -92,6 +101,7 @@ public final class PCMFrameReader: @unchecked Sendable {
         currentIsAudio = false
         hasLastGood = false
         lossStreak = 0
+        previousPacketSequence = nil
         pendingSamples.store(0, ordering: .relaxed)
     }
 
@@ -103,6 +113,14 @@ public final class PCMFrameReader: @unchecked Sendable {
         switch source() {
         case .packet(let packet):
             decodePayload(of: packet, into: current)
+            if let previous = previousPacketSequence, packet.sequence != previous &+ 1 {
+                // `lastGood` still holds the previous frame, whose last
+                // samples were the last ones output.
+                smoothSplice(
+                    fromLeft: lastGood[samplesPerFrame - 2],
+                    right: lastGood[samplesPerFrame - 1])
+            }
+            previousPacketSequence = packet.sequence
             lastGood.update(from: current, count: samplesPerFrame)
             hasLastGood = true
             lossStreak = 0
@@ -120,10 +138,24 @@ public final class PCMFrameReader: @unchecked Sendable {
                 current.update(repeating: 0, count: samplesPerFrame)
             }
             currentIsAudio = false
+            previousPacketSequence = nil
         case .buffering:
             current.update(repeating: 0, count: samplesPerFrame)
             lossStreak = 0
             currentIsAudio = false
+            previousPacketSequence = nil
+        }
+    }
+
+    /// Ramps the start of `current` from the previous output sample of each
+    /// channel into the new audio (linear crossfade over `spliceRampFrames`).
+    private func smoothSplice(fromLeft left: Float, right: Float) {
+        let rampFrames = Self.spliceRampFrames
+        for frame in 0..<rampFrames {
+            let weight = Float(frame + 1) / Float(rampFrames + 1)
+            let l = frame * 2
+            current[l] = left + (current[l] - left) * weight
+            current[l + 1] = right + (current[l + 1] - right) * weight
         }
     }
 

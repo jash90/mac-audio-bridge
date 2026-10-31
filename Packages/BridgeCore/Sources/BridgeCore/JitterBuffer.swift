@@ -54,6 +54,16 @@ public struct JitterBufferConfig: Sendable {
     /// the current target for this many seconds of playout
     /// (`.delayPercentile` estimator).
     public var targetFallHoldSeconds: TimeInterval = 5.0
+    /// Latency trim: when the peak depth over a `latencyTrimWindowSeconds`
+    /// window of playout exceeds `target + latencyTrimSlackFrames`, one frame
+    /// is skipped so the real buffering delay follows a falling target.
+    /// Without it, a target that decays after a transient leaves the depth —
+    /// the actual latency — where the transient put it (arrivals and pops
+    /// both run at 100/s, so nothing drains the surplus). Nil disables it.
+    public var latencyTrimSlackFrames: Int? = 2
+    /// Playout time per trim decision: at most one frame (10 ms) is skipped
+    /// per window.
+    public var latencyTrimWindowSeconds: TimeInterval = 1.0
 
     public init() {}
 
@@ -101,6 +111,8 @@ public struct JitterBufferStats: Sendable, Equatable {
     public var duplicates = 0
     /// Oldest frames dropped to recover from depth overflow.
     public var overflowDropped = 0
+    /// Frames skipped by the latency trim (depth above target + slack).
+    public var trimmed = 0
     /// Playout slots that found the buffer completely empty.
     public var underruns = 0
     /// Transitions from playing back to buffering: cushion rebuilds after a
@@ -158,6 +170,15 @@ public struct JitterBufferStats: Sendable, Equatable {
 /// audible gap stays short. Rising through several target steps (a
 /// staircase) is debounced into a single rebuild, so one jitter step costs
 /// at most a rebuild or two rather than one per step.
+///
+/// Latency trim: the target only says how deep the buffer should be; the
+/// depth itself does not shrink when the target falls, because arrivals and
+/// pops both run at the frame rate. A transient that built a 200 ms cushion
+/// would otherwise keep 200 ms of latency long after the target decayed.
+/// So when the peak depth over a one-second playout window stays above
+/// `target + latencyTrimSlackFrames`, one frame is skipped (at most one per
+/// window, i.e. ≤ 10 ms of shortening per second; the reader smooths the
+/// splice).
 public final class JitterBuffer: @unchecked Sendable {
     /// All mutable state, guarded by `lock`.
     private struct State: Sendable {
@@ -213,6 +234,12 @@ public final class JitterBuffer: @unchecked Sendable {
         /// rising staircase of targets collapses into one rebuild.
         var insertCount = 0
         var pendingRiseInsert: Int?
+        /// Latency-trim window: pops counted and peak depth seen in it, and
+        /// whether a trim is due (it waits for two consecutive frames to be
+        /// buffered so the skip never turns into a loss).
+        var trimWindowPops = 0
+        var trimWindowMaxDepth = 0
+        var trimPending = false
         var counters = JitterBufferStats()
 
         init(config: JitterBufferConfig) {
@@ -296,6 +323,7 @@ public final class JitterBuffer: @unchecked Sendable {
                         state.exitTarget = 0
                         state.pendingRiseInsert = nil
                         state.consecutiveEmptyPops = 0
+                        self.resetTrimWindow(&state)
                     }
                 }
             } else {
@@ -326,14 +354,23 @@ public final class JitterBuffer: @unchecked Sendable {
                 state.hasPlayedOnce = true
                 state.exitTarget = state.target
                 state.consecutiveEmptyPops = 0
+                self.resetTrimWindow(&state)
                 // Playback (re)starts from the lowest buffered sequence;
                 // while rebuffering the head is kept, and nothing below it
                 // can be buffered, so this only moves it up over a gap.
                 state.nextExpected = self.lowestSequence(state.buffered)
             }
 
-            guard let expected = state.nextExpected else { return .buffering }
+            guard var expected = state.nextExpected else { return .buffering }
             state.playoutSeconds += config.frameDuration
+            if self.shouldTrim(&state, expected: expected) {
+                // Skip the oldest frame: the next one is buffered too, so the
+                // stream stays contiguous apart from this 10 ms.
+                state.buffered.removeValue(forKey: expected)
+                state.counters.trimmed += 1
+                expected = expected &+ 1
+                state.nextExpected = expected
+            }
 
             if let packet = state.buffered.removeValue(forKey: expected) {
                 state.consecutiveEmptyPops = 0
@@ -362,6 +399,7 @@ public final class JitterBuffer: @unchecked Sendable {
                 state.counters.rebuffers += 1
                 state.consecutiveEmptyPops = 0
                 state.pendingRiseInsert = nil
+                self.resetTrimWindow(&state)
             }
             return .lost(sequence: expected)
         }
@@ -408,6 +446,41 @@ public final class JitterBuffer: @unchecked Sendable {
     }
 
     // MARK: - Internals
+
+    /// Latency trim decision for this pop (playing phase): tracks the peak
+    /// depth over the trim window and, once a window ends with the peak above
+    /// `target + slack`, arms a trim that fires on the first pop where the
+    /// expected frame and its successor are both buffered. The peak — not
+    /// the instantaneous depth — is compared because bursty delivery makes
+    /// the depth swing below the target between bursts; only a surplus that
+    /// persists even at the burst peaks is pure added latency.
+    private func shouldTrim(_ state: inout State, expected: UInt32) -> Bool {
+        guard let slack = config.latencyTrimSlackFrames else { return false }
+        state.trimWindowMaxDepth = max(state.trimWindowMaxDepth, state.buffered.count)
+        state.trimWindowPops += 1
+        if TimeInterval(state.trimWindowPops) * config.frameDuration
+            >= config.latencyTrimWindowSeconds - 1e-9
+        {
+            if state.trimWindowMaxDepth > state.target + slack {
+                state.trimPending = true
+            }
+            state.trimWindowPops = 0
+            state.trimWindowMaxDepth = 0
+        }
+        guard state.trimPending,
+            state.buffered.count > state.target,
+            state.buffered[expected] != nil,
+            state.buffered[expected &+ 1] != nil
+        else { return false }
+        state.trimPending = false
+        return true
+    }
+
+    private func resetTrimWindow(_ state: inout State) {
+        state.trimWindowPops = 0
+        state.trimWindowMaxDepth = 0
+        state.trimPending = false
+    }
 
     /// Cushion a buffering exit needs for `target`: with `target - 1` frames
     /// of spacing plus the newest packet's network delay, no on-time packet
@@ -556,5 +629,6 @@ public final class JitterBuffer: @unchecked Sendable {
         state.histogram = DelayHistogram(window: config.delayWindowSeconds)
         state.lowEstimateSince = nil
         state.pendingRiseInsert = nil
+        resetTrimWindow(&state)
     }
 }
