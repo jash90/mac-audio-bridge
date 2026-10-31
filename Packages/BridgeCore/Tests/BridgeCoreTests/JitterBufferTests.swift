@@ -63,6 +63,8 @@ struct JitterBufferTests {
         #expect(buffer.pop() == .buffering)
         #expect(buffer.pop() == .buffering)
         #expect(buffer.stats.depthFrames == 3)
+        // Initial prebuffering is not a mid-stream silence gap.
+        #expect(buffer.stats.bufferingPops == 0)
 
         insert(buffer, sequence: 3, streamFrame: 3)
         // Playback starts from the lowest buffered sequence.
@@ -224,6 +226,10 @@ struct JitterBufferTests {
         #expect(stats.late == 0)
         #expect(stats.duplicates == 0)
         #expect(stats.received == 9)
+        // A discontinuity reset is caller-driven prebuffering, not a
+        // rebuffer; the silence it causes still counts as a mid-stream gap.
+        #expect(stats.rebuffers == 0)
+        #expect(stats.bufferingPops == 1)
     }
 
     @Test("Depth above overflowFrames drops the oldest frames down to target")
@@ -256,9 +262,14 @@ struct JitterBufferTests {
         }
         let stats = buffer.stats
         #expect(stats.underruns == 8)
+        // The sustained stall itself was the rebuffer; the empty pops report
+        // losses, not silence gaps.
+        #expect(stats.rebuffers == 1)
+        #expect(stats.bufferingPops == 0)
 
         // The sustained stall returned the buffer to prebuffering.
         #expect(buffer.pop() == .buffering)
+        #expect(buffer.stats.bufferingPops == 1)
 
         insert(buffer, sequences: 20, 21, 22, 23)
         #expect(buffer.pop() == .packet(packet(sequence: 20, streamFrame: 20)))

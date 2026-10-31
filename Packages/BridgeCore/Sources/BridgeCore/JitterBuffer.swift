@@ -42,6 +42,12 @@ public struct JitterBufferStats: Sendable, Equatable {
     public var overflowDropped = 0
     /// Playout slots that found the buffer completely empty.
     public var underruns = 0
+    /// Transitions from playing back to buffering: cushion rebuilds after a
+    /// target rise, plus returns to prebuffering after a sustained underrun.
+    public var rebuffers = 0
+    /// Pops that returned `.buffering` after the first playing run started,
+    /// i.e. silence gaps mid-stream (initial prebuffering excluded).
+    public var bufferingPops = 0
     /// Frames currently buffered.
     public var depthFrames = 0
     /// Current adaptive target depth in frames.
@@ -60,11 +66,17 @@ public struct JitterBufferStats: Sendable, Equatable {
 ///
 /// Adaptivity: the target depth follows an RFC 3550 interarrival jitter
 /// estimate (`ceil(jitterMultiplier * jitter / frameDuration) + 1`, clamped
-/// to `[minTargetFrames, maxTargetFrames]`). The target rises immediately;
-/// when it rises above the cushion the current playing run started with and
-/// the buffer is shallower than the new target, the buffer briefly returns to
-/// `.buffering` to rebuild the deeper cushion. The target falls at most one
-/// frame per two seconds of playout, to avoid oscillation.
+/// to `[minTargetFrames, maxTargetFrames]`). The target rises immediately
+/// and falls at most one frame per two seconds of playout.
+///
+/// Cushion: the buffer tracks how far playout lags the newest arrival (the
+/// cushion). When a risen target demands more cushion than the current
+/// playing run started with, the buffer returns to `.buffering` and rebuilds
+/// it; the rebuild ends as soon as the cushion reaches
+/// `(target - 1) * frameDuration`, so the audible gap stays short. Rising
+/// through several target steps (a staircase) is debounced into a single
+/// rebuild, so one jitter step costs at most a rebuild or two rather than
+/// one per step.
 public final class JitterBuffer: @unchecked Sendable {
     /// All mutable state, guarded by `lock`.
     private struct State: Sendable {
@@ -78,6 +90,9 @@ public final class JitterBuffer: @unchecked Sendable {
         /// Next sequence to hand out. Nil until the first buffering exit;
         /// kept across rebuffering so stragglers are still classified as late.
         var nextExpected: UInt32?
+        /// True once playback has started at least once; gates the
+        /// `bufferingPops` counter (initial prebuffering is not a gap).
+        var hasPlayedOnce = false
         /// Target the current playing run left buffering with; 0 while
         /// prebuffering or after a reset.
         var exitTarget = 0
@@ -92,6 +107,19 @@ public final class JitterBuffer: @unchecked Sendable {
         var jitter: TimeInterval = 0
         var lastArrival: TimeInterval?
         var lastMediaTime: TimeInterval?
+        /// Media-clock anchor of the newest inserted packet, used to
+        /// extrapolate the media time of any sequence number.
+        var anchorSequence: UInt32?
+        var anchorMediaTime: TimeInterval = 0
+        /// Arrival time of the newest insert minus the media time of the
+        /// playback reference (the expected sequence while playing, the
+        /// lowest buffered sequence while rebuffering): the cushion.
+        var cushionEstimate: TimeInterval = 0
+        /// Insert counter, and the count at which a pending cushion rebuild
+        /// first became due; the rebuild is debounced by insert count so a
+        /// rising staircase of targets collapses into one rebuild.
+        var insertCount = 0
+        var pendingRiseInsert: Int?
         var counters = JitterBufferStats()
 
         init(minTargetFrames: Int) {
@@ -101,6 +129,9 @@ public final class JitterBuffer: @unchecked Sendable {
 
     private let config: JitterBufferConfig
     private let lock: OSAllocatedUnfairLock<State>
+    /// A target rise must persist this many inserts (~350 ms at stream rate)
+    /// before the cushion rebuild fires.
+    private let rebuildDebounceInserts = 35
 
     public init(config: JitterBufferConfig = .init()) {
         self.config = config
@@ -119,10 +150,15 @@ public final class JitterBuffer: @unchecked Sendable {
                 self.resetBuffer(&state)
             }
             state.counters.received += 1
+            state.insertCount += 1
 
             let mediaTime = Double(packet.sampleTime) / AudioFormat.sampleRate
             self.updateJitter(&state, arrivalTime: arrivalTime, mediaTime: mediaTime)
             self.updateTarget(&state)
+
+            state.anchorSequence = packet.sequence
+            state.anchorMediaTime = mediaTime
+            self.updateCushionEstimate(&state, arrivalTime: arrivalTime)
 
             let sequence = packet.sequence
             if state.buffered[sequence] != nil {
@@ -145,16 +181,26 @@ public final class JitterBuffer: @unchecked Sendable {
             }
 
             if state.phase == .playing, state.target > state.exitTarget {
-                if state.buffered.count < state.target {
-                    // The adapted target now demands a deeper cushion than
-                    // the one this playing run started with: pause playback
-                    // and rebuild it.
-                    state.phase = .buffering
-                    state.exitTarget = 0
-                } else {
-                    // Already deep enough for the new target.
+                if state.cushionEstimate >= self.requiredCushion(forTarget: state.target) {
+                    // The current cushion already satisfies the risen target.
                     state.exitTarget = state.target
+                    state.pendingRiseInsert = nil
+                } else {
+                    if state.pendingRiseInsert == nil {
+                        state.pendingRiseInsert = state.insertCount
+                    }
+                    if state.insertCount - state.pendingRiseInsert! >= rebuildDebounceInserts {
+                        // The risen target demands a deeper cushion than this
+                        // playing run started with: pause playback and rebuild.
+                        state.phase = .buffering
+                        state.counters.rebuffers += 1
+                        state.exitTarget = 0
+                        state.pendingRiseInsert = nil
+                        state.consecutiveEmptyPops = 0
+                    }
                 }
+            } else {
+                state.pendingRiseInsert = nil
             }
         }
     }
@@ -164,13 +210,26 @@ public final class JitterBuffer: @unchecked Sendable {
     /// exactly once per `frameDuration` by the playout clock.
     public func pop() -> JitterBufferOutput {
         lock.withLock { (state: inout State) in
-            // Leave buffering once the depth reaches the target; playback
-            // then starts from the lowest buffered sequence.
+            // Leave buffering once the depth reaches the target or the
+            // cushion is already deep enough; playback then (re)starts from
+            // the lowest buffered sequence.
             if state.phase == .buffering {
-                guard state.buffered.count >= state.target else { return .buffering }
+                let deepEnough = state.buffered.count >= state.target
+                let cushioned = !state.buffered.isEmpty
+                    && state.cushionEstimate >= self.requiredCushion(forTarget: state.target)
+                guard deepEnough || cushioned else {
+                    if state.hasPlayedOnce {
+                        state.counters.bufferingPops += 1
+                    }
+                    return .buffering
+                }
                 state.phase = .playing
+                state.hasPlayedOnce = true
                 state.exitTarget = state.target
                 state.consecutiveEmptyPops = 0
+                // Playback (re)starts from the lowest buffered sequence;
+                // while rebuffering the head is kept, and nothing below it
+                // can be buffered, so this only moves it up over a gap.
                 state.nextExpected = self.lowestSequence(state.buffered)
             }
 
@@ -200,7 +259,9 @@ public final class JitterBuffer: @unchecked Sendable {
             state.consecutiveEmptyPops += 1
             if state.consecutiveEmptyPops >= config.maxTargetFrames {
                 state.phase = .buffering
+                state.counters.rebuffers += 1
                 state.consecutiveEmptyPops = 0
+                state.pendingRiseInsert = nil
             }
             return .lost(sequence: expected)
         }
@@ -228,6 +289,13 @@ public final class JitterBuffer: @unchecked Sendable {
     }
 
     // MARK: - Internals
+
+    /// Cushion a buffering exit needs for `target`: with `target - 1` frames
+    /// of spacing plus the newest packet's network delay, no on-time packet
+    /// can arrive after its playout slot.
+    private func requiredCushion(forTarget target: Int) -> TimeInterval {
+        TimeInterval(max(target - 1, 0)) * config.frameDuration
+    }
 
     /// RFC 3550 section 6.4.1 interarrival jitter: the smoothed mean absolute
     /// deviation of the arrival spacing from the media (RTP) timestamp
@@ -263,8 +331,29 @@ public final class JitterBuffer: @unchecked Sendable {
         }
     }
 
+    /// Refreshes the cushion estimate after an insert. While playing, the
+    /// reference is the next expected sequence (how far playout lags the
+    /// newest arrival); while rebuffering, it is the sequence playback will
+    /// restart from, so the estimate is a safe lower bound for the cushion
+    /// the restart will have.
+    private func updateCushionEstimate(_ state: inout State, arrivalTime: TimeInterval) {
+        guard let anchorSequence = state.anchorSequence else { return }
+        func mediaTime(of sequence: UInt32) -> TimeInterval {
+            let offset = Int64(Int32(bitPattern: sequence &- anchorSequence))
+            return state.anchorMediaTime + TimeInterval(offset) * config.frameDuration
+        }
+        let reference: UInt32?
+        if state.phase == .playing {
+            reference = state.nextExpected
+        } else {
+            reference = lowestSequence(state.buffered)
+        }
+        guard let reference else { return }
+        state.cushionEstimate = arrivalTime - mediaTime(of: reference)
+    }
+
     /// Lowest buffered sequence, wrap-around aware. Linear scan; the depth is
-    /// bounded by `overflowFrames`, so this stays cheap on the pop path.
+    /// bounded by `overflowFrames`, so this stays cheap.
     private func lowestSequence(_ buffered: [UInt32: AudioPacket]) -> UInt32? {
         var lowest: UInt32?
         for sequence in buffered.keys {
@@ -286,5 +375,9 @@ public final class JitterBuffer: @unchecked Sendable {
         state.jitter = 0
         state.lastArrival = nil
         state.lastMediaTime = nil
+        state.anchorSequence = nil
+        state.anchorMediaTime = 0
+        state.cushionEstimate = 0
+        state.pendingRiseInsert = nil
     }
 }
