@@ -10,6 +10,11 @@ import os
 /// sample time advance continuously for the app's lifetime; the first packet of
 /// every run carries `.discontinuity` so the receiver resets its jitter buffer.
 ///
+/// Each tick drains EVERYTHING the ring holds (loop until empty), so a late
+/// timer — App Nap or timer coalescing — costs latency, not audio: the next
+/// tick emits every complete frame that piled up. The worst observed gap
+/// between ticks is exposed for the stats log.
+///
 /// All mutable state is confined to `queue`. Must be started/stopped from the main
 /// actor (like all owners in this app).
 final class FrameConverter: @unchecked Sendable {
@@ -52,6 +57,10 @@ final class FrameConverter: @unchecked Sendable {
     private var nextSequence: UInt32 = 0
     private var nextSampleTime: UInt64 = 0
     private var pendingDiscontinuity = false
+    /// Drain-timing diagnostics: the last tick's timestamp and the largest
+    /// tick-to-tick gap since the last `takeMaxTickIntervalMilliseconds`.
+    private var lastTickTime: DispatchTime?
+    private var maxTickInterval: TimeInterval = 0
 
     /// Samples (interleaved) per emitted frame: 480 frames × 2 channels.
     private static let samplesPerFrame = AudioFormat.samplesPerFrame * AudioFormat.channelCount
@@ -73,6 +82,8 @@ final class FrameConverter: @unchecked Sendable {
             self.sawNonZeroSamples = false
             self.runGeneration += 1
             self.staging.removeAll(keepingCapacity: true)
+            self.lastTickTime = nil
+            self.maxTickInterval = 0
             // The first packet of every run tells the receiver to reset.
             self.pendingDiscontinuity = true
 
@@ -174,6 +185,24 @@ final class FrameConverter: @unchecked Sendable {
             inputCapacitySamples = 0
             outputBuffer = nil
             staging.removeAll(keepingCapacity: true)
+            lastTickTime = nil
+            maxTickInterval = 0
+        }
+    }
+
+    /// Largest gap between drain ticks (in milliseconds) since the last call,
+    /// then resets the tracker. Includes the gap from the last tick to now,
+    /// so a fully stalled timer shows up even without a subsequent tick.
+    /// Zero while not running.
+    func takeMaxTickIntervalMilliseconds() -> Double {
+        queue.sync {
+            var worst = maxTickInterval
+            if let last = lastTickTime {
+                let idleGap = Double(DispatchTime.now().uptimeNanoseconds - last.uptimeNanoseconds) * 1e-9
+                worst = max(worst, idleGap)
+            }
+            maxTickInterval = 0
+            return worst * 1000
         }
     }
 
@@ -186,56 +215,75 @@ final class FrameConverter: @unchecked Sendable {
 
     private func drainOnce() {
         guard isRunning, let ring else { return }
+        recordTick()
 
         if let converter, let outputBuffer, let inputBuffer, let inputSamples,
             inputCapacitySamples > 0
         {
-            var conversionError: NSError?
-            let capacitySamples = inputCapacitySamples
-            // The converter fills up to the output buffer's capacity; frameLength on
-            // return holds the produced frame count. `.inputRanDry` is normal — the
-            // next timer tick pulls whatever arrived in the meantime. The input block
-            // runs synchronously on this queue, so capturing the locals is safe.
-            let status = converter.convert(to: outputBuffer, error: &conversionError) {
-                requestedPackets, outStatus in
-                let wanted = min(
-                    Int(requestedPackets) * AudioFormat.channelCount,
-                    capacitySamples)
-                let got = ring.read(into: inputSamples, count: wanted)
-                self.trackNonZeroSamples(inputSamples, count: got)
-                guard got > 0 else {
-                    // Momentarily empty. `.noDataNow` keeps the converter's state
-                    // intact — `.endOfStream` would terminate its input permanently.
-                    outStatus.pointee = .noDataNow
-                    return nil
+            // Resampling path: keep converting until a call produces nothing —
+            // the ring is then fully drained into the staging buffer.
+            while true {
+                var conversionError: NSError?
+                let capacitySamples = inputCapacitySamples
+                // The converter fills up to the output buffer's capacity; frameLength
+                // on return holds the produced frame count. `.inputRanDry` is normal —
+                // the loop ends when a call yields no output. The input block runs
+                // synchronously on this queue, so capturing the locals is safe.
+                let status = converter.convert(to: outputBuffer, error: &conversionError) {
+                    requestedPackets, outStatus in
+                    let wanted = min(
+                        Int(requestedPackets) * AudioFormat.channelCount,
+                        capacitySamples)
+                    let got = ring.read(into: inputSamples, count: wanted)
+                    self.trackNonZeroSamples(inputSamples, count: got)
+                    guard got > 0 else {
+                        // Momentarily empty. `.noDataNow` keeps the converter's state
+                        // intact — `.endOfStream` would terminate its input permanently.
+                        outStatus.pointee = .noDataNow
+                        return nil
+                    }
+                    inputBuffer.frameLength = AVAudioFrameCount(got / AudioFormat.channelCount)
+                    return inputBuffer
                 }
-                inputBuffer.frameLength = AVAudioFrameCount(got / AudioFormat.channelCount)
-                return inputBuffer
-            }
-            if status == .error {
-                logger.error(
-                    "Conversion failed: \(conversionError?.localizedDescription ?? "unknown error", privacy: .public)")
-            }
-            if outputBuffer.frameLength > 0,
-                let outputSamples = outputBuffer.audioBufferList.pointee.mBuffers.mData?
-                    .assumingMemoryBound(to: Float.self)
-            {
-                staging.append(
-                    contentsOf: UnsafeBufferPointer(
-                        start: outputSamples,
-                        count: Int(outputBuffer.frameLength) * AudioFormat.channelCount))
+                if status == .error {
+                    logger.error(
+                        "Conversion failed: \(conversionError?.localizedDescription ?? "unknown error", privacy: .public)")
+                }
+                let producedSamples = Int(outputBuffer.frameLength) * AudioFormat.channelCount
+                if producedSamples > 0,
+                    let outputSamples = outputBuffer.audioBufferList.pointee.mBuffers.mData?
+                        .assumingMemoryBound(to: Float.self)
+                {
+                    staging.append(
+                        contentsOf: UnsafeBufferPointer(
+                            start: outputSamples,
+                            count: producedSamples))
+                }
+                if producedSamples == 0 { break }
             }
         } else if let inputSamples, inputCapacitySamples > 0 {
-            // Tap already runs at 48 kHz — no resampling needed.
-            let got = ring.read(into: inputSamples, count: inputCapacitySamples)
-            trackNonZeroSamples(inputSamples, count: got)
-            if got > 0 {
+            // Tap already runs at 48 kHz — no resampling needed. Read until the
+            // ring is empty so a late tick drains everything that piled up.
+            while true {
+                let got = ring.read(into: inputSamples, count: inputCapacitySamples)
+                guard got > 0 else { break }
+                trackNonZeroSamples(inputSamples, count: got)
                 staging.append(
                     contentsOf: UnsafeBufferPointer(start: inputSamples, count: got))
             }
         }
 
         emitCompleteFrames()
+    }
+
+    /// Records the tick timestamp and the largest tick-to-tick gap.
+    private func recordTick() {
+        let now = DispatchTime.now()
+        if let last = lastTickTime {
+            let interval = Double(now.uptimeNanoseconds - last.uptimeNanoseconds) * 1e-9
+            maxTickInterval = max(maxTickInterval, interval)
+        }
+        lastTickTime = now
     }
 
     /// Records whether any nonzero sample has been read since the run started —

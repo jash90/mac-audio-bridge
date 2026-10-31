@@ -56,14 +56,22 @@ struct JitterBufferTests {
 
     // MARK: - Buffering and playback
 
-    @Test("lowLatency preset is valid: min ≤ max < overflow")
-    func lowLatencyPresetIsValid() {
-        let config = JitterBufferConfig.lowLatency
-        #expect(config.minTargetFrames == 3)
-        #expect(config.maxTargetFrames == 8)
-        #expect(config.overflowFrames == 12)
-        #expect(config.minTargetFrames <= config.maxTargetFrames)
-        #expect(config.maxTargetFrames < config.overflowFrames)
+    @Test("Latency presets are valid: min ≤ max < overflow, overflow = max + 6")
+    func latencyPresetsAreValid() {
+        let presets: [JitterLatencyMode: (min: Int, max: Int)] = [
+            .low: (3, 12),
+            .balanced: (5, 25),
+            .safe: (10, 40),
+        ]
+        for (mode, bounds) in presets {
+            let config = JitterBufferConfig.latency(mode)
+            #expect(config.minTargetFrames == bounds.min)
+            #expect(config.maxTargetFrames == bounds.max)
+            #expect(config.overflowFrames == config.maxTargetFrames + 6)
+            #expect(config.minTargetFrames <= config.maxTargetFrames)
+            #expect(config.maxTargetFrames < config.overflowFrames)
+            #expect(config.targetEstimator == .delayPercentile)
+        }
     }
 
     @Test("Stays in buffering until the depth reaches the target")
@@ -283,5 +291,99 @@ struct JitterBufferTests {
 
         insert(buffer, sequences: 20, 21, 22, 23)
         #expect(buffer.pop() == .packet(packet(sequence: 20, streamFrame: 20)))
+    }
+
+    // MARK: - Delay-percentile target estimator
+
+    @Test("Delay-percentile target rises on a held burst and falls slowly")
+    func delayPercentileTargetRisesAndFallsSlowly() {
+        var config = JitterBufferConfig()
+        config.minTargetFrames = 3
+        config.maxTargetFrames = 12
+        config.delayWindowSeconds = 1  // small window so it turns over quickly
+        let buffer = JitterBuffer(config: config)
+
+        // 2 s of on-time frames: zero relative delay, target stays at the
+        // minimum. Pops lag inserts by 10 frames.
+        for frame in 0..<200 {
+            insert(buffer, sequence: UInt32(frame), streamFrame: UInt64(frame))
+            if frame >= 10 { _ = buffer.pop() }
+        }
+        #expect(buffer.stats.targetFrames == 3)
+
+        // A burst: frames 200-207 are held and land together 80 ms after
+        // frame 200's send time (offsets 80 ms down to 10 ms). While the
+        // burst is still landing, p99 equals the max (80 ms) → target 9;
+        // the fully-landed window would compute 8, but the target never
+        // chases a lower estimate down.
+        for frame in 200..<208 {
+            buffer.insert(
+                packet(sequence: UInt32(frame), streamFrame: UInt64(frame)),
+                arrivalTime: 2.0 + 0.080
+            )
+        }
+        #expect(buffer.stats.targetFrames == 9)
+
+        // 4 s of clean traffic, by which point the burst samples have left
+        // the 1 s window: the estimate is low again, but the 5 s hold and
+        // the one-frame-per-2 s rate limit keep the target at 9.
+        for frame in 260..<660 {
+            insert(buffer, sequence: UInt32(frame), streamFrame: UInt64(frame))
+            _ = buffer.pop()
+        }
+        #expect(buffer.stats.targetFrames == 9)
+
+        // After the hold elapses the target steps down at most one frame per
+        // 2 s: 8 more seconds of clean traffic cannot reach the floor (that
+        // would need ~10 s of falls alone).
+        for frame in 660..<1460 {
+            insert(buffer, sequence: UInt32(frame), streamFrame: UInt64(frame))
+            _ = buffer.pop()
+        }
+        let settled = buffer.stats.targetFrames
+        #expect(settled >= 3)
+        #expect(settled <= 6)
+    }
+
+    @Test("Cushion anchors at the fastest observed path, not the first packet")
+    func cushionAnchorsAtFastestPath() {
+        var config = JitterBufferConfig()
+        config.minTargetFrames = 3
+        config.maxTargetFrames = 12
+        let buffer = JitterBuffer(config: config)
+
+        // Fresh packets 4 and 5 arrive first (fast path, offset ~1 ms); the
+        // delayed batch (frames 0-3, offsets 110-83 ms) lands after them,
+        // then frame 6 arrives on the fast path again.
+        buffer.insert(packet(sequence: 4, streamFrame: 4), arrivalTime: 0.041)
+        buffer.insert(packet(sequence: 5, streamFrame: 5), arrivalTime: 0.051)
+        buffer.insert(packet(sequence: 0, streamFrame: 0), arrivalTime: 0.110)
+        buffer.insert(packet(sequence: 1, streamFrame: 1), arrivalTime: 0.111)
+        buffer.insert(packet(sequence: 2, streamFrame: 2), arrivalTime: 0.112)
+        buffer.insert(packet(sequence: 3, streamFrame: 3), arrivalTime: 0.113)
+        buffer.insert(packet(sequence: 6, streamFrame: 6), arrivalTime: 0.115)
+
+        // The burst pushes the p99 to ~109 ms → target 12; the cushion is
+        // anchored at the fast path (1 ms), so at frame 6's insert it is
+        // 114 ms ≥ (12 - 1) × 10 ms and playback may start from the oldest
+        // buffered frame — at depth 7 < 12, i.e. via the cushion exit, which
+        // an anchor at the first observed packet (11 ms higher) would miss.
+        #expect(buffer.stats.targetFrames == 12)
+        #expect(buffer.pop() == .packet(packet(sequence: 0, streamFrame: 0)))
+    }
+
+    @Test("applyConfig resets buffered audio and applies the new range immediately")
+    func applyConfigResetsAndApplies() {
+        let buffer = JitterBuffer(config: .latency(.balanced))
+        insert(buffer, sequences: 0, 1, 2, 3, 4, 5, 6)
+        #expect(buffer.stats.depthFrames == 7)
+        #expect(buffer.stats.targetFrames == 5)
+
+        buffer.applyConfig(.latency(.low))
+
+        let stats = buffer.stats
+        #expect(stats.depthFrames == 0)
+        #expect(stats.targetFrames == 3)
+        #expect(buffer.pop() == .buffering)
     }
 }

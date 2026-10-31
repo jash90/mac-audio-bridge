@@ -24,10 +24,12 @@ final class ReceiverModel: ObservableObject {
     @Published private(set) var underrunCount = 0
     @Published private(set) var malformedCount = 0
     @Published private(set) var outputRoute: String?
+    @Published private(set) var latencyMode: JitterLatencyMode = .balanced
 
-    private let jitterBuffer = JitterBuffer(config: .lowLatency)
+    private let jitterBuffer = JitterBuffer(config: .latency(.balanced))
     private let receiver: UDPReceiver
     private let output: AudioOutput
+    private let statsWriter = StatsJSONLWriter()
 
     init() {
         receiver = UDPReceiver(jitterBuffer: jitterBuffer)
@@ -45,6 +47,14 @@ final class ReceiverModel: ObservableObject {
         } catch {
             phase = .failed("Start failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Applies a latency-mode change immediately: the buffer resets and
+    /// prebuffers with the new target range.
+    func setLatencyMode(_ mode: JitterLatencyMode) {
+        guard mode != latencyMode else { return }
+        latencyMode = mode
+        jitterBuffer.applyConfig(.latency(mode))
     }
 
     /// Pulls latency and loss snapshots for the UI — call 4×/s.
@@ -70,6 +80,42 @@ final class ReceiverModel: ObservableObject {
         underrunCount = stats.underruns
         malformedCount = receiver.malformedCount
         outputRoute = session.currentRoute.outputs.first?.portName
+    }
+
+    /// Writes one JSON line of telemetry to `Documents/stats.jsonl` — call
+    /// 1 Hz. The encode happens here; only `Data` crosses to the writer's
+    /// utility queue.
+    func logStats() {
+        guard phase == .running else { return }
+        let stats = jitterBuffer.stats
+        let session = AVAudioSession.sharedInstance()
+        let outputSeconds = session.outputLatency + session.ioBufferDuration
+        statsWriter.append(
+            StatsLine(
+                timestamp: Date().timeIntervalSince1970,
+                received: stats.received,
+                played: stats.played,
+                lost: stats.lost,
+                late: stats.late,
+                duplicates: stats.duplicates,
+                overflowDropped: stats.overflowDropped,
+                underruns: stats.underruns,
+                rebuffers: stats.rebuffers,
+                bufferingPops: stats.bufferingPops,
+                depthFrames: stats.depthFrames,
+                targetFrames: stats.targetFrames,
+                jitterMs: stats.jitterSeconds * 1000,
+                delayP50Ms: stats.delayP50Seconds * 1000,
+                delayP95Ms: stats.delayP95Seconds * 1000,
+                delayP99Ms: stats.delayP99Seconds * 1000,
+                delayMaxMs: stats.delayMaxSeconds * 1000,
+                maxInterArrivalGapMs: receiver.takeMaxInterArrivalGapSeconds() * 1000,
+                outputMs: outputSeconds * 1000,
+                route: session.currentRoute.outputs.first?.portName ?? "",
+                latencyMode: latencyMode.rawValue,
+                malformed: receiver.malformedCount
+            )
+        )
     }
 
     /// The device's Wi-Fi IPv4 address (interface en0), shown so the user can type
@@ -105,6 +151,7 @@ final class ReceiverModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var model = ReceiverModel()
+    @AppStorage("latencyMode") private var latencyMode: JitterLatencyMode = .balanced
 
     var body: some View {
         VStack(spacing: 20) {
@@ -116,6 +163,8 @@ struct ContentView: View {
                 .font(.title2.bold())
 
             address
+
+            latencyPicker
 
             stats
 
@@ -129,10 +178,31 @@ struct ContentView: View {
         .padding(24)
         .frame(maxWidth: .infinity)
         .task {
+            model.setLatencyMode(latencyMode)
             model.start()
         }
         .onReceive(Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()) { _ in
             model.refreshStats()
+        }
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            model.logStats()
+        }
+        .onChange(of: latencyMode) { _, mode in
+            model.setLatencyMode(mode)
+        }
+    }
+
+    private var latencyPicker: some View {
+        VStack(spacing: 4) {
+            Text("Latency mode")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Picker("Latency mode", selection: $latencyMode) {
+                ForEach(JitterLatencyMode.allCases, id: \.rawValue) { mode in
+                    Text(mode.displayName).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
         }
     }
 
@@ -176,5 +246,15 @@ struct ContentView: View {
             Text(value)
         }
         .frame(maxWidth: 260)
+    }
+}
+
+extension JitterLatencyMode {
+    var displayName: String {
+        switch self {
+        case .low: "Low"
+        case .balanced: "Balanced"
+        case .safe: "Safe"
+        }
     }
 }
