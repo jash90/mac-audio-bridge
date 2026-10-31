@@ -46,7 +46,8 @@ struct MenuView: View {
             case .running:
                 Text("State: streaming")
                 Text("Tap: \(Int(controller.tapSampleRate ?? 0)) Hz")
-                Text("Frames: \(controller.framesPerSecond)/s")
+                Text("Packets: \(controller.packetsPerSecond)/s")
+                Text("Seq: \(controller.currentSequence)")
                 if let captureWarning = controller.captureWarning {
                     Text(captureWarning)
                         .foregroundStyle(.red)
