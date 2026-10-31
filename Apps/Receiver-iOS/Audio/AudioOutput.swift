@@ -1,40 +1,46 @@
 import AVFoundation
 import BridgeCore
 import Foundation
-import Synchronization
 
-/// Plays the shared ring buffer through an `AVAudioSourceNode` (48 kHz stereo,
-/// deinterleaved Float32 render format). The render block only reads from the
-/// lock-free ring buffer — no allocation, no locking on the render thread.
+/// Plays the jitter buffer through an `AVAudioSourceNode` (48 kHz stereo,
+/// deinterleaved Float32 render format) via a `PCMFrameReader`, which turns
+/// the jitter buffer's 10 ms playout slots into arbitrary-size render reads
+/// with packet-loss concealment. The render block only touches preallocated
+/// state — no allocation, no Swift concurrency; the jitter buffer's short
+/// unfair lock is the only synchronization it meets.
 final class AudioOutput: @unchecked Sendable {
-    /// 60 ms of interleaved stereo before the render block starts reading.
-    private static let prebufferSamples =
-        Int(AudioFormat.sampleRate) * 60 / 1000 * AudioFormat.channelCount
-
-    private let ring: SPSCRingBuffer
+    private let jitterBuffer: JitterBuffer
     private let renderContext: RenderContext
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
 
-    init(ring: SPSCRingBuffer) {
-        self.ring = ring
-        self.renderContext = RenderContext(ring: ring, prebufferSamples: Self.prebufferSamples)
+    init(jitterBuffer: JitterBuffer) {
+        self.jitterBuffer = jitterBuffer
+        self.renderContext = RenderContext(
+            frameReader: PCMFrameReader(source: { jitterBuffer.pop() }))
     }
 
-    var underrunCount: Int {
-        renderContext.underrunCount.load(ordering: .relaxed)
+    /// Fraction (in frames, 0..<1) of the playout frame currently being
+    /// rendered — the "partially played frame" part of the latency readout.
+    var partiallyPlayedFrames: Double {
+        renderContext.frameReader.partiallyPlayedFrames
     }
 
-    /// Activates the audio session and starts the engine. The render block outputs
-    /// silence until the ring buffer holds the prebuffer amount.
+    /// Activates the audio session and starts the engine. The session asks
+    /// for 48 kHz and a 5 ms IO buffer to keep the output-side latency low.
+    /// The render block outputs silence until the jitter buffer leaves
+    /// prebuffering.
     func start() throws {
         guard sourceNode == nil else { return }
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playback, mode: .default)
+        try session.setPreferredSampleRate(AudioFormat.sampleRate)
+        try session.setPreferredIOBufferDuration(0.005)
         try session.setActive(true)
 
-        // The consumer (render thread) is not running yet, so resetting here is safe.
-        ring.reset()
+        // Fresh run: drop anything buffered and the concealment history. The
+        // render thread is not running yet, so this is race-free.
+        jitterBuffer.reset()
         renderContext.restart()
 
         let renderFormat = AVAudioFormat(
@@ -75,20 +81,15 @@ final class AudioOutput: @unchecked Sendable {
     }
 }
 
-/// Realtime state captured by the render block: the ring, a preallocated scratch
-/// buffer, the prebuffer gate and the underrun counter.
+/// Realtime state captured by the render block: the playout reader and a
+/// preallocated interleaved scratch frame.
 private final class RenderContext: @unchecked Sendable {
-    private let ring: SPSCRingBuffer
-    private let prebufferSamples: Int
+    let frameReader: PCMFrameReader
     private let scratch: UnsafeMutablePointer<Float>
     private static let scratchSamples = 8_192
 
-    let primed = Atomic<Bool>(false)
-    let underrunCount = Atomic<Int>(0)
-
-    init(ring: SPSCRingBuffer, prebufferSamples: Int) {
-        self.ring = ring
-        self.prebufferSamples = prebufferSamples
+    init(frameReader: PCMFrameReader) {
+        self.frameReader = frameReader
         self.scratch = UnsafeMutablePointer<Float>.allocate(capacity: Self.scratchSamples)
         self.scratch.initialize(repeating: 0, count: Self.scratchSamples)
     }
@@ -97,7 +98,8 @@ private final class RenderContext: @unchecked Sendable {
         scratch.deallocate()
     }
 
-    /// Called from the render thread. Fills `list` with audio or silence.
+    /// Called from the render thread. Fills `list` with audio or silence; the
+    /// reader's concealment and buffering rules produce the silence cases.
     func render(into list: UnsafeMutablePointer<AudioBufferList>, frameCount: Int) {
         // Index the variable-length list in place via its dedicated pointer view —
         // copying the struct out would leave only one AudioBuffer of storage.
@@ -110,19 +112,11 @@ private final class RenderContext: @unchecked Sendable {
             }
         }
 
-        // Hold off until the network has buffered enough audio (60 ms).
-        if !primed.load(ordering: .relaxed) {
-            guard ring.availableToRead >= prebufferSamples else { return }
-            primed.store(true, ordering: .relaxed)
-        }
-
+        // The reader serves any request size (render quanta are not
+        // necessarily a multiple of one 10 ms frame) and never runs dry.
         let samplesNeeded = min(frameCount * AudioFormat.channelCount, Self.scratchSamples)
-        let got = ring.read(into: scratch, count: samplesNeeded)
-        if got < samplesNeeded {
-            underrunCount.wrappingAdd(1, ordering: .relaxed)
-        }
-        guard got > 0 else { return }
-        let frames = got / AudioFormat.channelCount
+        frameReader.read(into: scratch, sampleCount: samplesNeeded)
+        let frames = samplesNeeded / AudioFormat.channelCount
 
         if buffers.count == 2 {
             // Deinterleaved: one mono buffer per channel.
@@ -136,14 +130,14 @@ private final class RenderContext: @unchecked Sendable {
         } else if buffers.count == 1, let data = buffers[0].mData {
             // Interleaved fallback.
             let destination = data.assumingMemoryBound(to: Float.self)
-            for i in 0..<got {
+            for i in 0..<samplesNeeded {
                 destination[i] = scratch[i]
             }
         }
     }
 
-    /// Re-arms the prebuffer gate for a fresh run (before the engine starts).
+    /// Re-arms the reader for a fresh run (before the engine starts).
     func restart() {
-        primed.store(false, ordering: .relaxed)
+        frameReader.reset()
     }
 }

@@ -27,21 +27,29 @@ private final class WarningMailbox: @unchecked Sendable {
     }
 }
 
-/// Frame counter shared between the converter queue (writer) and the UI (reader).
+/// Packet counter shared between the converter queue (writer) and the UI (reader).
 final class FrameStats: @unchecked Sendable {
-    private let frames = Atomic<Int>(0)
+    private let packets = Atomic<Int>(0)
+    private let lastSequence = Atomic<UInt32>(0)
 
-    func increment() {
-        frames.wrappingAdd(1, ordering: .relaxed)
+    func record(sequence: UInt32) {
+        packets.wrappingAdd(1, ordering: .relaxed)
+        lastSequence.store(sequence, ordering: .relaxed)
     }
 
     func reset() {
-        frames.store(0, ordering: .relaxed)
+        packets.store(0, ordering: .relaxed)
+        lastSequence.store(0, ordering: .relaxed)
     }
 
-    /// Returns the count since the last call and resets it to zero.
+    /// Returns the packet count since the last call and resets it to zero.
     func takePerSecondCount() -> Int {
-        frames.exchange(0, ordering: .acquiringAndReleasing)
+        packets.exchange(0, ordering: .acquiringAndReleasing)
+    }
+
+    /// Sequence number of the most recently emitted packet.
+    var sequence: UInt32 {
+        lastSequence.load(ordering: .relaxed)
     }
 }
 
@@ -57,7 +65,8 @@ final class SenderController: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var tapSampleRate: Double?
-    @Published private(set) var framesPerSecond = 0
+    @Published private(set) var packetsPerSecond = 0
+    @Published private(set) var currentSequence: UInt32 = 0
     @Published private(set) var captureWarning: String?
 
     private let tap = SystemAudioTap()
@@ -99,9 +108,9 @@ final class SenderController: ObservableObject {
         frameStats.reset()
         // Both callbacks run on the converter queue: they are @Sendable, capture
         // only Sendable state (no self), and never touch UI state directly.
-        converter.onFrame = { [udpSender, frameStats] frame in
-            udpSender.send(frame)
-            frameStats.increment()
+        converter.onFrame = { [udpSender, frameStats] packet in
+            udpSender.send(packet.encoded())
+            frameStats.record(sequence: packet.sequence)
         }
         converter.onCaptureStalled = { [captureWarningMailbox] in
             captureWarningMailbox.post(captureDeniedMessage)
@@ -119,14 +128,16 @@ final class SenderController: ObservableObject {
         udpSender.cancel()
         tap.stop()
         tapSampleRate = nil
-        framesPerSecond = 0
+        packetsPerSecond = 0
+        currentSequence = 0
         captureWarning = nil
         phase = .idle
     }
 
     /// Pulls counter snapshots and background warnings for the UI — call ~1 Hz.
     func refreshStats() {
-        framesPerSecond = frameStats.takePerSecondCount()
+        packetsPerSecond = frameStats.takePerSecondCount()
+        currentSequence = frameStats.sequence
         if let warning = captureWarningMailbox.take() {
             captureWarning = warning
         }
