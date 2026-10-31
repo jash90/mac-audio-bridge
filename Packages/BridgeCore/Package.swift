@@ -4,8 +4,8 @@ import PackageDescription
 let package = Package(
     name: "BridgeCore",
     platforms: [
-        .macOS("14.2"),
-        .iOS(.v17),
+        .macOS("15.0"),
+        .iOS(.v18),
     ],
     products: [
         .library(name: "BridgeCore", targets: ["BridgeCore"]),

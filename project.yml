@@ -2,8 +2,8 @@ name: MacAudioBridge
 options:
   bundleIdPrefix: dev.jash90
   deploymentTarget:
-    macOS: "14.2"
-    iOS: "17.0"
+    macOS: "15.0"
+    iOS: "18.0"
   createIntermediateGroups: true
 packages:
   BridgeCore:
