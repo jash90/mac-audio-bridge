@@ -31,9 +31,23 @@ final class ReceiverModel: ObservableObject {
     private let output: AudioOutput
     private let statsWriter = StatsJSONLWriter()
 
+    /// Model-owned stats loop (4 Hz UI refresh, 1 Hz JSONL line). It must NOT
+    /// live in the view: `Timer.publish` publishers created inside a SwiftUI
+    /// `body` are re-created on every body evaluation, so the 1 Hz logging
+    /// timer was reset by the 4 Hz UI updates and never fired — stats.jsonl
+    /// only got stale zero lines whenever the view sat still. A main-actor
+    /// task keeps ticking in the background too, as long as the active audio
+    /// session keeps the app running.
+    private var statsLoop: Task<Void, Never>?
+    private var tick = 0
+
     init() {
         receiver = UDPReceiver(jitterBuffer: jitterBuffer)
         output = AudioOutput(jitterBuffer: jitterBuffer)
+    }
+
+    deinit {
+        statsLoop?.cancel()
     }
 
     /// Starts listening and audio playback (called automatically on launch).
@@ -44,8 +58,29 @@ final class ReceiverModel: ObservableObject {
             try output.start()
             try receiver.start()
             phase = .running
+            startStatsLoop()
         } catch {
             phase = .failed("Start failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Main-actor loop (the model is @MainActor, so the task inherits it):
+    /// refresh the UI state every tick and write one JSONL line every fourth
+    /// tick. Ticks where the task was resumed late self-correct on the next
+    /// tick — the jitter-buffer counters are cumulative, not per-tick.
+    private func startStatsLoop() {
+        guard statsLoop == nil else { return }
+        statsLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.refreshStats()
+                if let self {
+                    self.tick += 1
+                    if self.tick.isMultiple(of: 4) {
+                        self.logStats()
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
         }
     }
 
@@ -57,7 +92,8 @@ final class ReceiverModel: ObservableObject {
         jitterBuffer.applyConfig(.latency(mode))
     }
 
-    /// Pulls latency and loss snapshots for the UI — call 4×/s.
+    /// Pulls latency and loss snapshots for the UI — called 4×/s by the
+    /// model's stats loop.
     func refreshStats() {
         let stats = jitterBuffer.stats
         let session = AVAudioSession.sharedInstance()
@@ -82,9 +118,9 @@ final class ReceiverModel: ObservableObject {
         outputRoute = session.currentRoute.outputs.first?.portName
     }
 
-    /// Writes one JSON line of telemetry to `Documents/stats.jsonl` — call
-    /// 1 Hz. The encode happens here; only `Data` crosses to the writer's
-    /// utility queue.
+    /// Writes one JSON line of telemetry to `Documents/stats.jsonl` — called
+    /// 1 Hz by the model's stats loop. The encode happens here; only `Data`
+    /// crosses to the writer's utility queue.
     func logStats() {
         guard phase == .running else { return }
         let stats = jitterBuffer.stats
@@ -180,12 +216,6 @@ struct ContentView: View {
         .task {
             model.setLatencyMode(latencyMode)
             model.start()
-        }
-        .onReceive(Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()) { _ in
-            model.refreshStats()
-        }
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
-            model.logStats()
         }
         .onChange(of: latencyMode) { _, mode in
             model.setLatencyMode(mode)

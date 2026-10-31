@@ -48,6 +48,38 @@ targets:
         INFOPLIST_FILE: Apps/Receiver-iOS/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         TARGETED_DEVICE_FAMILY: "1"
+  Driver:
+    type: bundle
+    platform: macOS
+    sources:
+      - path: Driver
+        excludes:
+          - "Info.plist"
+      - path: ThirdParty/libASPL/src
+    dependencies:
+      - sdk: CoreFoundation.framework
+      - sdk: CoreAudio.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.jash90.MacAudioBridge.Driver
+        PRODUCT_NAME: MacAudioBridge
+        WRAPPER_EXTENSION: driver
+        INFOPLIST_FILE: Driver/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MACH_O_TYPE: mh_bundle
+        CLANG_CXX_LANGUAGE_STANDARD: c++17
+        CLANG_ENABLE_MODULES: NO
+        HEADER_SEARCH_PATHS: ["$(PROJECT_DIR)/ThirdParty/libASPL/include"]
+        # Universal driver: works on Apple silicon and Intel Macs.
+        ARCHS: [arm64, x86_64]
+        ONLY_ACTIVE_ARCH: NO
+        # The factory symbol is referenced only through Info.plist keys, never
+        # from code — never let the linker strip it.
+        DEAD_CODE_STRIPPING: NO
+        # -Wall for our code; the two -Wno flags silence known benign warnings
+        # inside vendored libASPL (Stream.hpp designator order, offsetof in
+        # Driver.cpp) so third-party sources stay byte-identical to upstream.
+        OTHER_CPLUSPLUSFLAGS: ["$(inherited)", "-Wall", "-Wno-reorder-init-list", "-Wno-invalid-offsetof"]
 schemes:
   Sender:
     build:
@@ -59,5 +91,11 @@ schemes:
     build:
       targets:
         Receiver: all
+    run:
+      config: Debug
+  Driver:
+    build:
+      targets:
+        Driver: all
     run:
       config: Debug
