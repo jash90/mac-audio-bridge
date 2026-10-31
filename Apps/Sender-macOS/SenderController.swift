@@ -1,4 +1,5 @@
 import BridgeCore
+import CoreAudio
 import Foundation
 import Synchronization
 
@@ -56,6 +57,12 @@ final class FrameStats: @unchecked Sendable {
 /// One second of sender telemetry, appended as a JSON line to
 /// `~/Library/Logs/MacAudioBridge/sender-stats.jsonl`.
 private struct SenderStatsLine: Codable, Sendable {
+    /// "waiting" (device not selected / no address) or "streaming".
+    var mode: String
+    /// Whether "iPhone (Mac Audio Bridge)" is the default output device.
+    var defaultOutputIsOurs: Bool
+    /// Virtual-device volume actually applied to the stream (0 when muted).
+    var volume: Double
     var timestamp: Double
     /// Ring write() calls (≈ tap IOProc callbacks) in the last second.
     var ioCallbacks: Int
@@ -73,31 +80,83 @@ private struct SenderStatsLine: Codable, Sendable {
     var appNapActivityHeld: Bool
 }
 
-/// Glues tap → frame converter → UDP sender together and exposes UI state
-/// on the main actor.
+/// Owns tap → frame converter → UDP sender and drives them from the virtual
+/// device's state: streaming runs while "iPhone (Mac Audio Bridge)" is the
+/// default output AND a receiver address is set, and stops (releasing the tap)
+/// the moment the user switches the output away. All state lives on the main
+/// actor; CoreAudio listeners hop over from their own queue via a `@Sendable`
+/// callback.
 @MainActor
 final class SenderController: ObservableObject {
-    enum Phase: Equatable {
-        case idle
-        case running
-        case failed(String)
+    /// Whether the audio pipeline is currently running.
+    enum Mode: Equatable {
+        case waiting
+        case streaming
     }
 
     private static let statsFileURL = FileManager.default.urls(
         for: .libraryDirectory, in: .userDomainMask
     )[0].appendingPathComponent("Logs/MacAudioBridge/sender-stats.jsonl")
 
-    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var mode: Mode = .waiting
+    /// False while the HAL driver is not loaded (not installed / coreaudiod
+    /// restart pending). The menu then shows the install command.
+    @Published private(set) var driverInstalled = false
+    @Published private(set) var defaultOutputIsOurs = false
+    /// Virtual-device volume scalar (0...1) — reflects the volume keys.
+    @Published private(set) var deviceVolume: Float = 0
+    @Published private(set) var deviceMuted = false
+    /// Name of the output device used before "iPhone (Mac Audio Bridge)" was
+    /// selected, for the "Switch back" button.
+    @Published private(set) var previousDeviceName: String?
+    @Published private(set) var hasPreviousDevice = false
     @Published private(set) var tapSampleRate: Double?
     @Published private(set) var packetsPerSecond = 0
     @Published private(set) var currentSequence: UInt32 = 0
     @Published private(set) var captureWarning: String?
+    @Published private(set) var failureMessage: String?
+    /// The address currently streaming to (set when a run starts).
+    @Published private(set) var activeHost = ""
 
-    private let tap = SystemAudioTap()
+    private var receiverHost = "" {
+        didSet { evaluate() }
+    }
+
+    /// The 1 Hz state loop, owned by the controller itself: the menu's
+    /// SwiftUI lifetime only spans an open menu, so nothing view-side may
+    /// drive evaluation or stats.
+    private var stateLoop: Task<Void, Never>?
+
+    /// UserDefaults key shared with the menu's `@AppStorage` text field.
+    private static let hostKey = "receiverHost"
+
+    init() {
+        // The persisted receiver address — read here so streaming can start
+        // at launch with the menu never opened.
+        receiverHost = Self.loadPersistedHost()
+        // Main-actor task loop (the class is @MainActor, so the task inherits
+        // the main actor): one immediate pass — streaming starts within this
+        // first evaluate when our device is the default output and a host is
+        // set — then refresh every second.
+        stateLoop = Task { [weak self] in
+            self?.evaluate()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                self?.refreshStats()
+            }
+        }
+    }
+
+    deinit {
+        stateLoop?.cancel()
+    }
+
+    private let tap = DeviceAudioTap()
     private let converter = FrameConverter()
     private let udpSender = UDPSender()
     private let frameStats = FrameStats()
     private let captureWarningMailbox = WarningMailbox()
+    private let deviceEvents = DeviceEventObserver()
     private let statsWriter = RollingJSONLWriter(fileURL: SenderController.statsFileURL)
     private let statsEncoder: JSONEncoder = {
         let encoder = JSONEncoder()
@@ -113,24 +172,99 @@ final class SenderController: ObservableObject {
     private var lastRingWriteCalls = 0
     private var lastRingCapturedSamples = 0
     private var lastRingDroppedSamples = 0
+    /// Device ID the current listener registrations are bound to (device IDs
+    /// change when coreaudiod restarts, e.g. on driver install/uninstall).
+    private var observedDeviceID: AudioObjectID?
+    private var previousDeviceID: AudioObjectID?
 
-    var isRunning: Bool { phase == .running }
+    var isStreaming: Bool { mode == .streaming }
+    /// Device volume as a whole percent for the menu.
+    var volumePercent: Int { Int((deviceVolume * 100).rounded()) }
+    /// True while no receiver address is configured (drives the waiting text).
+    var receiverHostIsEmpty: Bool { receiverHost.isEmpty }
 
-    func toggle(host: String) {
-        if isRunning {
-            stop()
-        } else {
-            start(host: host)
-        }
+    /// The receiver address, kept in sync with the menu's text field (and
+    /// persisted so a relaunch streams without the menu being opened).
+    func setHost(_ host: String) {
+        let trimmed = host.trimmingCharacters(in: .whitespaces)
+        guard trimmed != receiverHost else { return }
+        receiverHost = trimmed
+        UserDefaults.standard.set(trimmed, forKey: Self.hostKey)
     }
 
-    func start(host: String) {
-        guard !isRunning else { return }
-        guard !host.isEmpty else {
-            phase = .failed("Enter the iPhone's IP address first.")
+    private static func loadPersistedHost() -> String {
+        (UserDefaults.standard.string(forKey: hostKey) ?? "")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    // MARK: - Output-device actions
+
+    /// Makes "iPhone (Mac Audio Bridge)" the default output, remembering the
+    /// device used before so `switchBackToPreviousOutput` can restore it.
+    func useIPhoneAsOutput() {
+        guard let deviceID = BridgeDevice.deviceID(),
+            let currentDefault = BridgeDevice.defaultOutputDeviceID(),
+            currentDefault != deviceID
+        else { return }
+        previousDeviceID = currentDefault
+        previousDeviceName = BridgeDevice.deviceName(currentDefault)
+        hasPreviousDevice = true
+        _ = BridgeDevice.setDefaultOutputDevice(deviceID)
+        evaluate()
+    }
+
+    /// Restores the output device used before ours was selected.
+    func switchBackToPreviousOutput() {
+        guard let previous = previousDeviceID else { return }
+        _ = BridgeDevice.setDefaultOutputDevice(previous)
+        evaluate()
+    }
+
+    // MARK: - Automatic start/stop
+
+    /// Re-reads the world (driver presence, default output, volume/mute) and
+    /// starts or stops streaming accordingly. Called ~1 Hz from `refreshStats`,
+    /// from every CoreAudio property listener, and after host/button changes —
+    /// so a stuck state self-heals on the next tick.
+    func evaluate() {
+        // Resolve fresh every time: the AudioObjectID is not stable across
+        // coreaudiod restarts.
+        let deviceID = BridgeDevice.deviceID()
+        driverInstalled = deviceID != nil
+        refreshDeviceListeners(deviceID)
+
+        guard let deviceID else {
+            if mode == .streaming { stopStreaming() }
+            defaultOutputIsOurs = false
             return
         }
 
+        let defaultID = BridgeDevice.defaultOutputDeviceID()
+        defaultOutputIsOurs = defaultID == deviceID
+
+        // Keep "previous device" meaningful: whenever the user routes the
+        // output to something that is not ours, that becomes the device to
+        // switch back to.
+        if let defaultID, defaultID != deviceID, defaultID != previousDeviceID {
+            previousDeviceID = defaultID
+            previousDeviceName = BridgeDevice.deviceName(defaultID)
+            hasPreviousDevice = true
+        }
+
+        updateVolume(deviceID: deviceID)
+
+        let shouldStream = defaultOutputIsOurs && !receiverHost.isEmpty
+        switch (shouldStream, mode) {
+        case (true, .waiting):
+            startStreaming(host: receiverHost, deviceID: deviceID)
+        case (false, .streaming):
+            stopStreaming()
+        default:
+            break
+        }
+    }
+
+    private func startStreaming(host: String, deviceID: AudioObjectID) {
         // Hold the system awake for the whole run: this is an LSUIElement app
         // with no window, so without an activity assertion App Nap coalesces
         // the 2.5 ms drain timer into seconds-long silences and the tap ring
@@ -146,12 +280,18 @@ final class SenderController: ObservableObject {
         do {
             try tap.start()
         } catch {
-            phase = .failed("Could not start the audio tap: \(error.localizedDescription)")
+            failureMessage = "Could not start the audio tap: \(error.localizedDescription)"
+            if let activity = streamingActivity {
+                ProcessInfo.processInfo.endActivity(activity)
+                streamingActivity = nil
+            }
             return
         }
 
+        activeHost = host
         tapSampleRate = tap.sampleRate
         captureWarning = nil
+        failureMessage = nil
         frameStats.reset()
         // Both callbacks run on the converter queue: they are @Sendable, capture
         // only Sendable state (no self), and never touch UI state directly.
@@ -163,11 +303,12 @@ final class SenderController: ObservableObject {
             captureWarningMailbox.post(captureDeniedMessage)
         }
         udpSender.setHost(host)
+        updateVolume(deviceID: deviceID)
         converter.start(ring: tap.ring, tapSampleRate: tap.sampleRate)
-        phase = .running
+        mode = .streaming
     }
 
-    func stop() {
+    private func stopStreaming() {
         // The converter is the ring's consumer side: stop (and drain) it on its
         // queue BEFORE the tap goes away. The ring reset for the next run happens
         // on that same queue in FrameConverter.start.
@@ -178,15 +319,72 @@ final class SenderController: ObservableObject {
             ProcessInfo.processInfo.endActivity(activity)
             streamingActivity = nil
         }
+        activeHost = ""
         tapSampleRate = nil
         packetsPerSecond = 0
         currentSequence = 0
         captureWarning = nil
-        phase = .idle
+        mode = .waiting
     }
 
-    /// Pulls counter snapshots and background warnings for the UI — call ~1 Hz.
+    // MARK: - Volume
+
+    /// Reads the virtual device's volume/mute, publishes it, and feeds the
+    /// converter's gain (mute → zeros). The volume keys and the menu-bar
+    /// slider change the device control, the listener calls `evaluate`, and
+    /// the new gain applies from the next drain tick.
+    private func updateVolume(deviceID: AudioObjectID) {
+        let volume = BridgeDevice.volumeScalar(deviceID) ?? 1
+        let muted = BridgeDevice.isMuted(deviceID) ?? false
+        deviceVolume = volume
+        deviceMuted = muted
+        converter.volumeGate.value = muted ? 0 : volume
+    }
+
+    // MARK: - Listeners
+
+    /// Registers the CoreAudio listeners: default-output changes on the system
+    /// object, and running-somewhere / volume / mute on our device. Re-binds
+    /// them whenever the device's AudioObjectID changes.
+    private func refreshDeviceListeners(_ deviceID: AudioObjectID?) {
+        guard deviceID != observedDeviceID else { return }
+        deviceEvents.removeAllRegistrations()
+        observedDeviceID = deviceID
+
+        // @Sendable closures do not inherit main-actor isolation; each hops to
+        // the main actor itself.
+        let event: @Sendable () -> Void = { [weak self] in
+            Task { @MainActor in self?.evaluate() }
+        }
+        _ = deviceEvents.add(
+            objectID: AudioObjectID(kAudioObjectSystemObject),
+            selector: kAudioHardwarePropertyDefaultOutputDevice,
+            scope: kAudioObjectPropertyScopeGlobal,
+            onEvent: event)
+        guard let deviceID else { return }
+        _ = deviceEvents.add(
+            objectID: deviceID,
+            selector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            scope: kAudioObjectPropertyScopeGlobal,
+            onEvent: event)
+        _ = deviceEvents.add(
+            objectID: deviceID,
+            selector: kAudioDevicePropertyVolumeScalar,
+            scope: kAudioObjectPropertyScopeOutput,
+            onEvent: event)
+        _ = deviceEvents.add(
+            objectID: deviceID,
+            selector: kAudioDevicePropertyMute,
+            scope: kAudioObjectPropertyScopeOutput,
+            onEvent: event)
+    }
+
+    // MARK: - Stats
+
+    /// Pulls counter snapshots and background warnings for the UI, re-evaluates
+    /// the streaming state, and appends a telemetry line — call ~1 Hz.
     func refreshStats() {
+        evaluate()
         packetsPerSecond = frameStats.takePerSecondCount()
         currentSequence = frameStats.sequence
         if let warning = captureWarningMailbox.take() {
@@ -196,17 +394,21 @@ final class SenderController: ObservableObject {
     }
 
     /// Appends one JSON line of sender telemetry to
-    /// `~/Library/Logs/MacAudioBridge/sender-stats.jsonl` — call ~1 Hz while
-    /// streaming. Only atomic ring/sender counters come off the hot paths;
-    /// encoding happens here, the file write on the writer's utility queue.
+    /// `~/Library/Logs/MacAudioBridge/sender-stats.jsonl` — call ~1 Hz, in
+    /// both waiting and streaming modes. Only atomic ring/sender counters come
+    /// off the hot paths; encoding happens here, the file write on the writer's
+    /// utility queue.
     private func logStats() {
-        guard phase == .running else { return }
+        let effectiveVolume = deviceMuted ? 0.0 : Double(deviceVolume)
         let ring = tap.ring
         let writeCalls = ring.writeCallCount
         let capturedSamples = ring.storedSampleCount + ring.droppedSampleCount
         let droppedSamples = ring.droppedSampleCount
         let sent = udpSender.takeSentCounts()
         let line = SenderStatsLine(
+            mode: mode == .streaming ? "streaming" : "waiting",
+            defaultOutputIsOurs: defaultOutputIsOurs,
+            volume: effectiveVolume,
             timestamp: Date().timeIntervalSince1970,
             ioCallbacks: writeCalls - lastRingWriteCalls,
             samplesCaptured: capturedSamples - lastRingCapturedSamples,
@@ -215,8 +417,7 @@ final class SenderController: ObservableObject {
             packetsSent: sent.datagrams,
             bytesSent: sent.bytes,
             maxTickMs: converter.takeMaxTickIntervalMilliseconds(),
-            appNapActivityHeld: streamingActivity != nil
-        )
+            appNapActivityHeld: streamingActivity != nil)
         lastRingWriteCalls = writeCalls
         lastRingCapturedSamples = capturedSamples
         lastRingDroppedSamples = droppedSamples

@@ -3,8 +3,8 @@ import CoreAudio
 import Foundation
 import os
 
-/// Errors thrown while creating the process tap pipeline.
-enum SystemAudioTapError: LocalizedError {
+/// Errors thrown while creating the device-bound process tap pipeline.
+enum DeviceAudioTapError: LocalizedError {
     case coreAudioFailure(stage: String, status: OSStatus)
 
     var errorDescription: String? {
@@ -29,35 +29,46 @@ enum SystemAudioTapError: LocalizedError {
     }
 }
 
-/// Global stereo Core Audio process tap that captures every process's output except
-/// our own. The realtime IOProc only copies interleaved Float32 samples into an
+/// Core Audio process tap bound to the "iPhone (Mac Audio Bridge)" virtual
+/// device (Driver/Driver.cpp): it captures the audio of every process that
+/// plays to that device — and nothing else. The device itself discards the
+/// samples (null sink), so the Mac speakers stay silent while streaming; this
+/// tap is the actual capture point.
+///
+/// The tap feeds a private aggregate device that uses the virtual device as
+/// its main (clock) sub-device, so the IO cycle is clocked by our own 48 kHz
+/// device instead of whatever hardware happens to be the system output. The
+/// realtime IOProc only copies interleaved Float32 samples into an
 /// `SPSCRingBuffer` — no allocation, no locks, no logging inside the callback.
 ///
-/// See `docs/research/process-tap.md` for the call sequence and its pitfalls.
+/// See `docs/research/process-tap.md` for the call sequence and
+/// `docs/virtual-device.md` for the whole-device picture.
 @MainActor
-final class SystemAudioTap {
+final class DeviceAudioTap {
     /// Interleaved stereo Float32 at the tap's sample rate (the IOProc produces,
     /// the FrameConverter consumes).
-    let ring = SPSCRingBuffer(capacity: SystemAudioTap.ringCapacity)
+    let ring = SPSCRingBuffer(capacity: DeviceAudioTap.ringCapacity)
 
     private static let ringCapacity = 131_072 // ≈ 1.4 s of 48 kHz interleaved stereo
     private static let ioQueueLabel = "dev.jash90.MacAudioBridge.tap-io"
 
-    /// The tap's current sample rate (typically the default output device's rate).
+    /// The tap's current sample rate (the virtual device's rate — 48 kHz).
     private(set) var sampleRate: Double = 0
     private(set) var isRunning = false
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
-    private let ioQueue = DispatchQueue(label: SystemAudioTap.ioQueueLabel)
-    private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "system-audio-tap")
+    private let ioQueue = DispatchQueue(label: DeviceAudioTap.ioQueueLabel)
+    private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "device-audio-tap")
 
     /// Creates and starts the tap. Throws with a human-readable message on failure
-    /// (e.g. when audio-capture permission was denied).
+    /// (e.g. when audio-capture permission was denied or the driver is gone).
     func start() throws {
         precondition(!isRunning)
-        // 1. Translate our own PID into a process AudioObjectID (the tap excludes it).
+        // 1. Translate our own PID into a process AudioObjectID. The tap covers
+        //    every process EXCEPT ours: our own aggregate's IO writes into the
+        //    virtual device, and excluding ourselves rules out any feedback.
         let ownPID = ProcessInfo.processInfo.processIdentifier
         var ownObject = AudioObjectID(kAudioObjectUnknown)
         var pidQualifier = ownPID
@@ -74,13 +85,20 @@ final class SystemAudioTap {
             &ownObjectSize,
             &ownObject)
         guard status == noErr, ownObject != AudioObjectID(kAudioObjectUnknown) else {
-            throw SystemAudioTapError.coreAudioFailure(stage: "PID translation", status: status)
+            throw DeviceAudioTapError.coreAudioFailure(stage: "PID translation", status: status)
         }
 
-        // 2. Global tap: every process that outputs audio except ours, stereo mixdown,
-        //    still audible locally. The CATapDescription initializers are
-        //    NS_REFINED_FOR_SWIFT without a Swift overlay, so the raw `__` name applies.
-        let description = CATapDescription(__stereoGlobalTapButExcludeProcesses: [ownObject as NSNumber])
+        // 2. Device-bound tap: every process's audio destined for OUR device,
+        //    stream 0 (the driver's single output stream — the tap format then
+        //    matches that stream: 48 kHz stereo Float32). The excluding variant
+        //    with only our own process excluded is the unambiguous "everything
+        //    playing to this device except us" form (CATapDescription.h).
+        //    The initializers are NS_REFINED_FOR_SWIFT without a Swift overlay,
+        //    so the raw `__` name applies.
+        let description = CATapDescription(
+            __excludingProcesses: [ownObject as NSNumber],
+            andDeviceUID: BridgeDevice.uid,
+            withStream: 0)
         description.name = "mac-audio-bridge-tap"
         description.uuid = UUID()
         description.isPrivate = true
@@ -88,7 +106,7 @@ final class SystemAudioTap {
 
         status = AudioHardwareCreateProcessTap(description, &tapID)
         guard status == noErr else {
-            throw SystemAudioTapError.coreAudioFailure(stage: "Creating process tap", status: status)
+            throw DeviceAudioTapError.coreAudioFailure(stage: "Creating process tap", status: status)
         }
 
         do {
@@ -101,22 +119,26 @@ final class SystemAudioTap {
         status = try createAggregateDevice(tapUUID: description.uuid)
         guard status == noErr else {
             destroyTap()
-            throw SystemAudioTapError.coreAudioFailure(stage: "Creating aggregate device", status: status)
+            throw DeviceAudioTapError.coreAudioFailure(stage: "Creating aggregate device", status: status)
         }
 
-        // 6. IOProc on the realtime IO thread — it only copies into the ring buffer.
-        // The block MUST come from a nonisolated factory: this class is @MainActor,
-        // so a closure literal written here would inherit main-actor isolation and
-        // Swift 6's dynamic executor check traps when CoreAudio invokes it on the
-        // IO queue (EXC_BREAKPOINT in _dispatch_assert_queue_fail).
+        // 6. IOProc on the realtime IO thread — it only copies the tap's input
+        // into the ring buffer. The aggregate also has an output side (our null
+        // device as a sub-device); the IO block leaves the output buffers
+        // untouched, which is fine — the driver discards whatever is written.
+        // The block MUST come from a nonisolated factory: this class is
+        // @MainActor, so a closure literal written here would inherit
+        // main-actor isolation and Swift 6's dynamic executor check traps when
+        // CoreAudio invokes it on the IO queue (EXC_BREAKPOINT in
+        // _dispatch_assert_queue_fail).
         let context = TapIOContext(ring: ring)
         var createdIOProc: AudioDeviceIOProcID?
-        let ioBlock = SystemAudioTap.makeIOBlock(context: context)
+        let ioBlock = DeviceAudioTap.makeIOBlock(context: context)
         status = AudioDeviceCreateIOProcIDWithBlock(&createdIOProc, aggregateID, ioQueue, ioBlock)
         guard status == noErr else {
             destroyAggregateDevice()
             destroyTap()
-            throw SystemAudioTapError.coreAudioFailure(stage: "Creating IOProc", status: status)
+            throw DeviceAudioTapError.coreAudioFailure(stage: "Creating IOProc", status: status)
         }
         ioProcID = createdIOProc
 
@@ -125,18 +147,18 @@ final class SystemAudioTap {
             destroyIOProc()
             destroyAggregateDevice()
             destroyTap()
-            throw SystemAudioTapError.coreAudioFailure(stage: "Starting device", status: status)
+            throw DeviceAudioTapError.coreAudioFailure(stage: "Starting device", status: status)
         }
 
         isRunning = true
         logger.info(
-            "Tap running at \(self.sampleRate, format: .fixed(precision: 0), privacy: .public) Hz")
+            "Device tap running at \(self.sampleRate, format: .fixed(precision: 0), privacy: .public) Hz")
     }
 
-    /// Stops the tap. Teardown order: device → IOProc → aggregate → tap.
-    /// The ring is NOT reset here — `reset()` is consumer-side only; the
-    /// FrameConverter's queue (the ring's only consumer) resets it when the
-    /// next run starts.
+    /// Stops the tap and releases it. Teardown order: device → IOProc →
+    /// aggregate → tap. The ring is NOT reset here — `reset()` is consumer-side
+    /// only; the FrameConverter's queue (the ring's only consumer) resets it
+    /// when the next run starts.
     func stop() {
         guard isRunning else { return }
         isRunning = false
@@ -146,12 +168,13 @@ final class SystemAudioTap {
         destroyIOProc()
         destroyAggregateDevice()
         destroyTap()
-        logger.info("Tap stopped")
+        logger.info("Device tap stopped")
     }
 
     // MARK: - Setup steps
 
-    /// 4. Reads the format the IOProc will deliver (device rate, Float32, 2 channels).
+    /// 4. Reads the format the IOProc will deliver (the tapped stream's
+    /// format: 48 kHz, Float32, 2 channels).
     private func readTapFormat() throws {
         var asbd = AudioStreamBasicDescription()
         var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
@@ -161,12 +184,14 @@ final class SystemAudioTap {
             mElement: kAudioObjectPropertyElementMain)
         let status = AudioObjectGetPropertyData(tapID, &address, 0, nil, &formatSize, &asbd)
         guard status == noErr, asbd.mSampleRate > 0 else {
-            throw SystemAudioTapError.coreAudioFailure(stage: "Reading tap format", status: status)
+            throw DeviceAudioTapError.coreAudioFailure(stage: "Reading tap format", status: status)
         }
         sampleRate = asbd.mSampleRate
     }
 
-    /// 5. Private input-only aggregate device that contains the tap.
+    /// 5. Private aggregate device: the virtual device as the main (clock)
+    /// sub-device, plus the tap. `tapautostart` makes `AudioDeviceStart` wait
+    /// for the first tapped audio instead of running dry while nothing plays.
     private func createAggregateDevice(tapUUID: UUID) throws -> OSStatus {
         let aggregateDescription: [String: Any] = [
             kAudioAggregateDeviceNameKey: "mac-audio-bridge-aggregate",
@@ -174,7 +199,10 @@ final class SystemAudioTap {
             kAudioAggregateDeviceIsPrivateKey: true, // required by tapautostart
             kAudioAggregateDeviceIsStackedKey: false,
             kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceSubDeviceListKey: [] as [[String: Any]], // input-only
+            kAudioAggregateDeviceMainSubDeviceKey: BridgeDevice.uid, // clock = our device
+            kAudioAggregateDeviceSubDeviceListKey: [
+                [kAudioSubDeviceUIDKey: BridgeDevice.uid],
+            ],
             kAudioAggregateDeviceTapListKey: [
                 [
                     kAudioSubTapDriftCompensationKey: true,
@@ -217,31 +245,6 @@ final class SystemAudioTap {
         AudioHardwareDestroyProcessTap(tapID)
         tapID = AudioObjectID(kAudioObjectUnknown)
     }
-}
-
-/// Whether the default output device is currently running audio for any client.
-/// Used to tell "nothing is playing" apart from a denied tap: a denied
-/// "System Audio Recording" grant makes Core Audio deliver only zero-filled
-/// buffers (or none at all) while the device itself keeps playing.
-func isDefaultOutputDeviceRunningSomewhere() -> Bool {
-    var deviceID = AudioObjectID(kAudioObjectUnknown)
-    var deviceIDSize = UInt32(MemoryLayout<AudioObjectID>.size)
-    var address = AudioObjectPropertyAddress(
-        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain)
-    guard AudioObjectGetPropertyData(
-        AudioObjectID(kAudioObjectSystemObject),
-        &address, 0, nil, &deviceIDSize, &deviceID) == noErr,
-        deviceID != AudioObjectID(kAudioObjectUnknown)
-    else { return false }
-
-    var isRunning: UInt32 = 0
-    var isRunningSize = UInt32(MemoryLayout<UInt32>.size)
-    address.mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere
-    guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &isRunningSize, &isRunning) == noErr
-    else { return false }
-    return isRunning != 0
 }
 
 /// State captured by the realtime IOProc: the ring buffer plus a preallocated scratch

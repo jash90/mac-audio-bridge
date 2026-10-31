@@ -1,25 +1,46 @@
 import AppKit
-import Combine
 import SwiftUI
 
-/// Menu bar window: receiver IP, start/stop toggle, status.
+/// Menu bar window: receiver IP, output-device switcher, status. Streaming is
+/// automatic — it runs while "iPhone (Mac Audio Bridge)" is the selected
+/// output device and an address is set (see SenderController.evaluate). The
+/// controller (created in SenderApp) owns the 1 Hz loop; this view owns no
+/// timers and only reads published state.
 struct MenuView: View {
     @AppStorage("receiverHost") private var host = ""
-    @StateObject private var controller = SenderController()
+    @ObservedObject var controller: SenderController
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Mac Audio Bridge")
                 .font(.headline)
 
+            if !controller.driverInstalled {
+                Text("Driver not installed — run: ./scripts/install-driver.sh")
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+
             TextField("iPhone IP address", text: $host)
                 .textFieldStyle(.roundedBorder)
-                .disabled(controller.isRunning)
+                .disabled(controller.isStreaming)
+                .onChange(of: host) { _, newValue in
+                    controller.setHost(newValue)
+                }
 
-            Button(controller.isRunning ? "Stop" : "Start") {
-                controller.toggle(host: host)
+            if controller.defaultOutputIsOurs {
+                Button("Switch back to \(controller.previousDeviceName ?? "previous device")") {
+                    controller.switchBackToPreviousOutput()
+                }
+                .disabled(!controller.hasPreviousDevice)
+            } else {
+                Button("Use iPhone as output") {
+                    controller.useIPhoneAsOutput()
+                }
+                .disabled(!controller.driverInstalled)
             }
-            .keyboardShortcut(.return)
 
             status
 
@@ -31,32 +52,30 @@ struct MenuView: View {
             .keyboardShortcut("q")
         }
         .padding(12)
-        .frame(width: 320)
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
-            controller.refreshStats()
-        }
+        .frame(width: 340)
     }
 
     @ViewBuilder
     private var status: some View {
         VStack(alignment: .leading, spacing: 3) {
-            switch controller.phase {
-            case .idle:
-                Text("State: idle")
-            case .running:
-                Text("State: streaming")
+            switch controller.mode {
+            case .streaming:
+                Text("Streaming to \(controller.activeHost)")
                 Text("Tap: \(Int(controller.tapSampleRate ?? 0)) Hz")
-                Text("Packets: \(controller.packetsPerSecond)/s")
-                Text("Seq: \(controller.currentSequence)")
-                if let captureWarning = controller.captureWarning {
-                    Text(captureWarning)
-                        .foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            case .failed(let message):
-                Text("State: error")
+            case .waiting:
+                Text(controller.receiverHostIsEmpty
+                    ? "Waiting — enter the iPhone's IP address"
+                    : "Waiting — select iPhone (Mac Audio Bridge) as output")
+            }
+            Text("Volume: \(controller.volumePercent)%\(controller.deviceMuted ? " (muted)" : "")")
+            Text("Packets: \(controller.packetsPerSecond)/s")
+            if let captureWarning = controller.captureWarning {
+                Text(captureWarning)
                     .foregroundStyle(.red)
-                Text(message)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let failureMessage = controller.failureMessage {
+                Text(failureMessage)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
