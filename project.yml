@@ -28,6 +28,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.jash90.MacAudioBridge.Sender
         PRODUCT_NAME: Mac Audio Bridge
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: Apps/Sender-macOS/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: Apps/Sender-macOS/Sender.entitlements
@@ -45,6 +46,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.jash90.MacAudioBridge.Receiver
         PRODUCT_NAME: Mac Audio Bridge
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: Apps/Receiver-iOS/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         TARGETED_DEVICE_FAMILY: "1"
