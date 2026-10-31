@@ -174,6 +174,38 @@ struct PCMFrameReaderTests {
         #expect(resumed == floats(from: ramp(1)))
     }
 
+    @Test("A skipped frame is spliced with a short ramp from the last output sample")
+    func skippedFrameIsSpliced() {
+        let first = ramp(0)
+        let third = ramp(20)
+        let sequence = OutputSequence([
+            .packet(packet(sequence: 0, samples: first)),
+            .packet(packet(sequence: 2, samples: third)),  // frame 1 trimmed
+        ])
+        let reader = PCMFrameReader(source: sequence.next)
+        _ = read(reader, sampleCount: Self.samplesPerFrame)
+        let spliced = read(reader, sampleCount: Self.samplesPerFrame)
+
+        let decoded = floats(from: third)
+        let lastLeft = Float(first[Self.samplesPerFrame - 2]) / 32768
+        let rampSamples = PCMFrameReader.spliceRampFrames * 2
+        // The first sample starts next to the previous output, then the ramp
+        // converges monotonically onto the decoded audio.
+        #expect(abs(spliced[0] - lastLeft) < abs(decoded[0] - lastLeft))
+        #expect(Array(spliced[rampSamples...]) == Array(decoded[rampSamples...]))
+    }
+
+    @Test("Contiguous packets are not altered by the splice ramp")
+    func contiguousPacketsAreUntouched() {
+        let sequence = OutputSequence([
+            .packet(packet(sequence: 7, samples: ramp(0))),
+            .packet(packet(sequence: 8, samples: ramp(30))),
+        ])
+        let reader = PCMFrameReader(source: sequence.next)
+        _ = read(reader, sampleCount: Self.samplesPerFrame)
+        #expect(read(reader, sampleCount: Self.samplesPerFrame) == floats(from: ramp(30)))
+    }
+
     @Test("Reset clears the concealment history")
     func resetClearsHistory() {
         let sequence = OutputSequence([
