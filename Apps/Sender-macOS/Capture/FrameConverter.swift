@@ -10,15 +10,16 @@ import os
 /// All mutable state is confined to `queue`. Must be started/stopped from the main
 /// actor (like all owners in this app).
 final class FrameConverter: @unchecked Sendable {
-    /// Called on the converter queue with one complete frame. Set before `start`,
-    /// never swapped while running.
-    var onFrame: ((Data) -> Void)?
+    /// Called on the converter queue with one complete frame. `@Sendable` so the
+    /// closure carries no actor isolation when invoked off the main actor.
+    /// Set before `start`, never swapped while running.
+    var onFrame: (@Sendable (Data) -> Void)?
 
     /// Called once on the converter queue when the tap delivered only exact-zero
     /// samples for `captureGraceInterval` after start while the default output
     /// device was running — the signature of a denied "System Audio Recording"
     /// grant. Set before `start`, never swapped while running.
-    var onCaptureStalled: (() -> Void)?
+    var onCaptureStalled: (@Sendable () -> Void)?
 
     private static let queueLabel = "dev.jash90.MacAudioBridge.frame-converter"
     private static let inputCapacityFrames = 8_192

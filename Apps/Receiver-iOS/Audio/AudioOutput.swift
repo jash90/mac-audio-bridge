@@ -43,10 +43,9 @@ final class AudioOutput: @unchecked Sendable {
             channels: AVAudioChannelCount(AudioFormat.channelCount),
             interleaved: false)!
 
-        let node = AVAudioSourceNode(format: renderFormat) { [renderContext] _, _, frameCount, audioBufferList in
-            renderContext.render(into: audioBufferList, frameCount: Int(frameCount))
-            return noErr
-        }
+        let node = AVAudioSourceNode(
+            format: renderFormat,
+            renderBlock: Self.makeRenderBlock(context: renderContext))
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: renderFormat)
         engine.prepare()
@@ -60,6 +59,19 @@ final class AudioOutput: @unchecked Sendable {
             engine.detach(sourceNode)
         }
         sourceNode = nil
+    }
+
+    // MARK: - Realtime callback
+
+    /// Builds the render block in a nonisolated context so it carries no actor
+    /// isolation; CoreAudio invokes it on the render thread, where hopping,
+    /// allocating and locking are forbidden. It only touches the preallocated,
+    /// Sendable `RenderContext`.
+    nonisolated private static func makeRenderBlock(context: RenderContext) -> AVAudioSourceNodeRenderBlock {
+        { _, _, frameCount, audioBufferList in
+            context.render(into: audioBufferList, frameCount: Int(frameCount))
+            return noErr
+        }
     }
 }
 

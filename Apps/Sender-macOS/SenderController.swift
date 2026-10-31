@@ -2,6 +2,31 @@ import BridgeCore
 import Foundation
 import Synchronization
 
+// File-scope constant so @Sendable background closures can reference it without
+// touching main-actor-isolated static state.
+private let captureDeniedMessage =
+    "No audio captured — allow Mac Audio Bridge in System Settings → Privacy & Security → Screen & System Audio Recording"
+
+/// Mailbox for warnings raised on background queues. `refreshStats` drains it on
+/// the main actor (~1 Hz), so background callbacks never touch UI state directly.
+private final class WarningMailbox: @unchecked Sendable {
+    private let message = Mutex<String?>(nil)
+
+    func post(_ value: String) {
+        message.withLock { current in
+            current = value
+        }
+    }
+
+    func take() -> String? {
+        message.withLock { current in
+            let value = current
+            current = nil
+            return value
+        }
+    }
+}
+
 /// Frame counter shared between the converter queue (writer) and the UI (reader).
 final class FrameStats: @unchecked Sendable {
     private let frames = Atomic<Int>(0)
@@ -35,13 +60,11 @@ final class SenderController: ObservableObject {
     @Published private(set) var framesPerSecond = 0
     @Published private(set) var captureWarning: String?
 
-    private static let captureDeniedMessage =
-        "No audio captured — allow Mac Audio Bridge in System Settings → Privacy & Security → Screen & System Audio Recording"
-
     private let tap = SystemAudioTap()
     private let converter = FrameConverter()
     private let udpSender = UDPSender()
     private let frameStats = FrameStats()
+    private let captureWarningMailbox = WarningMailbox()
 
     var isRunning: Bool { phase == .running }
 
@@ -74,14 +97,14 @@ final class SenderController: ObservableObject {
         tapSampleRate = tap.sampleRate
         captureWarning = nil
         frameStats.reset()
+        // Both callbacks run on the converter queue: they are @Sendable, capture
+        // only Sendable state (no self), and never touch UI state directly.
         converter.onFrame = { [udpSender, frameStats] frame in
             udpSender.send(frame)
             frameStats.increment()
         }
-        converter.onCaptureStalled = { [weak self] in
-            Task { @MainActor in
-                self?.captureWarning = Self.captureDeniedMessage
-            }
+        converter.onCaptureStalled = { [captureWarningMailbox] in
+            captureWarningMailbox.post(captureDeniedMessage)
         }
         udpSender.setHost(host)
         converter.start(ring: tap.ring, tapSampleRate: tap.sampleRate)
@@ -101,8 +124,11 @@ final class SenderController: ObservableObject {
         phase = .idle
     }
 
-    /// Pulls counter snapshots for the UI — call ~1 Hz.
+    /// Pulls counter snapshots and background warnings for the UI — call ~1 Hz.
     func refreshStats() {
         framesPerSecond = frameStats.takePerSecondCount()
+        if let warning = captureWarningMailbox.take() {
+            captureWarning = warning
+        }
     }
 }

@@ -105,11 +105,14 @@ final class SystemAudioTap {
         }
 
         // 6. IOProc on the realtime IO thread — it only copies into the ring buffer.
-        let context = IOContext(ring: ring)
+        // The block MUST come from a nonisolated factory: this class is @MainActor,
+        // so a closure literal written here would inherit main-actor isolation and
+        // Swift 6's dynamic executor check traps when CoreAudio invokes it on the
+        // IO queue (EXC_BREAKPOINT in _dispatch_assert_queue_fail).
+        let context = TapIOContext(ring: ring)
         var createdIOProc: AudioDeviceIOProcID?
-        status = AudioDeviceCreateIOProcIDWithBlock(&createdIOProc, aggregateID, ioQueue) { _, inputData, _, _, _ in
-            context.copyInterleavedStereo(from: inputData)
-        }
+        let ioBlock = SystemAudioTap.makeIOBlock(context: context)
+        status = AudioDeviceCreateIOProcIDWithBlock(&createdIOProc, aggregateID, ioQueue, ioBlock)
         guard status == noErr else {
             destroyAggregateDevice()
             destroyTap()
@@ -184,6 +187,17 @@ final class SystemAudioTap {
             &aggregateID)
     }
 
+    // MARK: - Realtime callback
+
+    /// Builds the IOProc block in a nonisolated context so it carries no main-actor
+    /// isolation. The block only touches the preallocated, Sendable `TapIOContext`:
+    /// no allocation, no locks, no logging, no actor hops — realtime-thread rules.
+    nonisolated private static func makeIOBlock(context: TapIOContext) -> AudioDeviceIOBlock {
+        { _, inputData, _, _, _ in
+            context.copyInterleavedStereo(from: inputData)
+        }
+    }
+
     // MARK: - Teardown helpers
 
     private func destroyIOProc() {
@@ -232,7 +246,7 @@ func isDefaultOutputDeviceRunningSomewhere() -> Bool {
 
 /// State captured by the realtime IOProc: the ring buffer plus a preallocated scratch
 /// area for interleaving non-interleaved input. Allocated once, off the IO thread.
-private final class IOContext: @unchecked Sendable {
+private final class TapIOContext: @unchecked Sendable {
     private let ring: SPSCRingBuffer
     /// Interleave scratch: `scratchFrames` frames of interleaved stereo.
     private let scratch: UnsafeMutablePointer<Float>
