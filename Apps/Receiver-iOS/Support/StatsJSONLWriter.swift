@@ -1,0 +1,97 @@
+import Foundation
+
+/// One second of receiver telemetry, appended as a single JSON line to
+/// `Documents/stats.jsonl` (reachable through the Files app).
+struct StatsLine: Codable, Sendable {
+    /// Wall-clock unix timestamp of the sample.
+    var timestamp: Double
+    var received: Int
+    var played: Int
+    var lost: Int
+    var late: Int
+    var duplicates: Int
+    var overflowDropped: Int
+    var underruns: Int
+    var rebuffers: Int
+    var bufferingPops: Int
+    var depthFrames: Int
+    var targetFrames: Int
+    /// RFC 3550 interarrival jitter estimate.
+    var jitterMs: Double
+    /// Relative-delay distribution (fastest-path-anchored), in ms.
+    var delayP50Ms: Double
+    var delayP95Ms: Double
+    var delayP99Ms: Double
+    var delayMaxMs: Double
+    /// Largest gap between consecutive packets in this second, in ms — the
+    /// Wi-Fi power-save burst signature.
+    var maxInterArrivalGapMs: Double
+    /// Output-side latency (audio session output latency + IO buffer), ms.
+    var outputMs: Double
+    /// Current audio route name (e.g. the headphones).
+    var route: String
+    /// Active latency mode: low / balanced / safe.
+    var latencyMode: String
+    /// Datagrams dropped as malformed since launch.
+    var malformed: Int
+}
+
+/// Appends one JSON line per second to `Documents/stats.jsonl` on a utility
+/// queue — never the render or network path. The file is capped at 2 MB;
+/// past the cap the oldest half of the lines is dropped. Encoding happens on
+/// the caller; only the resulting `Data` crosses to the queue.
+final class StatsJSONLWriter: @unchecked Sendable {
+    private let fileURL: URL
+    private let maxBytes: Int
+    private let encoder: JSONEncoder
+    /// All file access is confined to this queue.
+    private let queue = DispatchQueue(label: "dev.jash90.MacAudioBridge.stats", qos: .utility)
+
+    init(filename: String = "stats.jsonl", maxBytes: Int = 2 * 1024 * 1024) {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        fileURL = documents.appendingPathComponent(filename)
+        self.maxBytes = maxBytes
+        encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+    }
+
+    func append(_ line: StatsLine) {
+        guard let data = try? encoder.encode(line) else { return }
+        queue.async { [weak self] in
+            self?.write(data)
+        }
+    }
+
+    // MARK: - Queue-confined implementation
+
+    private func write(_ data: Data) {
+        var line = data
+        line.append(0x0A)
+        do {
+            let handle = try FileHandle(forWritingTo: fileURL)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: line)
+        } catch {
+            // No file yet (or it vanished): create it with this line.
+            try? line.write(to: fileURL, options: .atomic)
+        }
+        trimIfNeeded()
+    }
+
+    /// Keeps the file bounded: past `maxBytes`, drop the oldest half of the
+    /// lines and rewrite atomically.
+    private func trimIfNeeded() {
+        guard
+            let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+            let size = attributes[.size] as? Int,
+            size > maxBytes
+        else { return }
+        guard let contents = try? String(contentsOf: fileURL, encoding: .utf8) else { return }
+        var lines = contents.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        let keptLines = max(lines.count / 2, 1)
+        lines.removeFirst(lines.count - keptLines)
+        try? lines.joined(separator: "\n").appending("\n")
+            .write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+}

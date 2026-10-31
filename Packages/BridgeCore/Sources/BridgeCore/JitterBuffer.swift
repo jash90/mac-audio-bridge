@@ -1,38 +1,80 @@
 import Foundation
 import os
 
+/// Named latency modes for the jitter buffer: the trade-off between
+/// end-to-end latency and tolerance to delay variation on the network path.
+public enum JitterLatencyMode: String, CaseIterable, Sendable {
+    /// 30–120 ms cushion: streaming over a clean LAN/Wi-Fi link.
+    case low
+    /// 50–250 ms cushion: the default; survives typical iPhone Wi-Fi
+    /// power-save burst delivery (gaps of 50–150 ms and more).
+    case balanced
+    /// 100–400 ms cushion: congested links, long burst gaps, or downstream
+    /// chains (e.g. Bluetooth headphones) that buffer on their own.
+    case safe
+}
+
 /// Tuning parameters for the adaptive jitter buffer.
 public struct JitterBufferConfig: Sendable {
+    /// How the adaptive target depth is derived from the network observations.
+    public enum TargetEstimator: Sendable, Equatable {
+        /// RFC 3550 interarrival jitter × `jitterMultiplier` (the pre-M2.6
+        /// rule). Retained for comparison; the smoothed mean deviation
+        /// underestimates bursty delay.
+        case rfc3550
+        /// p99 of the windowed relative-delay distribution + `safetyMargin`
+        /// (the default): the target covers the actual delay tail, which is
+        /// what Wi-Fi power-save bursts stress.
+        case delayPercentile
+    }
+
     /// Nominal duration of one audio frame (10 ms at 48 kHz).
     public var frameDuration: TimeInterval = 0.010
     /// Lower clamp for the adaptive target depth (40 ms).
     public var minTargetFrames = 4
     /// Upper clamp for the adaptive target depth (80 ms).
     public var maxTargetFrames = 8
-    /// Target = ceil(multiplier * jitter / frameDuration) + 1, clamped.
+    /// Target multiplier for the `.rfc3550` estimator:
+    /// ceil(multiplier * jitter / frameDuration) + 1, clamped.
     public var jitterMultiplier = 3.0
     /// Depth above this resyncs the buffer by dropping the oldest frames
-    /// down to the target.
+    /// down to the target. An interim drift guard: until the receiver
+    /// resamples playout to the output audio clock (separate task), the two
+    /// clocks drift apart and the depth slowly ramps in one direction.
     public var overflowFrames = 16
+    /// How the adaptive target is derived; see `TargetEstimator`.
+    public var targetEstimator: TargetEstimator = .delayPercentile
+    /// Headroom added to the delay p99 before converting it to frames
+    /// (`.delayPercentile` estimator): it bridges the p99-to-max tail, so a
+    /// burst does not have to be seen twice before the target covers it.
+    public var safetyMargin: TimeInterval = 0.010
+    /// Sliding window of the delay histogram behind `.delayPercentile`.
+    public var delayWindowSeconds: TimeInterval = 10.0
+    /// The target may only fall once the p99-based estimate has stayed below
+    /// the current target for this many seconds of playout
+    /// (`.delayPercentile` estimator).
+    public var targetFallHoldSeconds: TimeInterval = 5.0
 
     public init() {}
 
-    /// Low-latency preset for the 48 kHz PCM bridge stream: a 30 ms minimum
-    /// cushion, an 80 ms ceiling, and an overflow resync at 120 ms.
-    ///
-    /// `overflowFrames` (12) is an interim drift guard: until the receiver
-    /// resamples playout to the output audio clock (separate task), the
-    /// sender's and the receiver's clocks drift apart and the buffered depth
-    /// slowly ramps in one direction. The overflow drop periodically resyncs
-    /// the depth to the target, trading a small glitch for bounded latency
-    /// instead of unbounded growth.
-    public static let lowLatency: JitterBufferConfig = {
+    /// Preset for a latency mode: clamps and overflow resync tuned per mode
+    /// (`overflowFrames = maxTargetFrames + 6`).
+    public static func latency(_ mode: JitterLatencyMode) -> JitterBufferConfig {
         var config = JitterBufferConfig()
-        config.minTargetFrames = 3
-        config.maxTargetFrames = 8
-        config.overflowFrames = 12
+        switch mode {
+        case .low:
+            config.minTargetFrames = 3
+            config.maxTargetFrames = 12
+        case .balanced:
+            config.minTargetFrames = 5
+            config.maxTargetFrames = 25
+        case .safe:
+            config.minTargetFrames = 10
+            config.maxTargetFrames = 40
+        }
+        config.overflowFrames = config.maxTargetFrames + 6
         return config
-    }()
+    }
 }
 
 /// One playout slot of output from the jitter buffer.
@@ -71,8 +113,15 @@ public struct JitterBufferStats: Sendable, Equatable {
     public var depthFrames = 0
     /// Current adaptive target depth in frames.
     public var targetFrames = 0
-    /// Current RFC 3550 interarrival jitter estimate, in seconds.
+    /// Current RFC 3550 interarrival jitter estimate, in seconds (a stat;
+    /// only drives the target with `targetEstimator = .rfc3550`).
     public var jitterSeconds: Double = 0
+    /// Relative-delay percentiles over the delay window (arrival minus media
+    /// time, anchored at the fastest observed path), in seconds.
+    public var delayP50Seconds: Double = 0
+    public var delayP95Seconds: Double = 0
+    public var delayP99Seconds: Double = 0
+    public var delayMaxSeconds: Double = 0
 }
 
 /// Payload-agnostic adaptive jitter buffer for `AudioPacket`s. Decoding and
@@ -83,22 +132,32 @@ public struct JitterBufferStats: Sendable, Equatable {
 /// audio thread; all state lives behind a single short unfair lock. `pop()`
 /// does not allocate beyond handing back the buffered packet.
 ///
-/// Adaptivity: the target depth follows an RFC 3550 interarrival jitter
-/// estimate (`ceil(jitterMultiplier * jitter / frameDuration) + 1`, clamped
-/// to `[minTargetFrames, maxTargetFrames]`). The target rises immediately
-/// and falls at most one frame per two seconds of playout.
+/// Adaptivity: the target depth follows the delay distribution. With the
+/// default `.delayPercentile` estimator the target is
+/// `ceil((p99 + safetyMargin) / frameDuration)`, clamped to
+/// `[minTargetFrames, maxTargetFrames]`, where p99 comes from a
+/// `DelayHistogram` over a sliding window — an RFC 3550 mean-deviation
+/// estimate underestimates bursty delay (Wi-Fi power save delivers UDP in
+/// 100 ms+ batches), while p99 tracks the actual tail. The target rises
+/// immediately and falls slowly: at most one frame per two seconds of
+/// playout, and only after the p99-based estimate has stayed below the
+/// current target for `targetFallHoldSeconds`. The RFC 3550 jitter estimate
+/// is still computed and reported as a stat (and drives the target with
+/// `targetEstimator = .rfc3550`).
 ///
 /// Cushion: the buffer tracks how far playout lags the newest arrival (the
-/// cushion), measured against an epoch anchor captured at the first insert
-/// after each reset — the sender's media clock and the receiver's arrival
-/// clock have unrelated epochs, so only the cushion's growth since the reset
-/// is meaningful. When a risen target demands more cushion than the current
-/// playing run started with, the buffer returns to `.buffering` and rebuilds
-/// it; the rebuild ends as soon as the cushion reaches
-/// `(target - 1) * frameDuration`, so the audible gap stays short. Rising
-/// through several target steps (a staircase) is debounced into a single
-/// rebuild, so one jitter step costs at most a rebuild or two rather than
-/// one per step.
+/// cushion), measured against the running minimum of
+/// `arrival - mediaTime` — the fastest path observed since the reset
+/// (anchoring at the first packet after a reset is wrong: that packet may
+/// itself have arrived late, e.g. at the tail of a burst). The sender's
+/// media clock and the receiver's arrival clock have unrelated epochs, so
+/// only the cushion's growth over that anchor is meaningful. When a risen
+/// target demands more cushion than the current playing run started with,
+/// the buffer returns to `.buffering` and rebuilds it; the rebuild ends as
+/// soon as the cushion reaches `(target - 1) * frameDuration`, so the
+/// audible gap stays short. Rising through several target steps (a
+/// staircase) is debounced into a single rebuild, so one jitter step costs
+/// at most a rebuild or two rather than one per step.
 public final class JitterBuffer: @unchecked Sendable {
     /// All mutable state, guarded by `lock`.
     private struct State: Sendable {
@@ -135,13 +194,20 @@ public final class JitterBuffer: @unchecked Sendable {
         var anchorMediaTime: TimeInterval = 0
         /// Arrival time of the newest insert minus the media time of the
         /// playback reference (the expected sequence while playing, the
-        /// lowest buffered sequence while rebuffering), relative to the epoch
-        /// offset anchored at the first insert after a reset: the cushion.
+        /// lowest buffered sequence while rebuffering), relative to the
+        /// fastest observed path since the reset: the cushion.
         var cushionEstimate: TimeInterval = 0
-        /// `arrival - media time` of the first insert after a reset. Sender
-        /// media time and the receiver's arrival clock have unrelated epochs,
-        /// so only the growth of the cushion since this anchor is meaningful.
-        var cushionOffset: TimeInterval?
+        /// Running minimum of `arrival - mediaTime` over accepted inserts
+        /// since the reset — the fastest network path. Anchors the cushion so
+        /// its growth measures real buffering, not the arbitrary delay of
+        /// whichever packet happened to arrive first.
+        var minOffsetSeen: TimeInterval?
+        /// Relative-delay distribution over the sliding window; drives the
+        /// `.delayPercentile` target estimator.
+        var histogram = DelayHistogram()
+        /// Playout time at which the p99-based estimate first dropped below
+        /// the current target; nil while the estimate covers the target.
+        var lowEstimateSince: TimeInterval?
         /// Insert counter, and the count at which a pending cushion rebuild
         /// first became due; the rebuild is debounced by insert count so a
         /// rising staircase of targets collapses into one rebuild.
@@ -149,12 +215,13 @@ public final class JitterBuffer: @unchecked Sendable {
         var pendingRiseInsert: Int?
         var counters = JitterBufferStats()
 
-        init(minTargetFrames: Int) {
-            target = minTargetFrames
+        init(config: JitterBufferConfig) {
+            target = config.minTargetFrames
+            histogram = DelayHistogram(window: config.delayWindowSeconds)
         }
     }
 
-    private let config: JitterBufferConfig
+    private var config: JitterBufferConfig
     private let lock: OSAllocatedUnfairLock<State>
     /// A target rise must persist this many inserts (~350 ms at stream rate)
     /// before the cushion rebuild fires.
@@ -162,7 +229,7 @@ public final class JitterBuffer: @unchecked Sendable {
 
     public init(config: JitterBufferConfig = .init()) {
         self.config = config
-        lock = OSAllocatedUnfairLock(initialState: State(minTargetFrames: config.minTargetFrames))
+        lock = OSAllocatedUnfairLock(initialState: State(config: config))
     }
 
     /// Buffers a received packet. `arrivalTime` is injected by the caller
@@ -181,7 +248,6 @@ public final class JitterBuffer: @unchecked Sendable {
 
             let mediaTime = Double(packet.sampleTime) / AudioFormat.sampleRate
             self.updateJitter(&state, arrivalTime: arrivalTime, mediaTime: mediaTime)
-            self.updateTarget(&state)
 
             state.anchorSequence = packet.sequence
             state.anchorMediaTime = mediaTime
@@ -196,6 +262,12 @@ public final class JitterBuffer: @unchecked Sendable {
                 state.counters.late += 1
                 return
             }
+            // Only accepted packets feed the delay distribution: duplicates
+            // and late packets carry inflated delays that would bias the
+            // percentile target upwards and keep it there.
+            state.histogram.record(arrivalTime: arrivalTime, mediaTime: mediaTime)
+            self.updateTarget(&state, arrivalTime: arrivalTime)
+
             state.buffered[sequence] = packet
 
             if state.buffered.count > config.overflowFrames {
@@ -297,10 +369,23 @@ public final class JitterBuffer: @unchecked Sendable {
 
     /// Clears buffered audio and returns to prebuffering, e.g. on a stream
     /// discontinuity or reconnect. Session counters are kept; the jitter
-    /// estimator restarts because inter-arrival history across a reset is
-    /// meaningless.
+    /// estimator and the delay histogram restart because inter-arrival
+    /// history across a reset is meaningless.
     public func reset() {
         lock.withLock { (state: inout State) in
+            self.resetBuffer(&state)
+        }
+    }
+
+    /// Swaps the configuration (e.g. a latency-mode change) and resets the
+    /// buffered audio so the new target range takes effect immediately;
+    /// session counters are kept, the adaptive target restarts at the new
+    /// minimum.
+    public func applyConfig(_ newConfig: JitterBufferConfig) {
+        lock.withLock { (state: inout State) in
+            self.config = newConfig
+            state.target = newConfig.minTargetFrames
+            state.lastTargetDecreaseAt = 0
             self.resetBuffer(&state)
         }
     }
@@ -312,6 +397,12 @@ public final class JitterBuffer: @unchecked Sendable {
             stats.depthFrames = state.buffered.count
             stats.targetFrames = state.target
             stats.jitterSeconds = state.jitter
+            if let percentiles = state.histogram.percentiles(now: state.lastArrival ?? 0) {
+                stats.delayP50Seconds = percentiles.p50
+                stats.delayP95Seconds = percentiles.p95
+                stats.delayP99Seconds = percentiles.p99
+                stats.delayMaxSeconds = percentiles.max
+            }
             return stats
         }
     }
@@ -341,21 +432,65 @@ public final class JitterBuffer: @unchecked Sendable {
         state.lastMediaTime = mediaTime
     }
 
-    /// Recomputes the target depth: rises immediately, falls at most one
-    /// frame per two seconds of playout.
-    private func updateTarget(_ state: inout State) {
-        let scaled = config.jitterMultiplier * state.jitter / config.frameDuration
-        let computed = min(
-            max(Int(ceil(scaled)) + 1, config.minTargetFrames),
-            config.maxTargetFrames
-        )
+    /// Recomputes the target depth. Rises immediately on either estimator.
+    /// Falls at most one frame per two seconds of playout; with
+    /// `.delayPercentile` additionally only after the estimate has stayed
+    /// below the current target for `targetFallHoldSeconds`, so one quiet
+    /// second does not undo the cushion that a burst demanded.
+    private func updateTarget(_ state: inout State, arrivalTime: TimeInterval) {
+        guard let computed = computedTarget(&state, arrivalTime: arrivalTime) else { return }
         if computed > state.target {
             state.target = computed
-        } else if computed < state.target,
-            state.playoutSeconds - state.lastTargetDecreaseAt >= 2.0
-        {
-            state.target = max(computed, state.target - 1)
-            state.lastTargetDecreaseAt = state.playoutSeconds
+            state.lowEstimateSince = nil
+            return
+        }
+        guard computed < state.target else {
+            state.lowEstimateSince = nil
+            return
+        }
+        switch config.targetEstimator {
+        case .rfc3550:
+            if state.playoutSeconds - state.lastTargetDecreaseAt >= 2.0 {
+                state.target = max(computed, state.target - 1)
+                state.lastTargetDecreaseAt = state.playoutSeconds
+            }
+        case .delayPercentile:
+            if state.lowEstimateSince == nil {
+                state.lowEstimateSince = state.playoutSeconds
+            }
+            let estimateHeldLow =
+                state.playoutSeconds - state.lowEstimateSince! >= config.targetFallHoldSeconds
+            let rateLimitSatisfied =
+                state.playoutSeconds - state.lastTargetDecreaseAt >= 2.0
+            if estimateHeldLow && rateLimitSatisfied {
+                state.target = max(computed, state.target - 1)
+                state.lastTargetDecreaseAt = state.playoutSeconds
+            }
+        }
+    }
+
+    /// The target the current network observations call for, clamped to the
+    /// configured range. Nil until the delay histogram has samples (the
+    /// target then stays at the minimum).
+    private func computedTarget(_ state: inout State, arrivalTime: TimeInterval) -> Int? {
+        switch config.targetEstimator {
+        case .rfc3550:
+            let scaled = config.jitterMultiplier * state.jitter / config.frameDuration
+            return min(
+                max(Int(ceil(scaled)) + 1, config.minTargetFrames),
+                config.maxTargetFrames
+            )
+        case .delayPercentile:
+            guard let percentiles = state.histogram.percentiles(now: arrivalTime) else {
+                return nil
+            }
+            // The epsilon keeps ceil() honest at exact frame boundaries
+            // ((0.08 + 0.01) / 0.01 evaluates to 9.000000000000002).
+            let scaled = (percentiles.p99 + config.safetyMargin) / config.frameDuration - 1e-9
+            return min(
+                max(Int(ceil(scaled)), config.minTargetFrames),
+                config.maxTargetFrames
+            )
         }
     }
 
@@ -365,12 +500,17 @@ public final class JitterBuffer: @unchecked Sendable {
     /// restart from, so the estimate is a safe lower bound for the cushion
     /// the restart will have.
     ///
-    /// The estimate is anchored: the epoch offset between the two clocks is
-    /// captured at the first insert after a reset and subtracted, so the
-    /// cushion measures the wall-time growth of buffered audio since the
-    /// reset regardless of when each side started its clock.
+    /// The estimate is anchored at the running minimum of
+    /// `arrival - mediaTime` — the fastest path observed since the reset —
+    /// rather than at whichever packet happened to arrive first: a first
+    /// packet delivered at the tail of a power-save burst carries an
+    /// above-minimum delay, and anchoring there would bias the cushion low.
     private func updateCushionEstimate(_ state: inout State, arrivalTime: TimeInterval) {
         guard let anchorSequence = state.anchorSequence else { return }
+        let currentOffset = arrivalTime - state.anchorMediaTime
+        if state.minOffsetSeen == nil || currentOffset < state.minOffsetSeen! {
+            state.minOffsetSeen = currentOffset
+        }
         func mediaTime(of sequence: UInt32) -> TimeInterval {
             let offset = Int64(Int32(bitPattern: sequence &- anchorSequence))
             return state.anchorMediaTime + TimeInterval(offset) * config.frameDuration
@@ -382,12 +522,8 @@ public final class JitterBuffer: @unchecked Sendable {
             reference = lowestSequence(state.buffered)
         }
         guard let reference else { return }
-        if let offset = state.cushionOffset {
-            state.cushionEstimate = arrivalTime - mediaTime(of: reference) - offset
-        } else {
-            state.cushionOffset = arrivalTime - mediaTime(of: reference)
-            state.cushionEstimate = 0
-        }
+        let minOffset = state.minOffsetSeen ?? currentOffset
+        state.cushionEstimate = arrivalTime - mediaTime(of: reference) - minOffset
     }
 
     /// Lowest buffered sequence, wrap-around aware. Linear scan; the depth is
@@ -416,7 +552,9 @@ public final class JitterBuffer: @unchecked Sendable {
         state.anchorSequence = nil
         state.anchorMediaTime = 0
         state.cushionEstimate = 0
-        state.cushionOffset = nil
+        state.minOffsetSeen = nil
+        state.histogram = DelayHistogram(window: config.delayWindowSeconds)
+        state.lowEstimateSince = nil
         state.pendingRiseInsert = nil
     }
 }

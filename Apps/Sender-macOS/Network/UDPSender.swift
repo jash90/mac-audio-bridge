@@ -31,13 +31,32 @@ final class UDPSender: @unchecked Sendable {
 
         let endpoint = NWEndpoint.Host(host)
         let port = NWEndpoint.Port(rawValue: Self.port)!
-        let newConnection = NWConnection(host: endpoint, port: port, using: .udp)
+        let parameters = NWParameters.udp
+        // WMM voice access class: keeps the stream in the AP's voice queue
+        // and out of best-effort contention, and helps iOS power-save
+        // scheduling on the receiving side.
+        parameters.serviceClass = .interactiveVoice
+        let newConnection = NWConnection(host: endpoint, port: port, using: parameters)
         newConnection.stateUpdateHandler = { [weak self] state in
             self?.handleState(state, host: host)
+            if case .ready = state {
+                self?.drainReceive(on: newConnection)
+            }
         }
         newConnection.start(queue: stateQueue)
         connection = newConnection
         logger.info("Connecting to \(host, privacy: .public):\(Self.port)")
+    }
+
+    /// Consumes incoming datagrams silently. The receiver replies with 16-byte
+    /// keepalive datagrams (and anything else that is not a valid audio packet
+    /// for this sender role) — they are dropped here, without per-datagram
+    /// logging; errors surface through the state handler.
+    private func drainReceive(on connection: NWConnection) {
+        connection.receiveMessage { [weak self] _, _, _, error in
+            guard error == nil else { return }
+            self?.drainReceive(on: connection)
+        }
     }
 
     /// Sends one datagram; dropped silently when the connection is not ready yet.

@@ -34,6 +34,16 @@ private struct SplitMix64 {
 
 // MARK: - Network simulation
 
+/// One packet landing on the receiver: its sequence and arrival time.
+private struct Arrival: Comparable {
+    let sequence: UInt32
+    let time: TimeInterval
+
+    static func < (lhs: Arrival, rhs: Arrival) -> Bool {
+        (lhs.time, lhs.sequence) < (rhs.time, rhs.sequence)
+    }
+}
+
 private struct SimulationReport {
     /// Stats after the final pop.
     let final: JitterBufferStats
@@ -64,22 +74,14 @@ private func simulate(
     warmUp: TimeInterval = 2,
     stepAt: TimeInterval? = nil,
     maxDelayAfterStep: TimeInterval? = nil,
-    grace: TimeInterval = 1
+    grace: TimeInterval = 1,
+    config: JitterBufferConfig = JitterBufferConfig()
 ) -> SimulationReport {
     let frameDuration: TimeInterval = 0.010
     let totalFrames = Int(duration / frameDuration)  // 6000
     let warmUpFrame = Int(warmUp / frameDuration)
     let graceFrame = stepAt.map { Int(($0 + grace) / frameDuration) } ?? warmUpFrame
     var rng = SplitMix64(seed: seed)
-
-    struct Arrival: Comparable {
-        let sequence: UInt32
-        let time: TimeInterval
-
-        static func < (lhs: Arrival, rhs: Arrival) -> Bool {
-            (lhs.time, lhs.sequence) < (rhs.time, rhs.sequence)
-        }
-    }
 
     var arrivals: [Arrival] = []
     arrivals.reserveCapacity(totalFrames)
@@ -96,11 +98,79 @@ private func simulate(
     }
     arrivals.sort()
 
+    return runStream(
+        arrivals: arrivals,
+        totalFrames: totalFrames,
+        warmUpFrame: warmUpFrame,
+        graceFrame: stepAt == nil ? nil : graceFrame,
+        config: config,
+        droppedAfterWarmUp: droppedAfterWarmUp
+    )
+}
+
+/// Deterministic Wi-Fi power-save simulation: the sender emits one frame
+/// every 10 ms with a 2-8 ms base delay; every 100 ms the AP holds the
+/// packets of the last 100 ms window and releases them together after a
+/// per-burst hold of 60-120 ms (a packet lands no earlier than its own
+/// on-time arrival). 1% of packets is dropped. Runs `.balanced` by default.
+private func simulateWiFiBurst(
+    seed: UInt64,
+    duration: TimeInterval = 60,
+    warmUp: TimeInterval = 3,
+    mode: JitterLatencyMode = .balanced
+) -> SimulationReport {
+    let frameDuration: TimeInterval = 0.010
+    let totalFrames = Int(duration / frameDuration)  // 6000
+    let warmUpFrame = Int(warmUp / frameDuration)
+    let burstFrames = 10  // one burst per 100 ms
+    var rng = SplitMix64(seed: seed)
+
+    var arrivals: [Arrival] = []
+    arrivals.reserveCapacity(totalFrames)
+    var droppedAfterWarmUp = 0
+    var hold: TimeInterval = 0
+    for index in 0..<totalFrames {
+        if index % burstFrames == 0 {
+            hold = 0.060 + rng.nextUniform(upTo: 0.060)  // 60-120 ms per burst
+        }
+        let sendTime = TimeInterval(index) * frameDuration
+        let base = 0.002 + rng.nextUniform(upTo: 0.006)  // 2-8 ms
+        if rng.nextBool(probability: 0.01) {
+            if index >= warmUpFrame { droppedAfterWarmUp += 1 }
+            continue
+        }
+        let release = TimeInterval(index - index % burstFrames) * frameDuration + hold
+        arrivals.append(Arrival(sequence: UInt32(index), time: max(sendTime + base, release)))
+    }
+    arrivals.sort()
+
+    return runStream(
+        arrivals: arrivals,
+        totalFrames: totalFrames,
+        warmUpFrame: warmUpFrame,
+        graceFrame: nil,
+        config: .latency(mode),
+        droppedAfterWarmUp: droppedAfterWarmUp
+    )
+}
+
+/// Drives one jitter buffer over a precomputed arrival schedule: inserts
+/// every packet whose arrival time has come, pops one playout slot per 10 ms
+/// tick, and samples the statistics the acceptance thresholds need.
+private func runStream(
+    arrivals: [Arrival],
+    totalFrames: Int,
+    warmUpFrame: Int,
+    graceFrame: Int?,
+    config: JitterBufferConfig,
+    droppedAfterWarmUp: Int
+) -> SimulationReport {
+    let frameDuration: TimeInterval = 0.010
     let payload = Data(
         repeating: 0x5A,
         count: AudioFormat.samplesPerFrame * AudioFormat.channelCount * 2  // PCM16 stereo
     )
-    let buffer = JitterBuffer()
+    let buffer = JitterBuffer(config: config)
     var nextArrivalIndex = 0
     var atWarmUp = JitterBufferStats()
     var atGrace = JitterBufferStats()
@@ -137,7 +207,7 @@ private func simulate(
         if tick == warmUpFrame - 1 {
             atWarmUp = buffer.stats
         }
-        if tick == graceFrame - 1, graceFrame != warmUpFrame {
+        if let graceFrame, tick == graceFrame - 1, graceFrame != warmUpFrame {
             atGrace = buffer.stats
         }
         if tick >= warmUpFrame {
@@ -152,10 +222,10 @@ private func simulate(
     return SimulationReport(
         final: buffer.stats,
         atWarmUp: atWarmUp,
-        atGrace: stepAt == nil ? atWarmUp : atGrace,
+        atGrace: graceFrame == nil ? atWarmUp : atGrace,
         framesSent: totalFrames,
         warmUpFrame: warmUpFrame,
-        graceFrame: graceFrame,
+        graceFrame: graceFrame ?? warmUpFrame,
         maxTargetAfterWarmUp: maxTargetAfterWarmUp,
         dropPercentAfterWarmUp: Double(droppedAfterWarmUp) / Double(totalFrames - warmUpFrame) * 100
     )
@@ -246,5 +316,35 @@ struct JitterBufferSimulationTests {
         // One second after the step the new cushion is in place: lates stay
         // within one percent of the frames sent in the measured window.
         #expect(latePercent <= 1.0)
+    }
+
+    @Test("Wi-Fi power-save bursts (100 ms batches, 60-120 ms holds) survive in balanced mode")
+    func wiFiBurstDeliverySurvives() {
+        let report = simulateWiFiBurst(seed: 0x5EED_C0FF_EE04)
+        let frames = report.framesSent - report.warmUpFrame
+        let latePercent = Double(report.final.late - report.atWarmUp.late) / Double(frames) * 100
+        let underruns = report.final.underruns - report.atWarmUp.underruns
+        let lostPercent = Double(report.final.lost - report.atWarmUp.lost) / Double(frames) * 100
+
+        print(
+            "simulation[burst]: late=\(report.final.late - report.atWarmUp.late) "
+                + "(\(String(format: "%.3f", latePercent))%), "
+                + "underruns=\(underruns), "
+                + "maxTarget=\(report.maxTargetAfterWarmUp), "
+                + "lost=\(report.final.lost - report.atWarmUp.lost) "
+                + "(\(String(format: "%.2f", lostPercent))%), "
+                + "simulatedDrop=\(String(format: "%.2f", report.dropPercentAfterWarmUp))%, "
+                + "rebuffers(after warm-up)=\(report.final.rebuffers - report.atWarmUp.rebuffers), "
+                + "bufferingPops(after warm-up)=\(report.final.bufferingPops - report.atWarmUp.bufferingPops), "
+                + "finalTarget=\(report.final.targetFrames), "
+                + "jitter=\(String(format: "%.4f", report.final.jitterSeconds)) s"
+        )
+
+        // After the 3 s warm-up: essentially no packet misses its playout
+        // slot, the buffer never drains, and the percentile target stays
+        // well inside the balanced ceiling.
+        #expect(latePercent <= 0.5)
+        #expect(underruns <= 2)
+        #expect(report.maxTargetAfterWarmUp <= 25)
     }
 }
