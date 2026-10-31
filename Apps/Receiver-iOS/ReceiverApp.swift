@@ -8,9 +8,3 @@ struct ReceiverApp: App {
         }
     }
 }
-
-struct ContentView: View {
-    var body: some View {
-        Text("Mac Audio Bridge")
-    }
-}
