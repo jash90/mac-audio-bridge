@@ -53,6 +53,26 @@ final class FrameStats: @unchecked Sendable {
     }
 }
 
+/// One second of sender telemetry, appended as a JSON line to
+/// `~/Library/Logs/MacAudioBridge/sender-stats.jsonl`.
+private struct SenderStatsLine: Codable, Sendable {
+    var timestamp: Double
+    /// Ring write() calls (≈ tap IOProc callbacks) in the last second.
+    var ioCallbacks: Int
+    /// Samples the tap delivered into the ring (stored + dropped).
+    var samplesCaptured: Int
+    /// Samples the ring dropped to overflow in the last second.
+    var ringDroppedSamples: Int
+    /// Samples currently sitting in the ring.
+    var ringFillSamples: Int
+    var packetsSent: Int
+    var bytesSent: Int
+    /// Largest gap between drain ticks in the last second, ms — the App Nap
+    /// / timer-throttling signature.
+    var maxTickMs: Double
+    var appNapActivityHeld: Bool
+}
+
 /// Glues tap → frame converter → UDP sender together and exposes UI state
 /// on the main actor.
 @MainActor
@@ -62,6 +82,10 @@ final class SenderController: ObservableObject {
         case running
         case failed(String)
     }
+
+    private static let statsFileURL = FileManager.default.urls(
+        for: .libraryDirectory, in: .userDomainMask
+    )[0].appendingPathComponent("Logs/MacAudioBridge/sender-stats.jsonl")
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var tapSampleRate: Double?
@@ -74,6 +98,21 @@ final class SenderController: ObservableObject {
     private let udpSender = UDPSender()
     private let frameStats = FrameStats()
     private let captureWarningMailbox = WarningMailbox()
+    private let statsWriter = RollingJSONLWriter(fileURL: SenderController.statsFileURL)
+    private let statsEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
+
+    /// App Nap prevention held while streaming: without it (LSUIElement menu
+    /// bar app, no windows), macOS throttles the 2.5 ms drain timer and the
+    /// tap ring overflows.
+    private var streamingActivity: NSObjectProtocol?
+    /// Ring counter baselines for per-second deltas.
+    private var lastRingWriteCalls = 0
+    private var lastRingCapturedSamples = 0
+    private var lastRingDroppedSamples = 0
 
     var isRunning: Bool { phase == .running }
 
@@ -91,6 +130,14 @@ final class SenderController: ObservableObject {
             phase = .failed("Enter the iPhone's IP address first.")
             return
         }
+
+        // Hold the system awake for the whole run: this is an LSUIElement app
+        // with no window, so without an activity assertion App Nap coalesces
+        // the 2.5 ms drain timer into seconds-long silences and the tap ring
+        // overflows (measured: 26 kB/s out of an expected 194 kB/s).
+        streamingActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .latencyCritical],
+            reason: "Streaming audio to iPhone")
 
         // Process taps are gated by the "System Audio Recording" TCC service: the
         // system prompt appears when the tap/IO starts. A denial shows up either as
@@ -127,6 +174,10 @@ final class SenderController: ObservableObject {
         converter.stop()
         udpSender.cancel()
         tap.stop()
+        if let activity = streamingActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            streamingActivity = nil
+        }
         tapSampleRate = nil
         packetsPerSecond = 0
         currentSequence = 0
@@ -140,6 +191,37 @@ final class SenderController: ObservableObject {
         currentSequence = frameStats.sequence
         if let warning = captureWarningMailbox.take() {
             captureWarning = warning
+        }
+        logStats()
+    }
+
+    /// Appends one JSON line of sender telemetry to
+    /// `~/Library/Logs/MacAudioBridge/sender-stats.jsonl` — call ~1 Hz while
+    /// streaming. Only atomic ring/sender counters come off the hot paths;
+    /// encoding happens here, the file write on the writer's utility queue.
+    private func logStats() {
+        guard phase == .running else { return }
+        let ring = tap.ring
+        let writeCalls = ring.writeCallCount
+        let capturedSamples = ring.storedSampleCount + ring.droppedSampleCount
+        let droppedSamples = ring.droppedSampleCount
+        let sent = udpSender.takeSentCounts()
+        let line = SenderStatsLine(
+            timestamp: Date().timeIntervalSince1970,
+            ioCallbacks: writeCalls - lastRingWriteCalls,
+            samplesCaptured: capturedSamples - lastRingCapturedSamples,
+            ringDroppedSamples: droppedSamples - lastRingDroppedSamples,
+            ringFillSamples: ring.availableToRead,
+            packetsSent: sent.datagrams,
+            bytesSent: sent.bytes,
+            maxTickMs: converter.takeMaxTickIntervalMilliseconds(),
+            appNapActivityHeld: streamingActivity != nil
+        )
+        lastRingWriteCalls = writeCalls
+        lastRingCapturedSamples = capturedSamples
+        lastRingDroppedSamples = droppedSamples
+        if let data = try? statsEncoder.encode(line) {
+            statsWriter.append(data)
         }
     }
 }

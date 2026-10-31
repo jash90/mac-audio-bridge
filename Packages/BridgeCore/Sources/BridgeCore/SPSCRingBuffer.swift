@@ -9,12 +9,20 @@ import Synchronization
 /// publishes reclaimed slots with a releasing store to `readIndex`; the producer loads it
 /// with acquire ordering before overwriting. Both indices are monotonic 64-bit counters —
 /// at 96,000 samples/s they would not overflow for millions of years.
+///
+/// Diagnostics: lock-free monotonic counters track write() calls, samples stored and
+/// samples dropped to overflow (relaxed ordering — they are readouts, not synchronization).
+/// `capturedSampleCount = storedSampleCount + droppedSampleCount` is everything the
+/// producer handed to `write`, i.e. everything the capture side produced.
 public final class SPSCRingBuffer: @unchecked Sendable {
     private let storage: UnsafeMutablePointer<Float>
     private let capacityValue: Int
     private let indexMask: Int
     private let writeIndex = Atomic<Int>(0)
     private let readIndex = Atomic<Int>(0)
+    private let writeCalls = Atomic<Int>(0)
+    private let storedSamples = Atomic<Int>(0)
+    private let droppedSamples = Atomic<Int>(0)
 
     /// Creates a ring buffer that holds `capacity` samples (rounded up to a power of two).
     public init(capacity: Int) {
@@ -36,6 +44,21 @@ public final class SPSCRingBuffer: @unchecked Sendable {
     /// Number of samples the buffer holds (power of two).
     public var capacity: Int { capacityValue }
 
+    /// Cumulative producer `write()` calls (≈ capture IOProc callbacks).
+    public var writeCallCount: Int {
+        writeCalls.load(ordering: .relaxed)
+    }
+
+    /// Cumulative samples successfully stored.
+    public var storedSampleCount: Int {
+        storedSamples.load(ordering: .relaxed)
+    }
+
+    /// Cumulative samples dropped because the ring was full when written.
+    public var droppedSampleCount: Int {
+        droppedSamples.load(ordering: .relaxed)
+    }
+
     /// Samples currently available to read (consumer's view).
     public var availableToRead: Int {
         writeIndex.load(ordering: .acquiring) - readIndex.load(ordering: .relaxed)
@@ -55,6 +78,11 @@ public final class SPSCRingBuffer: @unchecked Sendable {
         let reader = readIndex.load(ordering: .acquiring)
         let free = capacityValue - (cursor - reader)
         let toWrite = min(count, free)
+        writeCalls.wrappingAdd(1, ordering: .relaxed)
+        storedSamples.wrappingAdd(toWrite, ordering: .relaxed)
+        if toWrite < count {
+            droppedSamples.wrappingAdd(count - toWrite, ordering: .relaxed)
+        }
         guard toWrite > 0 else { return 0 }
         let start = cursor & indexMask
         let head = min(toWrite, capacityValue - start)

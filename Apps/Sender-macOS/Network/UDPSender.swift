@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import os
+import Synchronization
 
 /// Sends one UDP datagram per audio frame to `host:49000`. Recreates the connection
 /// when the host changes. Thread-safe: `send` runs on the converter queue, the other
@@ -14,6 +15,10 @@ final class UDPSender: @unchecked Sendable {
     private var host: String?
     private var isReady = false
     private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "udp-sender")
+    /// Cumulative datagrams/bytes handed to the connection (diagnostics for
+    /// the stats log; relaxed readouts).
+    private let sentDatagrams = Atomic<Int>(0)
+    private let sentBytes = Atomic<Int>(0)
 
     /// Points the sender at `host`, recreating the connection when it changes.
     /// An empty string tears the connection down.
@@ -31,13 +36,32 @@ final class UDPSender: @unchecked Sendable {
 
         let endpoint = NWEndpoint.Host(host)
         let port = NWEndpoint.Port(rawValue: Self.port)!
-        let newConnection = NWConnection(host: endpoint, port: port, using: .udp)
+        let parameters = NWParameters.udp
+        // WMM voice access class: keeps the stream in the AP's voice queue
+        // and out of best-effort contention, and helps iOS power-save
+        // scheduling on the receiving side.
+        parameters.serviceClass = .interactiveVoice
+        let newConnection = NWConnection(host: endpoint, port: port, using: parameters)
         newConnection.stateUpdateHandler = { [weak self] state in
             self?.handleState(state, host: host)
+            if case .ready = state {
+                self?.drainReceive(on: newConnection)
+            }
         }
         newConnection.start(queue: stateQueue)
         connection = newConnection
         logger.info("Connecting to \(host, privacy: .public):\(Self.port)")
+    }
+
+    /// Consumes incoming datagrams silently. The receiver replies with 16-byte
+    /// keepalive datagrams (and anything else that is not a valid audio packet
+    /// for this sender role) — they are dropped here, without per-datagram
+    /// logging; errors surface through the state handler.
+    private func drainReceive(on connection: NWConnection) {
+        connection.receiveMessage { [weak self] _, _, _, error in
+            guard error == nil else { return }
+            self?.drainReceive(on: connection)
+        }
     }
 
     /// Sends one datagram; dropped silently when the connection is not ready yet.
@@ -46,9 +70,18 @@ final class UDPSender: @unchecked Sendable {
         let connection = isReady ? connection : nil
         lock.unlock()
         guard let connection else { return }
+        sentDatagrams.wrappingAdd(1, ordering: .relaxed)
+        sentBytes.wrappingAdd(data.count, ordering: .relaxed)
         connection.send(content: data, completion: .contentProcessed { _ in
             // Errors surface through the state handler; per-frame logging would spam.
         })
+    }
+
+    /// Datagrams and bytes sent since the last call, then resets the counters.
+    func takeSentCounts() -> (datagrams: Int, bytes: Int) {
+        let datagrams = sentDatagrams.exchange(0, ordering: .acquiringAndReleasing)
+        let bytes = sentBytes.exchange(0, ordering: .acquiringAndReleasing)
+        return (datagrams, bytes)
     }
 
     func cancel() {
