@@ -32,7 +32,12 @@ final class FrameConverter: @unchecked Sendable {
     private static let queueLabel = "dev.jash90.MacAudioBridge.frame-converter"
     private static let inputCapacityFrames = 8_192
     /// 2.5 ms drain tick: a 10 ms frame waits at most one extra tick once complete.
-    private static let timerInterval = DispatchTimeInterval.milliseconds(2_500)
+    /// Expressed in seconds so the interval can be checked against the frame
+    /// duration at timer creation — a tick longer than one audio frame can
+    /// never ship again.
+    private static let timerIntervalSeconds: Double = 0.0025
+    private static let timerInterval = DispatchTimeInterval.nanoseconds(
+        Int(timerIntervalSeconds * 1e9))
     private static let timerLeeway = DispatchTimeInterval.microseconds(500)
     private static let captureGraceInterval: TimeInterval = 3
 
@@ -138,6 +143,9 @@ final class FrameConverter: @unchecked Sendable {
             }
 
             self.isRunning = true
+            precondition(
+                Self.timerIntervalSeconds < Double(AudioFormat.frameDurationMs) / 1000,
+                "drain tick \(Self.timerIntervalSeconds) s must be shorter than one audio frame")
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(
                 deadline: .now() + Self.timerInterval,
