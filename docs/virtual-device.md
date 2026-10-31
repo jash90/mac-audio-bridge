@@ -35,8 +35,9 @@ Three pieces cooperate:
 3. **Auto start/stop + volume** (`Apps/Sender-macOS/SenderController.swift`). The
    sender listens for `kAudioHardwarePropertyDefaultOutputDevice` (system) and
    `kAudioDevicePropertyDeviceIsRunningSomewhere` / `VolumeScalar` / `Mute` (our
-   device) and streams **only while our device is the default output AND an iPhone
-   address is set**; switching the output away stops the stream and releases the
+   device) and streams **only while our device is the default output AND a receiver
+   is known** (a discovered Bonjour receiver or a manual address — see
+   [discovery.md](discovery.md)); switching the output away stops the stream and releases the
    tap. The device's volume/mute is read from the driver's control and applied as a
    gain in the frame converter before packetizing (mute → zeros) — that is how the
    Mac volume keys set the iPhone loudness. The device's `AudioObjectID` is not
