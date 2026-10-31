@@ -83,10 +83,10 @@ public struct JitterBufferConfig: Sendable, Equatable {
     public var latencyTrimWindowSeconds: TimeInterval = 0.5
     /// A missing next frame is given up (reported lost) once a frame this
     /// many sequences newer has arrived: by then its primary and its
-    /// redundant copy (sent `AudioRedundancy.offsets` frames later) should
-    /// both have been delivered, so waiting would only stretch the
+    /// redundant copies (sent up to `AudioRedundancy.maxOffset` frames later)
+    /// should all have been delivered, so waiting would only stretch the
     /// concealment. Nil = wait whenever the buffer is below its target.
-    public var lossHorizonFrames: Int? = (AudioRedundancy.offsets.max() ?? 0) + 2
+    public var lossHorizonFrames: Int? = AudioRedundancy.maxOffset + 2
 
     public init() {}
 
@@ -154,6 +154,8 @@ public struct PlayoutFrame: Sendable, Equatable {
     public var skippedByteCount: Int
     /// Played from a redundant copy (the primary never arrived).
     public var recovered: Bool
+    /// Codec of the skipped frame (meaningful when `skippedByteCount > 0`).
+    public var skippedCodec: AudioCodec = .pcm16
 }
 
 /// One playout slot from the realtime `pop(payload:skippedPayload:)`.
@@ -574,11 +576,13 @@ public final class JitterBuffer: @unchecked Sendable {
 
         guard var expected = state.nextExpected else { return .buffering }
         var skippedBytes = 0
+        var skippedCodec = AudioCodec.pcm16
         if shouldTrim(&state, expected: expected) {
             // Skip the oldest frame (its successor is buffered too) and hand
             // it to the reader for the crossfade.
             let index = Int(expected & Self.slotMask)
             skippedBytes = copyOut(state, index, into: skippedPayload)
+            skippedCodec = AudioCodec(rawValue: state.slotCodec[index]) ?? .pcm16
             removeSlot(&state, index)
             state.counters.trimmed += 1
             expected = expected &+ 1
@@ -606,7 +610,8 @@ public final class JitterBuffer: @unchecked Sendable {
                 flags: AudioPacketFlags(rawValue: state.slotFlags[index]),
                 byteCount: copyOut(state, index, into: payload),
                 skippedByteCount: skippedBytes,
-                recovered: recovered)
+                recovered: recovered,
+                skippedCodec: skippedCodec)
             removeSlot(&state, index)
             state.consecutiveEmptyPops = 0
             state.inUnderrun = false

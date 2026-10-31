@@ -47,6 +47,8 @@ final class PlaybackController {
         var routeChanges: Int
         var interruptions: Int
         var concealment: ConcealmentStats
+        /// Codec / frame size of the stream being played.
+        var stream: PlayoutStream?
     }
 
     private let jitterBuffer: JitterBuffer
@@ -103,7 +105,8 @@ final class PlaybackController {
             ioBufferMilliseconds: session.ioBufferDuration * 1000,
             routeChanges: routeChanges,
             interruptions: interruptions,
-            concealment: output.concealmentStats)
+            concealment: output.concealmentStats,
+            stream: output.playoutStream)
     }
 
     /// Installs the observers and the supervision loop (once) and starts the

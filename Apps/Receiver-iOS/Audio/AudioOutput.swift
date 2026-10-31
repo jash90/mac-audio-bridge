@@ -172,6 +172,12 @@ final class AudioOutput {
         renderContext.frameReader.stats
     }
 
+    /// Codec and frame size of the stream being played (nil before the
+    /// first frame).
+    var playoutStream: PlayoutStream? {
+        renderContext.frameReader.stream
+    }
+
     // MARK: - Realtime callback
 
     /// The reader's playout source, built in a nonisolated context so it

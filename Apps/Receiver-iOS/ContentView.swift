@@ -25,6 +25,8 @@ final class ReceiverModel: ObservableObject {
     @Published private(set) var recoveredCount = 0
     @Published private(set) var concealedCount = 0
     @Published private(set) var malformedCount = 0
+    /// "Opus 192 kbit/s" / "PCM (uncompressed)"; nil before the first frame.
+    @Published private(set) var codecDescription: String?
     @Published private(set) var outputRoute: String?
     @Published private(set) var latencyMode: JitterLatencyMode = .balanced
     @Published private(set) var engineRunning = false
@@ -124,11 +126,13 @@ final class ReceiverModel: ObservableObject {
         rebufferCount = stats.rebuffers
         underrunCount = stats.underruns
         recoveredCount = stats.recovered
-        concealedCount = playback.snapshot.concealment.concealedFrames
+        let audio = playback.snapshot
+        concealedCount = audio.concealment.concealedFrames
+        codecDescription = audio.stream?.displayName
         malformedCount = receiver.malformedCount
         outputRoute = session.currentRoute.outputs.first?.portName
         engineRunning = playback.isEngineRunning
-        engineRestarts = playback.snapshot.engineRestarts
+        engineRestarts = audio.engineRestarts
     }
 
     /// Writes one JSON line of telemetry to `Documents/stats.jsonl` — called
@@ -181,7 +185,13 @@ final class ReceiverModel: ObservableObject {
                 fadeOuts: audio.concealment.fadeOuts,
                 fadeIns: audio.concealment.fadeIns,
                 crossfades: audio.concealment.crossfades,
-                frameMs: AudioFormat.frameDurationMs
+                frameMs: AudioFormat.frameDurationMs,
+                codec: audio.stream.map { StreamQuality.statsName($0.codec) } ?? "",
+                codecKbps: audio.stream.map {
+                    $0.payloadBytes * 8 / AudioFormat.frameDurationMs
+                } ?? 0,
+                decodeErrors: audio.concealment.decodeErrors,
+                opusPlcFrames: audio.concealment.opusPlcFrames
             )
         )
     }
@@ -276,6 +286,7 @@ struct ContentView: View {
 
     private var stats: some View {
         VStack(spacing: 6) {
+            statRow("Codec", model.codecDescription ?? "—")
             statRow("Buffer", "\(model.bufferMilliseconds) ms")
             statRow("Target", "\(model.targetMilliseconds) ms")
             statRow("Output", "\(model.outputMilliseconds) ms")

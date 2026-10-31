@@ -2,8 +2,8 @@ import AppKit
 import BridgeCore
 import SwiftUI
 
-/// Menu bar window: receiver picker, output-device switcher, status, and a
-/// manual-address fallback. Streaming is automatic — it runs while
+/// Menu bar window: receiver picker, stream-quality picker, output-device
+/// switcher, status, and a manual-address fallback. Streaming is automatic — it runs while
 /// "iPhone (Mac Audio Bridge)" is the selected output device and a receiver
 /// is known (see SenderController.evaluate). The controller (created in
 /// SenderApp) owns the 1 Hz loop and the Bonjour browser; this view owns no
@@ -13,6 +13,9 @@ struct MenuView: View {
     /// Text-field mirror of the manual host (persisted by the controller
     /// under the same `receiverHost` key).
     @AppStorage("receiverHost") private var manualHostText = ""
+    /// Codec / bitrate choice, persisted; the controller reads the same key
+    /// at launch and applies changes live.
+    @AppStorage(SenderController.qualityKey) private var quality = StreamQuality.default
     @State private var manualSectionExpanded = false
 
     var body: some View {
@@ -29,6 +32,8 @@ struct MenuView: View {
             }
 
             receiverPicker
+
+            qualityPicker
 
             if controller.defaultOutputIsOurs {
                 Button("Switch back to \(controller.previousDeviceName ?? "previous device")") {
@@ -93,6 +98,20 @@ struct MenuView: View {
         return "Automatic"
     }
 
+    // MARK: - Quality picker
+
+    private var qualityPicker: some View {
+        Picker("Quality", selection: $quality) {
+            ForEach(StreamQuality.allCases, id: \.self) { quality in
+                Text(quality.displayName).tag(quality)
+            }
+        }
+        .pickerStyle(.menu)
+        .onChange(of: quality) { _, newQuality in
+            controller.setQuality(newQuality)
+        }
+    }
+
     // MARK: - Manual address
 
     /// Fallback for networks where Bonjour does not get through. Used only
@@ -143,6 +162,9 @@ struct MenuView: View {
             }
             Text("Volume: \(controller.volumePercent)%\(controller.deviceMuted ? " (muted)" : "")")
             Text("Packets: \(controller.packetsPerSecond)/s")
+            if controller.isStreaming {
+                Text("\(controller.quality.displayName) — \(String(format: "%.0f", controller.kilobytesPerSecond)) kB/s")
+            }
             if controller.browserStatus == .localNetworkDenied {
                 Text("Local Network access is off — allow Mac Audio Bridge in System Settings → Privacy & Security → Local Network")
                     .foregroundStyle(.red)

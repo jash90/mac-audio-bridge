@@ -102,6 +102,17 @@ private struct SenderStatsLine: Codable, Sendable {
     var link: String
     /// Connections recreated by the keepalive timeout since launch.
     var reconnects: Int
+    /// Codec of the frames sent in the last second: "opus" / "pcm16" ("" =
+    /// none sent).
+    var codec: String
+    /// Audio payload bitrate of that codec, bit/s (Opus CBR target, or
+    /// 1536000 for PCM16; 0 = none sent).
+    var bitrate: Int
+    /// Mean payload bytes per 5 ms frame (Opus 192: 120, Opus 128: 80,
+    /// PCM16: 960).
+    var avgPayloadBytes: Double
+    /// p99 of the per-frame encode time in the last second, ms.
+    var encodeMsP99: Double
 }
 
 /// Owns tap → frame converter → UDP sender and drives them from the virtual
@@ -156,6 +167,10 @@ final class SenderController: ObservableObject {
     @Published private(set) var manualAddressEnabled: Bool
     /// The manual host as typed (persisted under `receiverHost`).
     @Published private(set) var manualHost: String
+    /// Codec / bitrate picked in the menu (persisted under `streamQuality`).
+    @Published private(set) var quality: StreamQuality
+    /// Bytes sent per second (all datagrams), in kB/s, for the menu.
+    @Published private(set) var kilobytesPerSecond: Double = 0
 
     private var selection: ReceiverSelection
     private var activeTarget: ReceiverTarget?
@@ -170,6 +185,8 @@ final class SenderController: ObservableObject {
     private static let hostKey = "receiverHost"
     private static let serviceNameKey = "receiverServiceName"
     private static let manualAddressEnabledKey = "manualAddressEnabled"
+    /// Shared with the menu's `@AppStorage("streamQuality")`.
+    static let qualityKey = "streamQuality"
 
     init() {
         // Persisted choices — read here so streaming can start at launch
@@ -181,10 +198,12 @@ final class SenderController: ObservableObject {
             .trimmingCharacters(in: .whitespaces)
         manualAddressEnabled = manualEnabled
         manualHost = host
+        quality = defaults.string(forKey: Self.qualityKey).flatMap(StreamQuality.init(rawValue:)) ?? .default
         selection = ReceiverSelection(
             storedSelection: storedService,
             manualHost: manualEnabled ? host : "",
             now: Self.uptime())
+        converter.qualityGate.value = quality
         // Bonjour browsing runs for the whole app lifetime, from launch.
         let browser = Self.makeBrowser(controller: self)
         self.browser = browser
@@ -236,6 +255,18 @@ final class SenderController: ObservableObject {
     var isStreaming: Bool { mode == .streaming }
     /// Device volume as a whole percent for the menu.
     var volumePercent: Int { Int((deviceVolume * 100).rounded()) }
+    // MARK: - Stream quality
+
+    /// The user picked a quality in the menu: applies from the next frame,
+    /// also mid-stream (the receiver follows each frame's codec), and is
+    /// persisted.
+    func setQuality(_ newQuality: StreamQuality) {
+        guard newQuality != quality else { return }
+        quality = newQuality
+        UserDefaults.standard.set(newQuality.rawValue, forKey: Self.qualityKey)
+        converter.qualityGate.value = newQuality
+    }
+
     // MARK: - Receiver selection
 
     /// The user picked a receiver in the menu (nil = automatic). Persisted by
@@ -412,7 +443,8 @@ final class SenderController: ObservableObject {
         // only Sendable state (no self), and never touch UI state directly.
         let packer = RedundancyPackerBox()
         converter.onFrame = { [udpSender, frameStats] packet in
-            // Primary datagram first, then the delayed redundant copy (see
+            // Primary datagram first (Opus: carrying the previous 4 frames),
+            // then any redundancy-only datagram (PCM16's delayed copy, see
             // AudioRedundancy); every datagram stays ≤ 1200 B (no IP
             // fragmentation).
             for datagram in packer.pack(packet) {
@@ -445,6 +477,7 @@ final class SenderController: ObservableObject {
         }
         tapSampleRate = nil
         packetsPerSecond = 0
+        kilobytesPerSecond = 0
         currentSequence = 0
         captureWarning = nil
         mode = .waiting
@@ -558,6 +591,14 @@ final class SenderController: ObservableObject {
         let capturedSamples = ring.storedSampleCount + ring.droppedSampleCount
         let droppedSamples = ring.droppedSampleCount
         let sent = udpSender.takeSentCounts()
+        kilobytesPerSecond = mode == .streaming ? Double(sent.bytes) / 1000 : 0
+        let encoder = converter.encoderStats.take()
+        let codecBitrate: Int
+        switch encoder.codec {
+        case .opus?: codecBitrate = quality.opusBitrate ?? 0
+        case .pcm16?: codecBitrate = StreamQuality.pcm.payloadBitrate
+        case nil: codecBitrate = 0
+        }
         let line = SenderStatsLine(
             mode: mode == .streaming ? "streaming" : "waiting",
             defaultOutputIsOurs: defaultOutputIsOurs,
@@ -575,7 +616,11 @@ final class SenderController: ObservableObject {
             keepaliveAgeMs: snapshot.keepaliveAge.map { ($0 * 1000).rounded() } ?? -1,
             connectionState: snapshot.connectionState,
             link: snapshot.link?.rawValue ?? "",
-            reconnects: snapshot.reconnects)
+            reconnects: snapshot.reconnects,
+            codec: encoder.codec.map(StreamQuality.statsName) ?? "",
+            bitrate: codecBitrate,
+            avgPayloadBytes: (encoder.averagePayloadBytes * 10).rounded() / 10,
+            encodeMsP99: (encoder.encodeMsP99 * 1000).rounded() / 1000)
         lastRingWriteCalls = writeCalls
         lastRingCapturedSamples = capturedSamples
         lastRingDroppedSamples = droppedSamples

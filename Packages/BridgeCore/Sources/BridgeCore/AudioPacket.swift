@@ -4,7 +4,8 @@ import Foundation
 public enum AudioCodec: UInt8, Sendable {
     /// Uncompressed 16-bit PCM samples in the payload.
     case pcm16 = 0
-    /// One Opus-encoded frame.
+    /// One Opus packet (one 5 ms CELT frame, CBR) per entry; entries are
+    /// length-prefixed by the datagram layout.
     case opus = 1
 }
 
@@ -270,42 +271,82 @@ public struct AudioDatagram: Sendable, Equatable {
 
 /// Loss recovery by redundancy (single toggle).
 ///
-/// Every frame is sent again, as a redundant entry, `offsets` frames later.
-/// One redundant copy `k` frames back recovers any run of up to `k`
-/// consecutive lost datagrams, as long as the jitter buffer still holds the
-/// slot when the copy arrives (it arrives k × 5 ms after the primary).
-/// The packer is codec-agnostic: entries are packed greedily into datagrams
-/// of at most `AudioFormat.maxDatagramBytes`, so a compact codec gets
-/// "current + previous N frames" in one datagram while PCM16 (960 B per
-/// frame) sends the copy as a second datagram — a delayed duplicate, about
-/// 3.3 Mbit/s in total.
+/// Every frame is sent again, as a redundant entry, at fixed frame offsets
+/// later; the offsets depend on the frame's codec. A copy `k` frames back
+/// recovers any run of up to `k` consecutive lost datagrams, as long as the
+/// jitter buffer still holds the slot when the copy arrives (k × 5 ms after
+/// the primary). The packer is codec-agnostic: entries are packed greedily
+/// into datagrams of at most `AudioFormat.maxDatagramBytes`, so a compact
+/// codec gets "current + previous N frames" in one datagram while PCM16
+/// (960 B per frame) sends the copy as a second datagram — a delayed
+/// duplicate, about 3.3 Mbit/s in total.
 public enum AudioRedundancy {
     /// Master switch for sending redundant copies.
     public static let enabled = true
-    /// Frames back at which each frame is repeated: 3 × 5 ms = 15 ms, which
-    /// recovers runs of up to three lost datagrams while needing only 15 ms of
-    /// extra cushion for the copy to arrive in time.
-    public static let offsets: [Int] = [3]
+    /// PCM16: one copy 3 × 5 ms = 15 ms later (only one 960 B frame fits a
+    /// datagram), recovering runs of up to three lost datagrams.
+    public static let pcmOffsets: [Int] = [3]
+    /// Opus: every datagram carries the previous N = 4 frames (offsets
+    /// 1...4), so each frame travels in five datagrams and any loss run of
+    /// up to 4 datagrams (20 ms) is recovered, the first copy arriving only
+    /// 5 ms after the primary. CBR keeps the size fixed: 20 + 5 × (3 + 120) =
+    /// 635 B at 192 kbit/s (≈ 1.06 Mbit/s with UDP/IP headers), 435 B at
+    /// 128 kbit/s — both far below the 1200 B budget, which would allow
+    /// N = 8 at 192 kbit/s; 4 balances burst coverage against airtime.
+    public static let opusOffsets: [Int] = [1, 2, 3, 4]
+
+    /// Offsets at which a frame of `codec` is repeated.
+    public static func offsets(for codec: AudioCodec) -> [Int] {
+        switch codec {
+        case .pcm16: pcmOffsets
+        case .opus: opusOffsets
+        }
+    }
+
+    /// The farthest offset of any codec: how long a redundant copy can trail
+    /// its primary.
+    public static var maxOffset: Int {
+        (pcmOffsets + opusOffsets).max() ?? 0
+    }
 }
 
 /// Turns a stream of frames into datagrams with redundant copies (see
-/// `AudioRedundancy`). Not thread-safe; owned by one queue.
+/// `AudioRedundancy`). Every datagram's entries share its header codec: when
+/// the stream switches codec, copies of the frames before the switch go out
+/// in their own redundancy-only datagram of their codec. Not thread-safe;
+/// owned by one queue.
 public struct RedundancyPacker: Sendable {
-    private let offsets: [Int]
+    private let pcmOffsets: [Int]
+    private let opusOffsets: [Int]
     private let maxDatagramBytes: Int
-    /// The last `maxOffset` frames, newest last (cleared at a discontinuity:
-    /// frames of a previous run are never repeated into a new one).
+    /// The last `historyDepth` frames, newest last (cleared at a
+    /// discontinuity: frames of a previous run are never repeated into a new
+    /// one).
     private var history: [AudioPacket] = []
     private let historyDepth: Int
 
-    public init(
-        offsets: [Int] = AudioRedundancy.enabled ? AudioRedundancy.offsets : [],
-        maxDatagramBytes: Int = AudioFormat.maxDatagramBytes
-    ) {
-        precondition(offsets.allSatisfy { (1...255).contains($0) }, "offsets in 1...255")
-        self.offsets = offsets.sorted()
+    /// The production packer: per-codec offsets from `AudioRedundancy` (none
+    /// when redundancy is disabled).
+    public init(maxDatagramBytes: Int = AudioFormat.maxDatagramBytes) {
+        let enabled = AudioRedundancy.enabled
+        self.init(
+            pcmOffsets: enabled ? AudioRedundancy.pcmOffsets : [],
+            opusOffsets: enabled ? AudioRedundancy.opusOffsets : [],
+            maxDatagramBytes: maxDatagramBytes)
+    }
+
+    /// A packer that repeats frames of every codec at `offsets`.
+    public init(offsets: [Int], maxDatagramBytes: Int = AudioFormat.maxDatagramBytes) {
+        self.init(pcmOffsets: offsets, opusOffsets: offsets, maxDatagramBytes: maxDatagramBytes)
+    }
+
+    public init(pcmOffsets: [Int], opusOffsets: [Int], maxDatagramBytes: Int = AudioFormat.maxDatagramBytes) {
+        precondition(
+            (pcmOffsets + opusOffsets).allSatisfy { (1...255).contains($0) }, "offsets in 1...255")
+        self.pcmOffsets = pcmOffsets.sorted()
+        self.opusOffsets = opusOffsets.sorted()
         self.maxDatagramBytes = maxDatagramBytes
-        historyDepth = offsets.max() ?? 0
+        historyDepth = (pcmOffsets + opusOffsets).max() ?? 0
         history.reserveCapacity(historyDepth + 1)
     }
 
@@ -313,17 +354,26 @@ public struct RedundancyPacker: Sendable {
         history.removeAll(keepingCapacity: true)
     }
 
+    private func offsets(for codec: AudioCodec) -> [Int] {
+        switch codec {
+        case .pcm16: pcmOffsets
+        case .opus: opusOffsets
+        }
+    }
+
     /// The datagrams to send for `frame`, in send order: the primary first
-    /// (with as many redundant entries as fit), then redundancy-only
-    /// datagrams for the copies that did not fit.
+    /// (with as many same-codec redundant entries as fit, nearest first),
+    /// then redundancy-only datagrams for the copies that did not fit or
+    /// belong to another codec.
     public mutating func pack(_ frame: AudioPacket) -> [Data] {
         if frame.flags.contains(.discontinuity) {
             reset()
         }
+        // Nearest first: history is newest last.
         var redundant: [AudioPacket] = []
-        for offset in offsets where offset <= history.count {
-            let candidate = history[history.count - offset]
-            if candidate.sequence == frame.sequence &- UInt32(offset) {
+        for candidate in history.reversed() {
+            let distance = frame.sequence &- candidate.sequence
+            if distance <= UInt32(UInt8.max), offsets(for: candidate.codec).contains(Int(distance)) {
                 redundant.append(candidate)
             }
         }
@@ -335,10 +385,10 @@ public struct RedundancyPacker: Sendable {
             let entry = AudioDatagram.Entry(
                 offset: AudioDatagram.offset(of: copy, from: frame.sequence), payload: copy.payload)
             let added = AudioDatagram.entryHeaderSize + copy.payload.count
-            if size + added > maxDatagramBytes, !current.entries.isEmpty {
+            if copy.codec != current.codec || size + added > maxDatagramBytes, !current.entries.isEmpty {
                 datagrams.append(current.encoded())
                 current = AudioDatagram(
-                    codec: frame.codec, flags: [], sequence: frame.sequence,
+                    codec: copy.codec, flags: [], sequence: frame.sequence,
                     sampleTime: frame.sampleTime, entries: [])
                 size = AudioDatagram.headerSize
             }
