@@ -87,11 +87,9 @@ private final class RenderContext: @unchecked Sendable {
 
     /// Called from the render thread. Fills `list` with audio or silence.
     func render(into list: UnsafeMutablePointer<AudioBufferList>, frameCount: Int) {
-        let buffers = withUnsafePointer(to: list.pointee.mBuffers) { base in
-            UnsafeBufferPointer(
-                start: UnsafeRawPointer(base).assumingMemoryBound(to: AudioBuffer.self),
-                count: Int(list.pointee.mNumberBuffers))
-        }
+        // Index the variable-length list in place via its dedicated pointer view —
+        // copying the struct out would leave only one AudioBuffer of storage.
+        let buffers = UnsafeMutableAudioBufferListPointer(list)
 
         // Default to silence; decoded samples overwrite the prefix below.
         for buffer in buffers {

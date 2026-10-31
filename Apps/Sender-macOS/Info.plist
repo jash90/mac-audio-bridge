@@ -24,7 +24,5 @@
 	<true/>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Mac Audio Bridge streams your Mac's audio to your iPhone.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Mac Audio Bridge captures system audio to stream it to your iPhone.</string>
 </dict>
 </plist>

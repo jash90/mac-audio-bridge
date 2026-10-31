@@ -1,4 +1,3 @@
-import AVFoundation
 import BridgeCore
 import Foundation
 import Synchronization
@@ -34,6 +33,10 @@ final class SenderController: ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var tapSampleRate: Double?
     @Published private(set) var framesPerSecond = 0
+    @Published private(set) var captureWarning: String?
+
+    private static let captureDeniedMessage =
+        "No audio captured — allow Mac Audio Bridge in System Settings → Privacy & Security → Screen & System Audio Recording"
 
     private let tap = SystemAudioTap()
     private let converter = FrameConverter()
@@ -46,34 +49,21 @@ final class SenderController: ObservableObject {
         if isRunning {
             stop()
         } else {
-            Task { await start(host: host) }
+            start(host: host)
         }
     }
 
-    func start(host: String) async {
+    func start(host: String) {
         guard !isRunning else { return }
         guard !host.isEmpty else {
             phase = .failed("Enter the iPhone's IP address first.")
             return
         }
 
-        // Audio capture is gated by TCC; trigger the prompt up front so a denial is
-        // reported here instead of as a silent tap.
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            break
-        case .notDetermined:
-            guard await AVCaptureDevice.requestAccess(for: .audio) else {
-                phase = .failed("Audio capture permission was denied.")
-                return
-            }
-        default:
-            phase = .failed(
-                "Audio capture permission is denied. Allow it in System Settings → "
-                    + "Privacy & Security → Microphone.")
-            return
-        }
-
+        // Process taps are gated by the "System Audio Recording" TCC service: the
+        // system prompt appears when the tap/IO starts. A denial shows up either as
+        // an error from start, or as zero-filled buffers — detected by the converter
+        // after 3 s and reported through `captureWarning`.
         do {
             try tap.start()
         } catch {
@@ -82,10 +72,16 @@ final class SenderController: ObservableObject {
         }
 
         tapSampleRate = tap.sampleRate
+        captureWarning = nil
         frameStats.reset()
         converter.onFrame = { [udpSender, frameStats] frame in
             udpSender.send(frame)
             frameStats.increment()
+        }
+        converter.onCaptureStalled = { [weak self] in
+            Task { @MainActor in
+                self?.captureWarning = Self.captureDeniedMessage
+            }
         }
         udpSender.setHost(host)
         converter.start(ring: tap.ring, tapSampleRate: tap.sampleRate)
@@ -93,11 +89,15 @@ final class SenderController: ObservableObject {
     }
 
     func stop() {
+        // The converter is the ring's consumer side: stop (and drain) it on its
+        // queue BEFORE the tap goes away. The ring reset for the next run happens
+        // on that same queue in FrameConverter.start.
         converter.stop()
         udpSender.cancel()
         tap.stop()
         tapSampleRate = nil
         framesPerSecond = 0
+        captureWarning = nil
         phase = .idle
     }
 

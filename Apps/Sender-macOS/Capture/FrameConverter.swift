@@ -14,9 +14,16 @@ final class FrameConverter: @unchecked Sendable {
     /// never swapped while running.
     var onFrame: ((Data) -> Void)?
 
+    /// Called once on the converter queue when the tap delivered only exact-zero
+    /// samples for `captureGraceInterval` after start while the default output
+    /// device was running — the signature of a denied "System Audio Recording"
+    /// grant. Set before `start`, never swapped while running.
+    var onCaptureStalled: (() -> Void)?
+
     private static let queueLabel = "dev.jash90.MacAudioBridge.frame-converter"
     private static let inputCapacityFrames = 8_192
     private static let timerIntervalMs = 5
+    private static let captureGraceInterval: TimeInterval = 3
 
     private let queue = DispatchQueue(label: FrameConverter.queueLabel)
     private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "frame-converter")
@@ -24,6 +31,8 @@ final class FrameConverter: @unchecked Sendable {
     // State confined to `queue`:
     private var timer: DispatchSourceTimer?
     private var isRunning = false
+    private var sawNonZeroSamples = false
+    private var runGeneration = 0
     private var ring: SPSCRingBuffer?
     private var converter: AVAudioConverter?
     private var inputBuffer: AVAudioPCMBuffer?
@@ -46,7 +55,11 @@ final class FrameConverter: @unchecked Sendable {
             guard let self else { return }
             self.stopTimer()
             self.ring = ring
-            ring.reset() // consumer side — drop samples from a previous run
+            // Consumer-side reset, deliberately on this queue: reset() must never
+            // race the consumer, and this queue is the ring's only consumer.
+            ring.reset()
+            self.sawNonZeroSamples = false
+            self.runGeneration += 1
             self.staging.removeAll(keepingCapacity: true)
 
             let targetFormat = AVAudioFormat(
@@ -110,6 +123,24 @@ final class FrameConverter: @unchecked Sendable {
             }
             timer.activate()
             self.timer = timer
+
+            // Denial detection: if nothing but zeros arrives within the grace
+            // period while the default output device is playing somewhere, the
+            // "System Audio Recording" grant was denied. Runs on this queue, not
+            // in the IOProc. The generation check no-ops checks from prior runs.
+            let generation = self.runGeneration
+            self.queue.asyncAfter(deadline: .now() + Self.captureGraceInterval) { [weak self] in
+                guard let self,
+                    self.isRunning,
+                    self.runGeneration == generation,
+                    !self.sawNonZeroSamples,
+                    isDefaultOutputDeviceRunningSomewhere()
+                else { return }
+                self.logger.error(
+                    "Tap delivered only silence for \(Self.captureGraceInterval, privacy: .public) s — capture denied?")
+                self.onCaptureStalled?()
+            }
+
             self.logger.info(
                 "Converter started (tap rate \(tapSampleRate, format: .fixed(precision: 0), privacy: .public) Hz)")
         }
@@ -120,6 +151,8 @@ final class FrameConverter: @unchecked Sendable {
         queue.sync {
             stopTimer()
             isRunning = false
+            runGeneration += 1
+            sawNonZeroSamples = false
             ring = nil
             converter = nil
             inputBuffer = nil
@@ -155,6 +188,7 @@ final class FrameConverter: @unchecked Sendable {
                     Int(requestedPackets) * AudioFormat.channelCount,
                     capacitySamples)
                 let got = ring.read(into: inputSamples, count: wanted)
+                self.trackNonZeroSamples(inputSamples, count: got)
                 guard got > 0 else {
                     // Momentarily empty. `.noDataNow` keeps the converter's state
                     // intact — `.endOfStream` would terminate its input permanently.
@@ -180,6 +214,7 @@ final class FrameConverter: @unchecked Sendable {
         } else if let inputSamples, inputCapacitySamples > 0 {
             // Tap already runs at 48 kHz — no resampling needed.
             let got = ring.read(into: inputSamples, count: inputCapacitySamples)
+            trackNonZeroSamples(inputSamples, count: got)
             if got > 0 {
                 staging.append(
                     contentsOf: UnsafeBufferPointer(start: inputSamples, count: got))
@@ -187,6 +222,16 @@ final class FrameConverter: @unchecked Sendable {
         }
 
         emitCompleteFrames()
+    }
+
+    /// Records whether any nonzero sample has been read since the run started —
+    /// zero-filled buffers are how a denied capture grant manifests. Queue-confined.
+    private func trackNonZeroSamples(_ samples: UnsafePointer<Float>, count: Int) {
+        guard !sawNonZeroSamples, count > 0 else { return }
+        for i in 0..<count where samples[i] != 0 {
+            sawNonZeroSamples = true
+            return
+        }
     }
 
     /// Chops the staging buffer into whole 10 ms frames and hands them to `onFrame`.

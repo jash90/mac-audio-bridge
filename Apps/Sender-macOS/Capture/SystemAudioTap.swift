@@ -131,6 +131,9 @@ final class SystemAudioTap {
     }
 
     /// Stops the tap. Teardown order: device → IOProc → aggregate → tap.
+    /// The ring is NOT reset here — `reset()` is consumer-side only; the
+    /// FrameConverter's queue (the ring's only consumer) resets it when the
+    /// next run starts.
     func stop() {
         guard isRunning else { return }
         isRunning = false
@@ -140,7 +143,6 @@ final class SystemAudioTap {
         destroyIOProc()
         destroyAggregateDevice()
         destroyTap()
-        ring.reset()
         logger.info("Tap stopped")
     }
 
@@ -203,6 +205,31 @@ final class SystemAudioTap {
     }
 }
 
+/// Whether the default output device is currently running audio for any client.
+/// Used to tell "nothing is playing" apart from a denied tap: a denied
+/// "System Audio Recording" grant makes Core Audio deliver only zero-filled
+/// buffers (or none at all) while the device itself keeps playing.
+func isDefaultOutputDeviceRunningSomewhere() -> Bool {
+    var deviceID = AudioObjectID(kAudioObjectUnknown)
+    var deviceIDSize = UInt32(MemoryLayout<AudioObjectID>.size)
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address, 0, nil, &deviceIDSize, &deviceID) == noErr,
+        deviceID != AudioObjectID(kAudioObjectUnknown)
+    else { return false }
+
+    var isRunning: UInt32 = 0
+    var isRunningSize = UInt32(MemoryLayout<UInt32>.size)
+    address.mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere
+    guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &isRunningSize, &isRunning) == noErr
+    else { return false }
+    return isRunning != 0
+}
+
 /// State captured by the realtime IOProc: the ring buffer plus a preallocated scratch
 /// area for interleaving non-interleaved input. Allocated once, off the IO thread.
 private final class IOContext: @unchecked Sendable {
@@ -225,15 +252,14 @@ private final class IOContext: @unchecked Sendable {
     /// layouts the tap can deliver: non-interleaved (2 AudioBuffers, one per channel)
     /// and interleaved (1 AudioBuffer). Frame counts derive from byte sizes —
     /// `AudioBuffer` carries no `mBytesPerFrame`.
+    ///
+    /// The list is indexed through `UnsafeMutableAudioBufferListPointer` so the
+    /// variable-length C array is read in place: copying `bufferList.pointee` out
+    /// would leave only ONE AudioBuffer of storage, and reading `mNumberBuffers`
+    /// elements from that copy would run past its end. Allocation-free.
     func copyInterleavedStereo(from bufferList: UnsafePointer<AudioBufferList>) {
-        let list = bufferList.pointee
-        // AudioBufferList.mBuffers is a variable-length C array — expose it as a Swift
-        // buffer so both buffers of a non-interleaved list are addressable.
-        let buffers = withUnsafePointer(to: list.mBuffers) { base in
-            UnsafeBufferPointer(
-                start: UnsafeRawPointer(base).assumingMemoryBound(to: AudioBuffer.self),
-                count: Int(list.mNumberBuffers))
-        }
+        let buffers = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(mutating: bufferList))
         guard buffers.count > 0, let firstData = buffers[0].mData else { return }
 
         if buffers.count == 1 {

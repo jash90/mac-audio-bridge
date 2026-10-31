@@ -47,6 +47,11 @@ struct MenuView: View {
                 Text("State: streaming")
                 Text("Tap: \(Int(controller.tapSampleRate ?? 0)) Hz")
                 Text("Frames: \(controller.framesPerSecond)/s")
+                if let captureWarning = controller.captureWarning {
+                    Text(captureWarning)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             case .failed(let message):
                 Text("State: error")
                     .foregroundStyle(.red)
