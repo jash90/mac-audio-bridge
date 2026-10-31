@@ -236,18 +236,10 @@ struct ContentView: View {
         }
     }
 
+    /// The Mac discovers this receiver over Bonjour; the IP stays below,
+    /// small, for debugging and the Mac's manual-address fallback.
     private var address: some View {
-        VStack(spacing: 4) {
-            Text("Type this address into the Mac app")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Text(model.ipAddress ?? "No Wi-Fi address (en0)")
-                .font(.title3.monospaced().bold())
-                .textSelection(.enabled)
-            Text(model.phase == .running ? "Listening on UDP 49000" : "Listener stopped")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        }
+        ReceiverVisibilityView(ipAddress: model.ipAddress, isListening: model.phase == .running)
     }
 
     private var stats: some View {

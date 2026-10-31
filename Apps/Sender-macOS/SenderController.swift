@@ -78,14 +78,28 @@ private struct SenderStatsLine: Codable, Sendable {
     /// / timer-throttling signature.
     var maxTickMs: Double
     var appNapActivityHeld: Bool
+    /// Receiver streamed to: Bonjour service name or manual host ("" = none).
+    var receiver: String
+    /// Age of the last receiver keepalive on the current connection, ms
+    /// (-1 = none yet / no connection).
+    var keepaliveAgeMs: Double
+    /// NWConnection state: none / setup / preparing / waiting / ready /
+    /// failed / cancelled.
+    var connectionState: String
+    /// Keepalive liveness: connecting / alive / idle / noResponse ("" = no
+    /// connection).
+    var link: String
+    /// Connections recreated by the keepalive timeout since launch.
+    var reconnects: Int
 }
 
 /// Owns tap → frame converter → UDP sender and drives them from the virtual
 /// device's state: streaming runs while "iPhone (Mac Audio Bridge)" is the
-/// default output AND a receiver address is set, and stops (releasing the tap)
-/// the moment the user switches the output away. All state lives on the main
-/// actor; CoreAudio listeners hop over from their own queue via a `@Sendable`
-/// callback.
+/// default output AND a receiver is known — a Bonjour service (selected in the
+/// menu or the only one visible) or a manual host — and stops (releasing the
+/// tap) the moment the user switches the output away. All state lives on the
+/// main actor; CoreAudio listeners and the Bonjour browser hop over from their
+/// own queues via `@Sendable` callbacks built in nonisolated factories.
 @MainActor
 final class SenderController: ObservableObject {
     /// Whether the audio pipeline is currently running.
@@ -115,29 +129,59 @@ final class SenderController: ObservableObject {
     @Published private(set) var currentSequence: UInt32 = 0
     @Published private(set) var captureWarning: String?
     @Published private(set) var failureMessage: String?
-    /// The address currently streaming to (set when a run starts).
-    @Published private(set) var activeHost = ""
+    /// Receiver currently streamed to (service name or host; "" when idle).
+    @Published private(set) var activeReceiver = ""
+    /// Bonjour receivers currently visible, sorted.
+    @Published private(set) var visibleReceivers: [String] = []
+    /// The receiver picked in the menu (nil = automatic).
+    @Published private(set) var selectedReceiver: String?
+    @Published private(set) var selectionStatus: ReceiverSelection.Status = .noReceiver
+    /// Keepalive liveness of the current connection (nil = no connection).
+    @Published private(set) var link: ReceiverLiveness.State?
+    @Published private(set) var browserStatus: ReceiverBrowser.Status = .starting
+    /// Whether the manual address is in effect — only after the user opened
+    /// the "Manual address" section once, so an old typed-in IP from before
+    /// discovery existed is not silently used.
+    @Published private(set) var manualAddressEnabled: Bool
+    /// The manual host as typed (persisted under `receiverHost`).
+    @Published private(set) var manualHost: String
 
-    private var receiverHost = "" {
-        didSet { evaluate() }
-    }
+    private var selection: ReceiverSelection
+    private var activeTarget: ReceiverTarget?
+    private var browser: ReceiverBrowser?
 
     /// The 1 Hz state loop, owned by the controller itself: the menu's
     /// SwiftUI lifetime only spans an open menu, so nothing view-side may
     /// drive evaluation or stats.
     private var stateLoop: Task<Void, Never>?
 
-    /// UserDefaults key shared with the menu's `@AppStorage` text field.
+    /// UserDefaults keys.
     private static let hostKey = "receiverHost"
+    private static let serviceNameKey = "receiverServiceName"
+    private static let manualAddressEnabledKey = "manualAddressEnabled"
 
     init() {
-        // The persisted receiver address — read here so streaming can start
-        // at launch with the menu never opened.
-        receiverHost = Self.loadPersistedHost()
+        // Persisted choices — read here so streaming can start at launch
+        // with the menu never opened.
+        let defaults = UserDefaults.standard
+        let storedService = defaults.string(forKey: Self.serviceNameKey)
+        let manualEnabled = defaults.bool(forKey: Self.manualAddressEnabledKey)
+        let host = (defaults.string(forKey: Self.hostKey) ?? "")
+            .trimmingCharacters(in: .whitespaces)
+        manualAddressEnabled = manualEnabled
+        manualHost = host
+        selection = ReceiverSelection(
+            storedSelection: storedService,
+            manualHost: manualEnabled ? host : "",
+            now: Self.uptime())
+        // Bonjour browsing runs for the whole app lifetime, from launch.
+        let browser = Self.makeBrowser(controller: self)
+        self.browser = browser
+        browser.start()
         // Main-actor task loop (the class is @MainActor, so the task inherits
         // the main actor): one immediate pass — streaming starts within this
-        // first evaluate when our device is the default output and a host is
-        // set — then refresh every second.
+        // first evaluate when our device is the default output and a receiver
+        // is known — then refresh every second.
         stateLoop = Task { [weak self] in
             self?.evaluate()
             while !Task.isCancelled {
@@ -149,6 +193,7 @@ final class SenderController: ObservableObject {
 
     deinit {
         stateLoop?.cancel()
+        browser?.stop()
     }
 
     private let tap = DeviceAudioTap()
@@ -180,21 +225,67 @@ final class SenderController: ObservableObject {
     var isStreaming: Bool { mode == .streaming }
     /// Device volume as a whole percent for the menu.
     var volumePercent: Int { Int((deviceVolume * 100).rounded()) }
-    /// True while no receiver address is configured (drives the waiting text).
-    var receiverHostIsEmpty: Bool { receiverHost.isEmpty }
+    // MARK: - Receiver selection
 
-    /// The receiver address, kept in sync with the menu's text field (and
-    /// persisted so a relaunch streams without the menu being opened).
-    func setHost(_ host: String) {
-        let trimmed = host.trimmingCharacters(in: .whitespaces)
-        guard trimmed != receiverHost else { return }
-        receiverHost = trimmed
-        UserDefaults.standard.set(trimmed, forKey: Self.hostKey)
+    /// The user picked a receiver in the menu (nil = automatic). Persisted by
+    /// service name, so it survives relaunches and address changes.
+    func selectReceiver(_ name: String?) {
+        let name = name.flatMap { $0.isEmpty ? nil : $0 }
+        if let name {
+            UserDefaults.standard.set(name, forKey: Self.serviceNameKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.serviceNameKey)
+        }
+        selection.select(name, now: Self.uptime())
+        evaluate()
     }
 
-    private static func loadPersistedHost() -> String {
-        (UserDefaults.standard.string(forKey: hostKey) ?? "")
-            .trimmingCharacters(in: .whitespaces)
+    /// Called when the "Manual address" section is opened: from then on the
+    /// (possibly pre-discovery) typed host is in effect.
+    func enableManualAddress() {
+        guard !manualAddressEnabled else { return }
+        manualAddressEnabled = true
+        UserDefaults.standard.set(true, forKey: Self.manualAddressEnabledKey)
+        selection.setManualHost(manualHost, now: Self.uptime())
+        evaluate()
+    }
+
+    /// The manual host, kept in sync with the menu's text field — editable at
+    /// any time, also while streaming (the connection is recreated).
+    func setManualHost(_ host: String) {
+        let trimmed = host.trimmingCharacters(in: .whitespaces)
+        guard trimmed != manualHost else { return }
+        manualHost = trimmed
+        UserDefaults.standard.set(trimmed, forKey: Self.hostKey)
+        guard manualAddressEnabled else { return }
+        selection.setManualHost(trimmed, now: Self.uptime())
+        evaluate()
+    }
+
+    private func receiversChanged(_ names: [String]) {
+        selection.updateVisibleServices(names, now: Self.uptime())
+        evaluate()
+    }
+
+    private func browserStatusChanged(_ status: ReceiverBrowser.Status) {
+        browserStatus = status
+    }
+
+    private func publishSelection() {
+        if visibleReceivers != selection.visibleServices {
+            visibleReceivers = selection.visibleServices
+        }
+        if selectedReceiver != selection.storedSelection {
+            selectedReceiver = selection.storedSelection
+        }
+        if selectionStatus != selection.status {
+            selectionStatus = selection.status
+        }
+    }
+
+    /// Monotonic seconds for the selection's grace timing.
+    private static func uptime() -> TimeInterval {
+        ProcessInfo.processInfo.systemUptime
     }
 
     // MARK: - Output-device actions
@@ -222,11 +313,15 @@ final class SenderController: ObservableObject {
 
     // MARK: - Automatic start/stop
 
-    /// Re-reads the world (driver presence, default output, volume/mute) and
-    /// starts or stops streaming accordingly. Called ~1 Hz from `refreshStats`,
-    /// from every CoreAudio property listener, and after host/button changes —
-    /// so a stuck state self-heals on the next tick.
+    /// Re-reads the world (driver presence, default output, volume/mute,
+    /// receiver selection) and starts or stops streaming accordingly. Called
+    /// ~1 Hz from `refreshStats`, from every CoreAudio property listener, on
+    /// every browse change, and after menu actions — so a stuck state
+    /// self-heals on the next tick.
     func evaluate() {
+        selection.tick(now: Self.uptime())
+        publishSelection()
+
         // Resolve fresh every time: the AudioObjectID is not stable across
         // coreaudiod restarts.
         let deviceID = BridgeDevice.deviceID()
@@ -253,18 +348,28 @@ final class SenderController: ObservableObject {
 
         updateVolume(deviceID: deviceID)
 
-        let shouldStream = defaultOutputIsOurs && !receiverHost.isEmpty
-        switch (shouldStream, mode) {
-        case (true, .waiting):
-            startStreaming(host: receiverHost, deviceID: deviceID)
-        case (false, .streaming):
+        let target = selection.target
+        switch (defaultOutputIsOurs, target, mode) {
+        case (true, let target?, .waiting):
+            startStreaming(target: target, deviceID: deviceID)
+        case (true, let target?, .streaming) where target != activeTarget:
+            // Receiver changed mid-stream (menu pick, manual edit): only the
+            // connection is replaced, the tap keeps running.
+            setActiveTarget(target)
+        case (false, _, .streaming), (_, nil, .streaming):
             stopStreaming()
         default:
             break
         }
     }
 
-    private func startStreaming(host: String, deviceID: AudioObjectID) {
+    private func setActiveTarget(_ target: ReceiverTarget?) {
+        activeTarget = target
+        activeReceiver = target?.displayName ?? ""
+        udpSender.setTarget(target)
+    }
+
+    private func startStreaming(target: ReceiverTarget, deviceID: AudioObjectID) {
         // Hold the system awake for the whole run: this is an LSUIElement app
         // with no window, so without an activity assertion App Nap coalesces
         // the 2.5 ms drain timer into seconds-long silences and the tap ring
@@ -288,7 +393,6 @@ final class SenderController: ObservableObject {
             return
         }
 
-        activeHost = host
         tapSampleRate = tap.sampleRate
         captureWarning = nil
         failureMessage = nil
@@ -302,7 +406,7 @@ final class SenderController: ObservableObject {
         converter.onCaptureStalled = { [captureWarningMailbox] in
             captureWarningMailbox.post(captureDeniedMessage)
         }
-        udpSender.setHost(host)
+        setActiveTarget(target)
         updateVolume(deviceID: deviceID)
         converter.start(ring: tap.ring, tapSampleRate: tap.sampleRate)
         mode = .streaming
@@ -314,12 +418,14 @@ final class SenderController: ObservableObject {
         // on that same queue in FrameConverter.start.
         converter.stop()
         udpSender.cancel()
+        activeTarget = nil
+        activeReceiver = ""
+        link = nil
         tap.stop()
         if let activity = streamingActivity {
             ProcessInfo.processInfo.endActivity(activity)
             streamingActivity = nil
         }
-        activeHost = ""
         tapSampleRate = nil
         packetsPerSecond = 0
         currentSequence = 0
@@ -351,11 +457,7 @@ final class SenderController: ObservableObject {
         deviceEvents.removeAllRegistrations()
         observedDeviceID = deviceID
 
-        // @Sendable closures do not inherit main-actor isolation; each hops to
-        // the main actor itself.
-        let event: @Sendable () -> Void = { [weak self] in
-            Task { @MainActor in self?.evaluate() }
-        }
+        let event = Self.makeDeviceEventHandler(controller: self)
         _ = deviceEvents.add(
             objectID: AudioObjectID(kAudioObjectSystemObject),
             selector: kAudioHardwarePropertyDefaultOutputDevice,
@@ -379,6 +481,36 @@ final class SenderController: ObservableObject {
             onEvent: event)
     }
 
+    // MARK: - Nonisolated callback factories
+
+    /// CoreAudio listener callback: runs on the listener queue, captures only
+    /// a weak reference to the (Sendable, main-actor) controller and hops to
+    /// the main actor.
+    nonisolated private static func makeDeviceEventHandler(
+        controller: SenderController
+    ) -> @Sendable () -> Void {
+        { [weak controller] in
+            Task { @MainActor in controller?.evaluate() }
+        }
+    }
+
+    /// Bonjour browser with callbacks that hop to the main actor in FIFO
+    /// order (`DispatchQueue.main`), so an older result set can never
+    /// overwrite a newer one.
+    nonisolated private static func makeBrowser(controller: SenderController) -> ReceiverBrowser {
+        ReceiverBrowser(
+            onResults: { [weak controller] names in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { controller?.receiversChanged(names) }
+                }
+            },
+            onStatus: { [weak controller] status in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { controller?.browserStatusChanged(status) }
+                }
+            })
+    }
+
     // MARK: - Stats
 
     /// Pulls counter snapshots and background warnings for the UI, re-evaluates
@@ -390,7 +522,11 @@ final class SenderController: ObservableObject {
         if let warning = captureWarningMailbox.take() {
             captureWarning = warning
         }
-        logStats()
+        let snapshot = udpSender.linkSnapshot()
+        if link != snapshot.link {
+            link = snapshot.link
+        }
+        logStats(link: snapshot)
     }
 
     /// Appends one JSON line of sender telemetry to
@@ -398,7 +534,7 @@ final class SenderController: ObservableObject {
     /// both waiting and streaming modes. Only atomic ring/sender counters come
     /// off the hot paths; encoding happens here, the file write on the writer's
     /// utility queue.
-    private func logStats() {
+    private func logStats(link snapshot: UDPSender.LinkSnapshot) {
         let effectiveVolume = deviceMuted ? 0.0 : Double(deviceVolume)
         let ring = tap.ring
         let writeCalls = ring.writeCallCount
@@ -417,7 +553,12 @@ final class SenderController: ObservableObject {
             packetsSent: sent.datagrams,
             bytesSent: sent.bytes,
             maxTickMs: converter.takeMaxTickIntervalMilliseconds(),
-            appNapActivityHeld: streamingActivity != nil)
+            appNapActivityHeld: streamingActivity != nil,
+            receiver: (snapshot.target ?? selection.target)?.displayName ?? "",
+            keepaliveAgeMs: snapshot.keepaliveAge.map { ($0 * 1000).rounded() } ?? -1,
+            connectionState: snapshot.connectionState,
+            link: snapshot.link?.rawValue ?? "",
+            reconnects: snapshot.reconnects)
         lastRingWriteCalls = writeCalls
         lastRingCapturedSamples = capturedSamples
         lastRingDroppedSamples = droppedSamples

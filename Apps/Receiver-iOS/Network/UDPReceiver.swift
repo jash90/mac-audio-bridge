@@ -1,6 +1,7 @@
 import BridgeCore
 import Foundation
 import Network
+import dnssd
 import os
 import Synchronization
 
@@ -8,17 +9,30 @@ import Synchronization
 /// 20 ms while audio packets are arriving. iPhone Wi-Fi power save delivers
 /// UDP in bursts (50-150 ms gaps and more), which the jitter buffer sees as
 /// late/lost packets; a steady 20 ms reply stream keeps the radio in active
-/// state. Set to false to measure the unmitigated burst behaviour.
+/// state. Set to false to measure the unmitigated burst behaviour — note
+/// the sender also uses these keepalives as its liveness signal (M3) and
+/// recreates its connection every 3 s without them.
 private let receiverKeepaliveEnabled = true
 
-/// Listens for UDP datagrams on port 49000. Each datagram is one `AudioPacket`
-/// (10 ms of interleaved little-endian Int16 PCM); decoded packets are inserted
-/// into the jitter buffer stamped with a monotonic arrival time. Datagrams that
-/// fail `AudioPacket.decode`, or that carry an unexpected codec or payload
-/// size, are dropped and counted as malformed. Start/stop run on the main
-/// actor, callbacks are confined to one serial queue.
+/// Listens for UDP datagrams on port 49000 (any free port if that one is
+/// taken — Bonjour carries the real port) and advertises the listener as the
+/// Bonjour service `_macaudiobridge._udp` named after the device ("iPhone
+/// 7KQ2", see `ReceiverIdentity`) with TXT `v=1`, so the Mac finds it by name
+/// and re-resolves it when the Wi-Fi address changes. A failed listener is
+/// recreated (same name, same port), so a sender keeps working across it.
+///
+/// Each datagram is one `AudioPacket` (10 ms of interleaved little-endian
+/// Int16 PCM); decoded packets are inserted into the jitter buffer stamped
+/// with a monotonic arrival time. Datagrams that fail `AudioPacket.decode`, or
+/// that carry an unexpected codec or payload size, are dropped and counted as
+/// malformed. Start/stop run on the main actor, callbacks are confined to one
+/// serial queue.
 final class UDPReceiver: @unchecked Sendable {
-    static let port: UInt16 = 49_000
+    static let port: UInt16 = ReceiverService.preferredPort
+    private static let listenerRestartDelay: TimeInterval = 2
+    /// Sender flows that delivered nothing for this long are closed (a
+    /// sender that reconnected arrives as a new flow from a new port).
+    private static let idlePeerTimeout: TimeInterval = 30
     /// Expected payload of one PCM16 stereo frame: 480 frames × 2 channels × 2 bytes.
     private static let expectedPayloadBytes =
         AudioFormat.samplesPerFrame * AudioFormat.channelCount * MemoryLayout<Int16>.size
@@ -45,15 +59,27 @@ final class UDPReceiver: @unchecked Sendable {
     /// jitter buffer's interarrival estimates rely on.
     private let clockStart = ContinuousClock.now
 
-    /// An accepted sender connection, and whether its path is ready (keepalive
-    /// sends are dropped until it is).
+    /// An accepted sender connection, whether its path is ready (keepalive
+    /// sends are dropped until it is), and when it last delivered a packet
+    /// (keepalives go only to senders that are actually streaming).
     private struct Peer {
         let connection: NWConnection
+        let acceptedAt: TimeInterval
         var isReady = false
+        var lastPacketArrival: TimeInterval?
     }
+
+    /// Posts advertisement state to the main actor in FIFO order.
+    private let postAdvertisement = UDPReceiver.makeAdvertisementPoster()
 
     // State confined to `queue`:
     private var listener: NWListener?
+    /// True between start() and stop(); a failed listener is recreated only
+    /// while running.
+    private var isRunning = false
+    /// Bumped per listener; callbacks of replaced listeners are ignored.
+    private var listenerGeneration: UInt64 = 0
+    private var serviceName = ""
     private var peers: [Peer] = []
     private var keepaliveTimer: DispatchSourceTimer?
     /// Arrival time of the last accepted packet, and the largest gap between
@@ -75,32 +101,28 @@ final class UDPReceiver: @unchecked Sendable {
     }
 
     func start() throws {
-        let alreadyRunning: Bool = queue.sync { listener != nil }
+        let alreadyRunning: Bool = queue.sync { isRunning }
         guard !alreadyRunning else { return }
-        let parameters = NWParameters.udp
-        // WMM voice access class: the AP and iOS power-save scheduling favor
-        // the voice queue, which tightens the delay distribution.
-        parameters.serviceClass = .interactiveVoice
-        let newListener = try NWListener(
-            using: parameters,
-            on: NWEndpoint.Port(rawValue: Self.port)!)
+        let name = ReceiverIdentity.serviceName()
+        let newListener = try Self.makeListener(port: Self.port, serviceName: name)
         queue.async { [weak self] in
-            guard let self, self.listener == nil else {
+            guard let self, !self.isRunning else {
                 newListener.cancel()
                 return
             }
-            self.listener = newListener
-            newListener.newConnectionHandler = { [weak self] connection in
-                self?.accept(connection)
-            }
-            newListener.start(queue: self.queue)
+            self.isRunning = true
+            self.serviceName = name
+            self.install(newListener)
             self.startKeepaliveTimer()
-            self.logger.info("Listening on UDP port \(Self.port) (serviceClass interactiveVoice)")
+            self.logger.info(
+                "Listening on UDP port \(Self.port), advertising \(name, privacy: .public) (serviceClass interactiveVoice)")
         }
     }
 
     func stop() {
         queue.sync {
+            isRunning = false
+            listenerGeneration &+= 1
             keepaliveTimer?.cancel()
             keepaliveTimer = nil
             listener?.cancel()
@@ -108,6 +130,8 @@ final class UDPReceiver: @unchecked Sendable {
             peers.forEach { $0.connection.cancel() }
             peers.removeAll()
         }
+        postAdvertisement(.status(.starting))
+        postAdvertisement(.registeredName(nil))
     }
 
     /// Largest gap between consecutive accepted packets since the last call
@@ -120,26 +144,112 @@ final class UDPReceiver: @unchecked Sendable {
         }
     }
 
-    // MARK: - Queue-confined implementation
+    // MARK: - Listener lifecycle (queue-confined)
 
-    private func accept(_ connection: NWConnection) {
-        connection.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .ready:
-                self.updatePeer(for: connection) { $0.isReady = true }
-            case .failed(let error):
-                self.logger.error("Connection failed: \(error.localizedDescription, privacy: .public)")
-                self.drop(connection)
-            case .cancelled:
-                self.drop(connection)
-            default:
-                break
+    private func install(_ newListener: NWListener) {
+        listenerGeneration &+= 1
+        let generation = listenerGeneration
+        newListener.newConnectionHandler = Self.makeConnectionHandler(receiver: self)
+        newListener.stateUpdateHandler = Self.makeListenerStateHandler(
+            receiver: self, generation: generation)
+        newListener.serviceRegistrationUpdateHandler = Self.makeRegistrationHandler(
+            receiver: self, generation: generation)
+        listener = newListener
+        postAdvertisement(.status(.starting))
+        newListener.start(queue: queue)
+    }
+
+    private func handleListenerState(_ state: NWListener.State, generation: UInt64) {
+        guard generation == listenerGeneration, let current = listener else { return }
+        switch state {
+        case .ready:
+            postAdvertisement(.port(current.port?.rawValue))
+            // Provisional until the registration callback reports the name
+            // actually registered (Bonjour renames on a conflict).
+            postAdvertisement(.registeredName(serviceName))
+            postAdvertisement(.status(.advertising))
+        case .waiting(let error):
+            logger.info("Listener waiting: \(error.localizedDescription, privacy: .public)")
+            postAdvertisement(.status(
+                Self.isPolicyDenied(error) ? .localNetworkDenied : .failed(error.localizedDescription)))
+        case .failed(let error):
+            logger.error("Listener failed: \(error.localizedDescription, privacy: .public)")
+            postAdvertisement(.status(
+                Self.isPolicyDenied(error) ? .localNetworkDenied : .failed(error.localizedDescription)))
+            current.cancel()
+            listener = nil
+            // Port 49000 taken: take any port right away (discovered senders
+            // follow the advertised port). Anything else: retry the
+            // preferred port shortly.
+            let portInUse: Bool = {
+                if case .posix(let code) = error { return code == .EADDRINUSE }
+                return false
+            }()
+            let usedPreferredPort = current.port?.rawValue == Self.port || current.port == nil
+            scheduleListenerRestart(
+                port: portInUse && usedPreferredPort ? nil : Self.port,
+                after: portInUse ? 0 : Self.listenerRestartDelay)
+        default:
+            break
+        }
+    }
+
+    private func handleRegistration(_ change: NWListener.ServiceRegistrationChange, generation: UInt64) {
+        guard generation == listenerGeneration else { return }
+        switch change {
+        case .add(let endpoint):
+            if case .service(let name, _, _, _) = endpoint {
+                postAdvertisement(.registeredName(name))
+            }
+            postAdvertisement(.status(.advertising))
+        case .remove:
+            postAdvertisement(.registeredName(nil))
+        @unknown default:
+            break
+        }
+    }
+
+    /// Recreates the listener (same service name) unless stopped meanwhile.
+    /// `port` nil = any free port.
+    private func scheduleListenerRestart(port: UInt16?, after delay: TimeInterval) {
+        let generation = listenerGeneration
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.isRunning, self.listener == nil,
+                generation == self.listenerGeneration
+            else { return }
+            do {
+                let newListener = try Self.makeListener(port: port, serviceName: self.serviceName)
+                self.install(newListener)
+                self.logger.info("Listener recreated on port \(port.map(String.init) ?? "any", privacy: .public)")
+            } catch {
+                self.logger.error(
+                    "Listener restart failed: \(error.localizedDescription, privacy: .public)")
+                self.scheduleListenerRestart(port: Self.port, after: Self.listenerRestartDelay)
             }
         }
+    }
+
+    // MARK: - Sender connections (queue-confined)
+
+    private func accept(_ connection: NWConnection) {
+        connection.stateUpdateHandler = Self.makePeerStateHandler(receiver: self, connection: connection)
         connection.start(queue: queue)
-        peers.append(Peer(connection: connection))
+        peers.append(Peer(connection: connection, acceptedAt: elapsedSeconds()))
         receiveLoop(on: connection)
+    }
+
+    private func handlePeerState(_ state: NWConnection.State, connection: NWConnection) {
+        switch state {
+        case .ready:
+            updatePeer(for: connection) { $0.isReady = true }
+        case .failed(let error):
+            logger.error("Connection failed: \(error.localizedDescription, privacy: .public)")
+            drop(connection)
+        case .cancelled:
+            drop(connection)
+        default:
+            break
+        }
     }
 
     private func updatePeer(for connection: NWConnection, _ update: (inout Peer) -> Void) {
@@ -153,32 +263,38 @@ final class UDPReceiver: @unchecked Sendable {
     }
 
     private func receiveLoop(on connection: NWConnection) {
-        connection.receiveMessage { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let data, isComplete {
-                self.ingest(data)
-            }
-            if let error {
-                self.logger.error(
-                    "Receive failed: \(error.localizedDescription, privacy: .public)")
-                self.drop(connection)
-                return
-            }
-            self.receiveLoop(on: connection)
-        }
+        connection.receiveMessage(
+            completion: Self.makeReceiveHandler(receiver: self, connection: connection))
     }
 
-    private func ingest(_ data: Data) {
+    private func handleReceive(
+        _ data: Data?, isComplete: Bool, error: NWError?, connection: NWConnection
+    ) {
+        if let data, isComplete, ingest(data) {
+            let arrival = lastPacketArrival
+            updatePeer(for: connection) { $0.lastPacketArrival = arrival }
+        }
+        if let error {
+            logger.error("Receive failed: \(error.localizedDescription, privacy: .public)")
+            drop(connection)
+            return
+        }
+        receiveLoop(on: connection)
+    }
+
+    /// Decodes and buffers one datagram; true when it was a valid packet.
+    @discardableResult
+    private func ingest(_ data: Data) -> Bool {
         let packet: AudioPacket
         do {
             packet = try AudioPacket.decode(data)
         } catch {
             countMalformed()
-            return
+            return false
         }
         guard packet.codec == .pcm16, packet.payload.count == Self.expectedPayloadBytes else {
             countMalformed()
-            return
+            return false
         }
         let arrival = elapsedSeconds()
         if let last = lastPacketArrival {
@@ -186,6 +302,7 @@ final class UDPReceiver: @unchecked Sendable {
         }
         lastPacketArrival = arrival
         jitterBuffer.insert(packet, arrivalTime: arrival)
+        return true
     }
 
     private func countMalformed() {
@@ -201,21 +318,25 @@ final class UDPReceiver: @unchecked Sendable {
             deadline: .now() + Self.keepaliveInterval,
             repeating: Self.keepaliveInterval
         )
-        timer.setEventHandler { [weak self] in
-            self?.sendKeepaliveIfStreaming()
-        }
+        timer.setEventHandler(handler: Self.makeKeepaliveHandler(receiver: self))
         timer.resume()
         keepaliveTimer = timer
     }
 
-    /// Sends one keepalive per ready peer while packets arrived within the
-    /// last second. Sends on a not-ready connection would just error per
-    /// datagram, so they are skipped instead.
+    /// Sends one keepalive per ready peer that delivered packets within the
+    /// last second (the sender also uses them as its liveness signal). Sends
+    /// on a not-ready connection would just error per datagram, so they are
+    /// skipped instead. Also closes sender flows idle for 30 s.
     private func sendKeepaliveIfStreaming() {
+        let now = elapsedSeconds()
+        pruneIdlePeers(now: now)
         guard let lastArrival = lastPacketArrival,
-            elapsedSeconds() - lastArrival < Self.keepaliveActivityWindow
+            now - lastArrival < Self.keepaliveActivityWindow
         else { return }
         for peer in peers where peer.isReady {
+            guard let peerArrival = peer.lastPacketArrival,
+                now - peerArrival < Self.keepaliveActivityWindow
+            else { continue }
             peer.connection.send(
                 content: Self.keepalivePayload,
                 completion: .contentProcessed { _ in
@@ -224,6 +345,99 @@ final class UDPReceiver: @unchecked Sendable {
                 }
             )
         }
+    }
+
+    private func pruneIdlePeers(now: TimeInterval) {
+        let idle = peers.filter {
+            now - ($0.lastPacketArrival ?? $0.acceptedAt) > Self.idlePeerTimeout
+        }
+        for peer in idle {
+            drop(peer.connection)
+        }
+    }
+
+    // MARK: - Nonisolated factories (capture only Sendable state)
+
+    nonisolated private static func makeListener(port: UInt16?, serviceName: String) throws -> NWListener {
+        let parameters = NWParameters.udp
+        // WMM voice access class: the AP and iOS power-save scheduling favor
+        // the voice queue, which tightens the delay distribution.
+        parameters.serviceClass = .interactiveVoice
+        let listener: NWListener
+        if let port {
+            listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+        } else {
+            listener = try NWListener(using: parameters)
+        }
+        listener.service = NWListener.Service(
+            name: serviceName,
+            type: ReceiverService.type,
+            domain: nil,
+            txtRecord: NWTXTRecord([ReceiverService.versionKey: ReceiverService.protocolVersion]))
+        return listener
+    }
+
+    nonisolated private static func makeAdvertisementPoster()
+        -> @Sendable (ReceiverAdvertisement.Update) -> Void
+    {
+        { update in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { ReceiverAdvertisement.shared.apply(update) }
+            }
+        }
+    }
+
+    nonisolated private static func makeConnectionHandler(
+        receiver: UDPReceiver
+    ) -> @Sendable (NWConnection) -> Void {
+        { [weak receiver] connection in
+            receiver?.accept(connection)
+        }
+    }
+
+    nonisolated private static func makeListenerStateHandler(
+        receiver: UDPReceiver, generation: UInt64
+    ) -> @Sendable (NWListener.State) -> Void {
+        { [weak receiver] state in
+            receiver?.handleListenerState(state, generation: generation)
+        }
+    }
+
+    nonisolated private static func makeRegistrationHandler(
+        receiver: UDPReceiver, generation: UInt64
+    ) -> @Sendable (NWListener.ServiceRegistrationChange) -> Void {
+        { [weak receiver] change in
+            receiver?.handleRegistration(change, generation: generation)
+        }
+    }
+
+    nonisolated private static func makePeerStateHandler(
+        receiver: UDPReceiver, connection: NWConnection
+    ) -> @Sendable (NWConnection.State) -> Void {
+        { [weak receiver] state in
+            receiver?.handlePeerState(state, connection: connection)
+        }
+    }
+
+    nonisolated private static func makeReceiveHandler(
+        receiver: UDPReceiver, connection: NWConnection
+    ) -> @Sendable (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void {
+        { [weak receiver] data, _, isComplete, error in
+            receiver?.handleReceive(data, isComplete: isComplete, error: error, connection: connection)
+        }
+    }
+
+    nonisolated private static func makeKeepaliveHandler(receiver: UDPReceiver) -> @Sendable () -> Void {
+        { [weak receiver] in
+            receiver?.sendKeepaliveIfStreaming()
+        }
+    }
+
+    private static func isPolicyDenied(_ error: NWError) -> Bool {
+        if case .dns(let code) = error {
+            return code == DNSServiceErrorType(kDNSServiceErr_PolicyDenied)
+        }
+        return false
     }
 
     /// Seconds elapsed on the monotonic arrival clock.
