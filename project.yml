@@ -1,0 +1,63 @@
+name: MacAudioBridge
+options:
+  bundleIdPrefix: dev.jash90
+  deploymentTarget:
+    macOS: "14.2"
+    iOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  BridgeCore:
+    path: Packages/BridgeCore
+settings:
+  base:
+    DEVELOPMENT_TEAM: H2X8YGN869
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+targets:
+  Sender:
+    type: application
+    platform: macOS
+    sources:
+      - path: Apps/Sender-macOS
+        excludes:
+          - "Info.plist"
+          - "Sender.entitlements"
+    dependencies:
+      - package: BridgeCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.jash90.MacAudioBridge.Sender
+        PRODUCT_NAME: Mac Audio Bridge
+        INFOPLIST_FILE: Apps/Sender-macOS/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Apps/Sender-macOS/Sender.entitlements
+        ENABLE_HARDENED_RUNTIME: YES
+  Receiver:
+    type: application
+    platform: iOS
+    sources:
+      - path: Apps/Receiver-iOS
+        excludes:
+          - "Info.plist"
+    dependencies:
+      - package: BridgeCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.jash90.MacAudioBridge.Receiver
+        PRODUCT_NAME: Mac Audio Bridge
+        INFOPLIST_FILE: Apps/Receiver-iOS/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+schemes:
+  Sender:
+    build:
+      targets:
+        Sender: all
+    run:
+      config: Debug
+  Receiver:
+    build:
+      targets:
+        Receiver: all
+    run:
+      config: Debug
