@@ -49,6 +49,24 @@ struct StatsLine: Codable, Sendable {
     /// Audio route changes and interruptions since launch.
     var routeChanges: Int
     var interruptions: Int
+    /// Redundant copies received, and frames played from one because the
+    /// primary never arrived (M2.8).
+    var redundantReceived: Int
+    var recovered: Int
+    /// Playout slots spent waiting with an empty buffer, and waiting for a
+    /// missing frame / growing the cushion (5 ms each).
+    var underrunFrames: Int
+    var waitFrames: Int
+    /// Reader concealment: synthesized slots, concealment events, the ones
+    /// that faded all the way to silence, resumes (fade-ins) and crossfaded
+    /// splices (trim / overflow).
+    var concealedFrames: Int
+    var concealments: Int
+    var fadeOuts: Int
+    var fadeIns: Int
+    var crossfades: Int
+    /// Playout frame length in ms (5 since M2.8; depth/target are in frames).
+    var frameMs: Int
 }
 
 /// Appends one JSON line per second to `Documents/stats.jsonl` on a utility

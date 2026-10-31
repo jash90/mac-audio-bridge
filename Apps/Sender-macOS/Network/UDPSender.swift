@@ -4,7 +4,8 @@ import Network
 import os
 import Synchronization
 
-/// Sends one UDP datagram per audio frame to the current `ReceiverTarget` —
+/// Sends the datagrams of every audio frame (primary + redundant copy, see
+/// `AudioRedundancy`) to the current `ReceiverTarget` —
 /// a Bonjour service (resolved by the system on every new connection) or a
 /// manual host on port 49000.
 ///
@@ -36,7 +37,9 @@ final class UDPSender: @unchecked Sendable {
     private static let keepaliveMagic: [UInt8] = [0x4D, 0x41, 0x42, 0x4B]
     private static let keepaliveLength = 16
 
-    private let stateQueue = DispatchQueue(label: "dev.jash90.MacAudioBridge.udp-sender")
+    /// User-interactive: the connection's I/O and callbacks run here, and a
+    /// throttled queue would add its own pacing jitter to every datagram.
+    private let stateQueue = DispatchQueue(label: "dev.jash90.MacAudioBridge.udp-sender", qos: .userInteractive)
     private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "udp-sender")
 
     // Guarded by `lock`:

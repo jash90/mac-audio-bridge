@@ -30,7 +30,7 @@ Three pieces cooperate:
    also rules out any feedback from the aggregate's own IO. The tap feeds a private
    aggregate device whose **main (clock) sub-device is the virtual device**, with
    `tapautostart` so IO waits for the first audio. From there the M2.5/M2.6
-   pipeline is unchanged: SPSC ring → 10 ms PCM16 frames → UDP.
+   pipeline is unchanged: SPSC ring → 5 ms PCM16 frames → UDP (≤ 1200 B datagrams, each frame repeated 15 ms later; see `AudioRedundancy`).
 
 3. **Auto start/stop + volume** (`Apps/Sender-macOS/SenderController.swift`). The
    sender listens for `kAudioHardwarePropertyDefaultOutputDevice` (system) and

@@ -17,13 +17,13 @@ private let receiverKeepaliveEnabled = true
 /// Listens for UDP datagrams on port 49000 (any free port if that one is
 /// taken — Bonjour carries the real port) and advertises the listener as the
 /// Bonjour service `_macaudiobridge._udp` named after the device ("iPhone
-/// 7KQ2", see `ReceiverIdentity`) with TXT `v=1`, so the Mac finds it by name
+/// 7KQ2", see `ReceiverIdentity`) with TXT `v=2`, so the Mac finds it by name
 /// and re-resolves it when the Wi-Fi address changes. A failed listener is
 /// recreated (same name, same port), so a sender keeps working across it.
 ///
-/// Each datagram is one `AudioPacket` (10 ms of interleaved little-endian
-/// Int16 PCM); decoded packets are inserted into the jitter buffer stamped
-/// with a monotonic arrival time. Datagrams that fail `AudioPacket.decode`, or
+/// Each datagram is one `AudioDatagram` (5 ms frames of interleaved
+/// little-endian Int16 PCM: a primary and/or redundant copies); every frame
+/// is inserted into the jitter buffer stamped with a monotonic arrival time. Datagrams that fail `AudioDatagram.decode`, or
 /// that carry an unexpected codec or payload size, are dropped and counted as
 /// malformed. Start/stop run on the main actor, callbacks are confined to one
 /// serial queue.
@@ -33,9 +33,8 @@ final class UDPReceiver: @unchecked Sendable {
     /// Sender flows that delivered nothing for this long are closed (a
     /// sender that reconnected arrives as a new flow from a new port).
     private static let idlePeerTimeout: TimeInterval = 30
-    /// Expected payload of one PCM16 stereo frame: 480 frames × 2 channels × 2 bytes.
-    private static let expectedPayloadBytes =
-        AudioFormat.samplesPerFrame * AudioFormat.channelCount * MemoryLayout<Int16>.size
+    /// Expected payload of one PCM16 stereo frame: 240 frames × 2 channels × 2 bytes.
+    private static let expectedPayloadBytes = AudioFormat.pcm16FrameBytes
     /// Keepalive cadence, and how recently the last packet must have arrived
     /// for keepalives to keep flowing ("while playing").
     private static let keepaliveInterval: TimeInterval = 0.020
@@ -52,7 +51,9 @@ final class UDPReceiver: @unchecked Sendable {
     }()
 
     private let jitterBuffer: JitterBuffer
-    private let queue = DispatchQueue(label: "dev.jash90.MacAudioBridge.udp-receiver")
+    /// User-interactive: arrival timestamps are taken here, and a throttled
+    /// queue would add its own scheduling jitter to every delay sample.
+    private let queue = DispatchQueue(label: "dev.jash90.MacAudioBridge.udp-receiver", qos: .userInteractive)
     private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "udp-receiver")
     private let malformedDatagrams = Atomic<Int>(0)
     /// Arrival-clock epoch. `ContinuousClock` never goes backwards, which the
@@ -282,26 +283,35 @@ final class UDPReceiver: @unchecked Sendable {
         receiveLoop(on: connection)
     }
 
-    /// Decodes and buffers one datagram; true when it was a valid packet.
+    /// Decodes one datagram and buffers every frame it carries (the primary
+    /// and any redundant copies); true when it was a valid audio datagram.
+    /// The inter-arrival gap tracks datagrams carrying a primary only.
     @discardableResult
     private func ingest(_ data: Data) -> Bool {
-        let packet: AudioPacket
+        let datagram: AudioDatagram
         do {
-            packet = try AudioPacket.decode(data)
+            datagram = try AudioDatagram.decode(data)
         } catch {
             countMalformed()
             return false
         }
-        guard packet.codec == .pcm16, packet.payload.count == Self.expectedPayloadBytes else {
+        guard datagram.codec == .pcm16,
+            datagram.entries.allSatisfy({ $0.payload.count == Self.expectedPayloadBytes })
+        else {
             countMalformed()
             return false
         }
         let arrival = elapsedSeconds()
-        if let last = lastPacketArrival {
-            maxInterArrivalGap = max(maxInterArrivalGap, arrival - last)
+        let packets = datagram.packets()
+        if packets.contains(where: { !$0.isRedundant }) {
+            if let last = lastPacketArrival {
+                maxInterArrivalGap = max(maxInterArrivalGap, arrival - last)
+            }
+            lastPacketArrival = arrival
         }
-        lastPacketArrival = arrival
-        jitterBuffer.insert(packet, arrivalTime: arrival)
+        for packet in packets {
+            jitterBuffer.insert(packet, arrivalTime: arrival)
+        }
         return true
     }
 

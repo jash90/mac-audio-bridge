@@ -36,12 +36,14 @@ public struct DelayPercentiles: Sendable, Equatable {
 /// estimate underestimates the tail: bursts show up directly in p99/max.
 ///
 /// Pure value type, no clocks and no locks: the caller owns the threading
-/// (inside the jitter buffer's lock, or a network queue) and injects the
-/// sample times. Sample times must be non-decreasing in record order (arrival
-/// clocks are monotonic); the window prune relies on it. Storage is
-/// preallocated at init and recording never allocates; `percentiles` sorts
-/// into a preallocated scratch buffer, so steady-state calls do not allocate
-/// either.
+/// and injects the sample times. Sample times must be non-decreasing in
+/// record order (arrival clocks are monotonic); the window prune relies on
+/// it. Storage is preallocated at init and nothing allocates afterwards.
+///
+/// Cost: the offsets are also kept in a sorted array, so `record` and the
+/// window prune are a binary search plus one `memmove` (O(n) bytes moved,
+/// a few microseconds for a 45 s window at 200 packets/s), and every
+/// percentile query is O(1) — no sorting, ever.
 public struct DelayHistogram: Sendable {
     /// Samples older than this many seconds before `now` stop counting.
     private let window: TimeInterval
@@ -55,8 +57,8 @@ public struct DelayHistogram: Sendable {
     private var head = 0
     /// Samples currently stored (alive or not yet pruned).
     private var count = 0
-    /// Scratch buffer for percentile computation, reused across calls.
-    private var scratch: [TimeInterval] = []
+    /// The stored offsets in ascending order (`count` elements).
+    private var sorted: [TimeInterval] = []
 
     public init(window: TimeInterval = 10, capacity: Int = 2048) {
         precondition(window > 0, "DelayHistogram window must be positive")
@@ -65,7 +67,13 @@ public struct DelayHistogram: Sendable {
         self.capacity = capacity
         times = [TimeInterval](repeating: 0, count: capacity)
         offsets = [TimeInterval](repeating: 0, count: capacity)
-        scratch.reserveCapacity(capacity)
+        sorted.reserveCapacity(capacity)
+    }
+
+    /// Ring capacity that holds `window` seconds at `packetsPerSecond` with
+    /// 25 % headroom.
+    public static func capacity(window: TimeInterval, packetsPerSecond: Double) -> Int {
+        Int((window * packetsPerSecond * 1.25).rounded(.up)) + 64
     }
 
     /// Records one packet: `arrivalTime` is the receive timestamp,
@@ -75,6 +83,7 @@ public struct DelayHistogram: Sendable {
         let offset = arrivalTime - mediaTime
         if count == capacity {
             // Ring full: overwrite the oldest sample.
+            removeSorted(offsets[head])
             times[head] = arrivalTime
             offsets[head] = offset
             head = (head + 1) % capacity
@@ -84,7 +93,12 @@ public struct DelayHistogram: Sendable {
             offsets[tail] = offset
             count += 1
         }
+        sorted.insert(offset, at: insertionIndex(offset))
     }
+
+    /// Smallest `arrival - media` offset still stored (the fastest path), or
+    /// nil when empty. Does not prune.
+    public var minimumOffset: TimeInterval? { sorted.first }
 
     /// Drops samples that have left the window and returns the nearest-rank
     /// percentiles of the remaining relative delays, or nil when the window
@@ -94,32 +108,21 @@ public struct DelayHistogram: Sendable {
     public mutating func percentiles(now: TimeInterval) -> DelayPercentiles? {
         prune(now: now)
         guard count > 0 else { return nil }
-
-        var minOffset = offsets[head]
-        for index in 0..<count {
-            let offset = offsets[(head + index) % capacity]
-            if offset < minOffset { minOffset = offset }
-        }
-
-        scratch.removeAll(keepingCapacity: true)
-        for index in 0..<count {
-            scratch.append(offsets[(head + index) % capacity] - minOffset)
-        }
-        scratch.sort()
-
-        func percentile(_ fraction: Double) -> TimeInterval {
-            // Nearest-rank: the ceil(fraction × n)-th smallest value.
-            let rank = min(max(Int((fraction * Double(count)).rounded(.up)), 1), count)
-            return scratch[rank - 1]
-        }
-
         return DelayPercentiles(
-            p50: percentile(0.50),
-            p95: percentile(0.95),
-            p99: percentile(0.99),
-            max: scratch[count - 1],
+            p50: rank(0.50),
+            p95: rank(0.95),
+            p99: rank(0.99),
+            max: sorted[count - 1] - sorted[0],
             sampleCount: count
         )
+    }
+
+    /// Nearest-rank `fraction` quantile (0...1; 1 = max) of the windowed
+    /// relative delays after pruning, or nil when empty. O(1).
+    public mutating func quantile(_ fraction: Double, now: TimeInterval) -> TimeInterval? {
+        prune(now: now)
+        guard count > 0 else { return nil }
+        return rank(fraction)
     }
 
     /// Forgets every sample (e.g. on a stream discontinuity, where delay
@@ -127,14 +130,42 @@ public struct DelayHistogram: Sendable {
     public mutating func reset() {
         head = 0
         count = 0
+        sorted.removeAll(keepingCapacity: true)
+    }
+
+    // MARK: - Internals
+
+    private func rank(_ fraction: Double) -> TimeInterval {
+        // Nearest-rank: the ceil(fraction × n)-th smallest value.
+        let index = min(max(Int((fraction * Double(count)).rounded(.up)), 1), count)
+        return sorted[index - 1] - sorted[0]
     }
 
     /// Drops samples recorded strictly before `now - window`.
     private mutating func prune(now: TimeInterval) {
         let cutoff = now - window
         while count > 0, times[head] < cutoff {
+            removeSorted(offsets[head])
             head = (head + 1) % capacity
             count -= 1
+        }
+    }
+
+    /// First index whose value is >= `value` (binary search).
+    private func insertionIndex(_ value: TimeInterval) -> Int {
+        var low = 0
+        var high = sorted.count
+        while low < high {
+            let mid = (low + high) / 2
+            if sorted[mid] < value { low = mid + 1 } else { high = mid }
+        }
+        return low
+    }
+
+    private mutating func removeSorted(_ value: TimeInterval) {
+        let index = insertionIndex(value)
+        if index < sorted.count, sorted[index] == value {
+            sorted.remove(at: index)
         }
     }
 }
