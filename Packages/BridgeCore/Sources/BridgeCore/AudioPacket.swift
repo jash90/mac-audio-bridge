@@ -94,7 +94,7 @@ public struct AudioPacket: Sendable, Equatable {
     }
 }
 
-/// One UDP datagram: a fixed 20-byte big-endian header followed by one or
+/// One UDP datagram: a fixed 24-byte big-endian header followed by one or
 /// more codec frames. Codec-agnostic: every entry is an opaque frame of the
 /// header's codec, so the same layout carries "current + previous N frames"
 /// for a compact codec (several frames fit in one datagram) and a single
@@ -103,14 +103,16 @@ public struct AudioPacket: Sendable, Equatable {
 ///
 ///     offset  size  field
 ///        0      4   magic "MABA" (0x4D414241)
-///        4      1   version (2)
+///        4      1   version (3)
 ///        5      1   codec (AudioCodec raw value)
 ///        6      1   flags (AudioPacketFlags raw value) — apply to the
 ///                   reference frame only
 ///        7      1   entry count (≥ 1)
 ///        8      4   reference sequence (wrapping)
 ///       12      8   reference sampleTime
-///       20      …   entries, each:
+///       20      4   source tag (`SourceTag` of the sending Mac; 0 =
+///                   untagged) — the receiver plays one source at a time
+///       24      …   entries, each:
 ///                     1  back offset k: this entry is frame
 ///                        (sequence − k), sampleTime − k × samplesPerFrame
 ///                     2  payload length (big-endian)
@@ -132,19 +134,21 @@ public struct AudioDatagram: Sendable, Equatable {
     }
 
     /// Fixed header size in bytes.
-    public static let headerSize = 20
+    public static let headerSize = 24
     /// Per-entry header: offset (1) + length (2).
     public static let entryHeaderSize = 3
     /// Leading magic value, ASCII "MABA".
     public static let magic: UInt32 = 0x4D41_4241
-    /// Version 2: 5 ms frames, multi-frame entries (version 1 was one 10 ms
-    /// frame per datagram).
-    public static let version: UInt8 = 2
+    /// Version 3: version 2 (5 ms frames, multi-frame entries) plus the
+    /// source tag (version 1 was one 10 ms frame per datagram).
+    public static let version: UInt8 = 3
 
     public var codec: AudioCodec
     public var flags: AudioPacketFlags
     public var sequence: UInt32
     public var sampleTime: UInt64
+    /// Tag of the sending Mac (`SourceTag.make(sourceID:)`), 0 = untagged.
+    public var source: UInt32
     public var entries: [Entry]
 
     public init(
@@ -152,22 +156,29 @@ public struct AudioDatagram: Sendable, Equatable {
         flags: AudioPacketFlags,
         sequence: UInt32,
         sampleTime: UInt64,
+        source: UInt32 = 0,
         entries: [Entry]
     ) {
         self.codec = codec
         self.flags = flags
         self.sequence = sequence
         self.sampleTime = sampleTime
+        self.source = source
         self.entries = entries
+    }
+
+    /// Whether the datagram carries its reference frame (offset 0).
+    public var hasPrimary: Bool {
+        entries.contains { $0.offset == 0 }
     }
 
     /// A datagram whose reference is `primary`, carrying `primary` at
     /// offset 0 followed by `redundant` (each must precede `primary` by
     /// 1...255 frames).
-    public init(primary: AudioPacket, redundant: [AudioPacket]) {
+    public init(primary: AudioPacket, redundant: [AudioPacket], source: UInt32 = 0) {
         self.init(
             codec: primary.codec, flags: primary.flags, sequence: primary.sequence,
-            sampleTime: primary.sampleTime,
+            sampleTime: primary.sampleTime, source: source,
             entries: [Entry(offset: 0, payload: primary.payload)]
                 + redundant.map { Entry(offset: Self.offset(of: $0, from: primary.sequence), payload: $0.payload) })
     }
@@ -214,6 +225,7 @@ public struct AudioDatagram: Sendable, Equatable {
         append32(sequence)
         append32(UInt32(truncatingIfNeeded: sampleTime >> 32))
         append32(UInt32(truncatingIfNeeded: sampleTime))
+        append32(source)
         for entry in entries {
             precondition(entry.payload.count <= Int(UInt16.max), "entry payload too large")
             data.append(entry.offset)
@@ -246,6 +258,7 @@ public struct AudioDatagram: Sendable, Equatable {
         let entryCount = Int(byte(7))
         let sequence = read32(8)
         let sampleTime = UInt64(read32(12)) << 32 | UInt64(read32(16))
+        let source = read32(20)
 
         guard entryCount > 0 else { throw AudioPacketError.malformedEntries }
         var entries: [Entry] = []
@@ -265,7 +278,8 @@ public struct AudioDatagram: Sendable, Equatable {
         }
         guard cursor == data.count else { throw AudioPacketError.malformedEntries }
         return AudioDatagram(
-            codec: codec, flags: flags, sequence: sequence, sampleTime: sampleTime, entries: entries)
+            codec: codec, flags: flags, sequence: sequence, sampleTime: sampleTime, source: source,
+            entries: entries)
     }
 }
 
@@ -289,8 +303,8 @@ public enum AudioRedundancy {
     /// Opus: every datagram carries the previous N = 4 frames (offsets
     /// 1...4), so each frame travels in five datagrams and any loss run of
     /// up to 4 datagrams (20 ms) is recovered, the first copy arriving only
-    /// 5 ms after the primary. CBR keeps the size fixed: 20 + 5 × (3 + 120) =
-    /// 635 B at 192 kbit/s (≈ 1.06 Mbit/s with UDP/IP headers), 435 B at
+    /// 5 ms after the primary. CBR keeps the size fixed: 24 + 5 × (3 + 120) =
+    /// 639 B at 192 kbit/s (≈ 1.07 Mbit/s with UDP/IP headers), 439 B at
     /// 128 kbit/s — both far below the 1200 B budget, which would allow
     /// N = 8 at 192 kbit/s; 4 balances burst coverage against airtime.
     public static let opusOffsets: [Int] = [1, 2, 3, 4]
@@ -324,6 +338,8 @@ public struct RedundancyPacker: Sendable {
     /// one).
     private var history: [AudioPacket] = []
     private let historyDepth: Int
+    /// Stamped into every datagram's header (`AudioDatagram.source`).
+    public var sourceTag: UInt32 = 0
 
     /// The production packer: per-codec offsets from `AudioRedundancy` (none
     /// when redundancy is disabled).
@@ -379,7 +395,7 @@ public struct RedundancyPacker: Sendable {
         }
 
         var datagrams: [Data] = []
-        var current = AudioDatagram(primary: frame, redundant: [])
+        var current = AudioDatagram(primary: frame, redundant: [], source: sourceTag)
         var size = AudioDatagram.encodedSize(payloadSizes: [frame.payload.count])
         for copy in redundant {
             let entry = AudioDatagram.Entry(
@@ -389,7 +405,7 @@ public struct RedundancyPacker: Sendable {
                 datagrams.append(current.encoded())
                 current = AudioDatagram(
                     codec: copy.codec, flags: [], sequence: frame.sequence,
-                    sampleTime: frame.sampleTime, entries: [])
+                    sampleTime: frame.sampleTime, source: sourceTag, entries: [])
                 size = AudioDatagram.headerSize
             }
             current.entries.append(entry)

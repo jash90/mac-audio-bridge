@@ -19,6 +19,31 @@ final class VolumeGate: @unchecked Sendable {
     }
 }
 
+/// When the stream last carried audible (non-silent) samples — the phone's
+/// "audio playing" indicator. Written once per frame on the converter queue
+/// (one relaxed atomic store), read ~1 Hz on the main actor.
+final class AudibilityTracker: @unchecked Sendable {
+    /// Peak below this (about -80 dBFS) counts as silence.
+    static let threshold: Float = 1e-4
+    private let lastAudibleNanos = Atomic<UInt64>(0)
+
+    func recordAudible() {
+        lastAudibleNanos.store(DispatchTime.now().uptimeNanoseconds, ordering: .relaxed)
+    }
+
+    func reset() {
+        lastAudibleNanos.store(0, ordering: .relaxed)
+    }
+
+    /// Whether audible samples were seen within `window` seconds.
+    func audible(within window: TimeInterval) -> Bool {
+        let last = lastAudibleNanos.load(ordering: .relaxed)
+        guard last > 0 else { return false }
+        let now = DispatchTime.now().uptimeNanoseconds
+        return now <= last || Double(now - last) / 1e9 <= window
+    }
+}
+
 /// The stream quality picked in the menu, read once per drain tick on the
 /// converter queue — a plain atomic, like `VolumeGate`. A change applies from
 /// the next frame (within one 2.5 ms tick).
@@ -137,6 +162,9 @@ final class FrameConverter: @unchecked Sendable {
 
     /// Encoder telemetry for the stats line.
     let encoderStats = EncoderStats()
+
+    /// Last time a frame carried audible samples (before the volume gain).
+    let audibility = AudibilityTracker()
 
     private static let queueLabel = "dev.jash90.MacAudioBridge.frame-converter"
     private static let inputCapacityFrames = 8_192
@@ -436,6 +464,12 @@ final class FrameConverter: @unchecked Sendable {
             let sequence = nextSequence
             let sampleTime = nextSampleTime
             let started = DispatchTime.now().uptimeNanoseconds
+            let audible = staging.withUnsafeBufferPointer { buffer in
+                Self.isAudible(buffer.baseAddress! + frameStart, count: Self.samplesPerFrame)
+            }
+            if audible {
+                audibility.recordAudible()
+            }
             let packet = staging.withUnsafeBufferPointer { buffer in
                 frameEncoder.encode(
                     buffer.baseAddress! + frameStart, gain: gain, quality: quality, flags: flags,
@@ -453,5 +487,13 @@ final class FrameConverter: @unchecked Sendable {
         if frameStart > 0 {
             staging.removeFirst(frameStart)
         }
+    }
+
+    /// Whether any sample of the frame is above the silence threshold.
+    private static func isAudible(_ samples: UnsafePointer<Float>, count: Int) -> Bool {
+        for i in 0..<count where abs(samples[i]) > AudibilityTracker.threshold {
+            return true
+        }
+        return false
     }
 }

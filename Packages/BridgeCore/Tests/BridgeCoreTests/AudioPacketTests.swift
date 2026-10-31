@@ -97,12 +97,13 @@ struct AudioPacketTests {
         let packet = referencePacket()
         #expect([UInt8](packet.encoded()) == [
             0x4D, 0x41, 0x42, 0x41,  // magic "MABA"
-            0x02,  // version
+            0x03,  // version
             0x01,  // opus
             0x01,  // discontinuity flag
             0x01,  // one entry
             0xDE, 0xAD, 0xBE, 0xEF,  // sequence
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,  // sampleTime
+            0x00, 0x00, 0x00, 0x00,  // source tag (untagged)
             0x00, 0x00, 0x02,  // entry: offset 0, length 2
             0xAA, 0xBB,  // payload
         ])
