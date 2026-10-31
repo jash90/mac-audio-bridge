@@ -19,10 +19,10 @@ final class VolumeGate: @unchecked Sendable {
     }
 }
 
-/// Drains the tap's ring buffer on a dedicated serial queue (timer every 2.5 ms),
-/// resamples to 48 kHz with `AVAudioConverter` when the tap rate differs, applies
-/// the virtual device's volume (see `VolumeGate`), and emits fixed 10 ms frames
-/// as `AudioPacket`s (PCM16, 1920-byte payload). A frame is emitted in the same
+/// Drains the tap's ring buffer on a dedicated serial `.userInteractive` queue
+/// (strict timer every 2.5 ms), resamples to 48 kHz with `AVAudioConverter` when
+/// the tap rate differs, applies the virtual device's volume (see `VolumeGate`),
+/// and emits fixed 5 ms frames as `AudioPacket`s (PCM16, 960-byte payload). A frame is emitted in the same
 /// tick it completes — no extra queueing — and sequence and sample time advance
 /// continuously for the app's lifetime; the first packet of every run carries
 /// `.discontinuity` so the receiver resets its jitter buffer.
@@ -52,17 +52,22 @@ final class FrameConverter: @unchecked Sendable {
 
     private static let queueLabel = "dev.jash90.MacAudioBridge.frame-converter"
     private static let inputCapacityFrames = 8_192
-    /// 2.5 ms drain tick: a 10 ms frame waits at most one extra tick once complete.
+    /// 2.5 ms drain tick: a 5 ms frame waits at most one extra tick once complete.
     /// Expressed in seconds so the interval can be checked against the frame
     /// duration at timer creation — a tick longer than one audio frame can
     /// never ship again.
     private static let timerIntervalSeconds: Double = 0.0025
     private static let timerInterval = DispatchTimeInterval.nanoseconds(
         Int(timerIntervalSeconds * 1e9))
-    private static let timerLeeway = DispatchTimeInterval.microseconds(500)
+    /// Tight leeway plus a `.strict` timer on a `.userInteractive` queue:
+    /// the measured 121 ms tick gaps came from timer coalescing of a
+    /// default-QoS, non-strict source; a strict source is never deferred past
+    /// its leeway, and user-interactive QoS keeps the queue off the
+    /// efficiency cores' throttled lanes.
+    private static let timerLeeway = DispatchTimeInterval.microseconds(100)
     private static let captureGraceInterval: TimeInterval = 3
 
-    private let queue = DispatchQueue(label: FrameConverter.queueLabel)
+    private let queue = DispatchQueue(label: FrameConverter.queueLabel, qos: .userInteractive)
     private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "frame-converter")
 
     // State confined to `queue`:
@@ -88,7 +93,7 @@ final class FrameConverter: @unchecked Sendable {
     private var lastTickTime: DispatchTime?
     private var maxTickInterval: TimeInterval = 0
 
-    /// Samples (interleaved) per emitted frame: 480 frames × 2 channels.
+    /// Samples (interleaved) per emitted frame: 240 frames × 2 channels.
     private static let samplesPerFrame = AudioFormat.samplesPerFrame * AudioFormat.channelCount
 
     init() {
@@ -167,7 +172,7 @@ final class FrameConverter: @unchecked Sendable {
             precondition(
                 Self.timerIntervalSeconds < Double(AudioFormat.frameDurationMs) / 1000,
                 "drain tick \(Self.timerIntervalSeconds) s must be shorter than one audio frame")
-            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            let timer = DispatchSource.makeTimerSource(flags: .strict, queue: self.queue)
             timer.schedule(
                 deadline: .now() + Self.timerInterval,
                 repeating: Self.timerInterval,
@@ -326,7 +331,7 @@ final class FrameConverter: @unchecked Sendable {
         }
     }
 
-    /// Chops the staging buffer into whole 10 ms frames, applies the volume
+    /// Chops the staging buffer into whole 5 ms frames, applies the volume
     /// gate's gain, and hands one `AudioPacket` per frame to `onFrame`.
     private func emitCompleteFrames() {
         // One relaxed atomic load per drain; mute yields gain 0 (zeros out).

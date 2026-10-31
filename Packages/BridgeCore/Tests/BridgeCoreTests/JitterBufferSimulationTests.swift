@@ -62,10 +62,10 @@ private struct SimulationReport {
     let dropPercentAfterWarmUp: Double
 }
 
-/// Deterministic simulation: the sender emits one frame every 10 ms; every
+/// Deterministic simulation: the sender emits one frame every 5 ms; every
 /// packet gets a uniform random delay in `0..<maxDelay` and is dropped with
 /// probability `dropRate`; from `stepAt` on (if set) the delay bound becomes
-/// `maxDelayAfterStep`. The playout clock pops every 10 ms from t = 0.
+/// `maxDelayAfterStep`. The playout clock pops every 5 ms from t = 0.
 private func simulate(
     seed: UInt64,
     maxDelay: TimeInterval,
@@ -77,10 +77,10 @@ private func simulate(
     grace: TimeInterval = 1,
     config: JitterBufferConfig = JitterBufferConfig()
 ) -> SimulationReport {
-    let frameDuration: TimeInterval = 0.010
-    let totalFrames = Int(duration / frameDuration)  // 6000
-    let warmUpFrame = Int(warmUp / frameDuration)
-    let graceFrame = stepAt.map { Int(($0 + grace) / frameDuration) } ?? warmUpFrame
+    let frameDuration = AudioFormat.frameDuration
+    let totalFrames = Int((duration / frameDuration).rounded())
+    let warmUpFrame = Int((warmUp / frameDuration).rounded())
+    let graceFrame = stepAt.map { Int((($0 + grace) / frameDuration).rounded()) } ?? warmUpFrame
     var rng = SplitMix64(seed: seed)
 
     var arrivals: [Arrival] = []
@@ -109,7 +109,7 @@ private func simulate(
 }
 
 /// Deterministic Wi-Fi power-save simulation: the sender emits one frame
-/// every 10 ms with a 2-8 ms base delay; every 100 ms the AP holds the
+/// every 5 ms with a 2-8 ms base delay; every 100 ms the AP holds the
 /// packets of the last 100 ms window and releases them together after a
 /// per-burst hold of 60-120 ms (a packet lands no earlier than its own
 /// on-time arrival). 1% of packets is dropped. Runs `.balanced` by default.
@@ -119,10 +119,10 @@ private func simulateWiFiBurst(
     warmUp: TimeInterval = 3,
     mode: JitterLatencyMode = .balanced
 ) -> SimulationReport {
-    let frameDuration: TimeInterval = 0.010
-    let totalFrames = Int(duration / frameDuration)  // 6000
-    let warmUpFrame = Int(warmUp / frameDuration)
-    let burstFrames = 10  // one burst per 100 ms
+    let frameDuration = AudioFormat.frameDuration
+    let totalFrames = Int((duration / frameDuration).rounded())
+    let warmUpFrame = Int((warmUp / frameDuration).rounded())
+    let burstFrames = AudioFormat.frames(milliseconds: 100)  // one burst per 100 ms
     var rng = SplitMix64(seed: seed)
 
     var arrivals: [Arrival] = []
@@ -155,7 +155,7 @@ private func simulateWiFiBurst(
 }
 
 /// Drives one jitter buffer over a precomputed arrival schedule: inserts
-/// every packet whose arrival time has come, pops one playout slot per 10 ms
+/// every packet whose arrival time has come, pops one playout slot per 5 ms
 /// tick, and samples the statistics the acceptance thresholds need.
 private func runStream(
     arrivals: [Arrival],
@@ -165,10 +165,10 @@ private func runStream(
     config: JitterBufferConfig,
     droppedAfterWarmUp: Int
 ) -> SimulationReport {
-    let frameDuration: TimeInterval = 0.010
+    let frameDuration = AudioFormat.frameDuration
     let payload = Data(
         repeating: 0x5A,
-        count: AudioFormat.samplesPerFrame * AudioFormat.channelCount * 2  // PCM16 stereo
+        count: AudioFormat.pcm16FrameBytes
     )
     let buffer = JitterBuffer(config: config)
     var nextArrivalIndex = 0
@@ -200,7 +200,7 @@ private func runStream(
                 playedInOrder = false
             }
             lastPlayed = packet.sequence
-        case .lost, .buffering:
+        case .lost, .underrun, .buffering:
             break
         }
 
@@ -307,13 +307,16 @@ struct JitterBufferSimulationTests {
                 + "bufferingPops=\(report.final.bufferingPops), "
                 + "late(after grace)=\(lateAfterGrace) (\(String(format: "%.3f", latePercent))%), "
                 + "underruns=\(report.final.underruns), "
+                + "waitFrames=\(report.final.waitFrames), underrunFrames=\(report.final.underrunFrames), "
                 + "finalTarget=\(report.final.targetFrames), "
                 + "finalJitter=\(String(format: "%.4f", report.final.jitterSeconds)) s"
         )
 
-        // The whole transition costs at most two rebuilds and 80 ms of gap.
-        #expect(report.final.rebuffers <= 2)
-        #expect(report.final.bufferingPops <= 8)
+        // The transition needs no rebuild (the cushion grows by waiting) and
+        // no silence gap; at most 80 ms of waiting in total.
+        #expect(report.final.rebuffers == 0)
+        #expect(report.final.bufferingPops == 0)
+        #expect(report.final.underrunFrames + report.final.waitFrames <= AudioFormat.frames(milliseconds: 80))
         // One second after the step the new cushion is in place: lates stay
         // within one percent of the frames sent in the measured window.
         #expect(latePercent <= 1.0)
@@ -321,12 +324,13 @@ struct JitterBufferSimulationTests {
 
     @Test("After a 0-200 ms transient calms down, target and real depth both return to the floor")
     func transientDecaysTargetAndDepth() {
-        // 10 s of 0-200 ms jitter, then 80 s of 0-10 ms jitter, balanced mode.
+        // 10 s of 0-200 ms jitter, then 120 s of 0-10 ms jitter, balanced
+        // mode (its 45 s max window must expire before the decay starts).
         let report = simulate(
             seed: 0x5EED_C0FF_EE05,
             maxDelay: 0.200,
             dropRate: 0.01,
-            duration: 90,
+            duration: 130,
             stepAt: 10,
             maxDelayAfterStep: 0.010,
             config: .latency(.balanced)
@@ -344,10 +348,10 @@ struct JitterBufferSimulationTests {
         )
 
         let floor = JitterBufferConfig.latency(.balanced).minTargetFrames
-        #expect(report.maxTargetAfterWarmUp >= 18)  // the transient did raise it
+        #expect(report.maxTargetAfterWarmUp >= AudioFormat.frames(milliseconds: 180))  // the transient did raise it
         #expect(report.final.targetFrames == floor)
         // The latency itself follows: depth within target + trim slack.
-        #expect(report.final.depthFrames <= floor + 2)
+        #expect(report.final.depthFrames <= floor + AudioFormat.frames(milliseconds: 20))
         #expect(latePercent <= 0.5)
     }
 
@@ -379,6 +383,6 @@ struct JitterBufferSimulationTests {
         // well inside the balanced ceiling.
         #expect(latePercent <= 0.5)
         #expect(underruns <= 2)
-        #expect(report.maxTargetAfterWarmUp <= 25)
+        #expect(report.maxTargetAfterWarmUp <= JitterBufferConfig.latency(.balanced).maxTargetFrames)
     }
 }

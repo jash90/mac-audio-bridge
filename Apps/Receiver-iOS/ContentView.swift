@@ -22,6 +22,8 @@ final class ReceiverModel: ObservableObject {
     @Published private(set) var lateCount = 0
     @Published private(set) var rebufferCount = 0
     @Published private(set) var underrunCount = 0
+    @Published private(set) var recoveredCount = 0
+    @Published private(set) var concealedCount = 0
     @Published private(set) var malformedCount = 0
     @Published private(set) var outputRoute: String?
     @Published private(set) var latencyMode: JitterLatencyMode = .balanced
@@ -121,6 +123,8 @@ final class ReceiverModel: ObservableObject {
         lateCount = stats.late
         rebufferCount = stats.rebuffers
         underrunCount = stats.underruns
+        recoveredCount = stats.recovered
+        concealedCount = playback.snapshot.concealment.concealedFrames
         malformedCount = receiver.malformedCount
         outputRoute = session.currentRoute.outputs.first?.portName
         engineRunning = playback.isEngineRunning
@@ -167,7 +171,17 @@ final class ReceiverModel: ObservableObject {
                 sessionSampleRate: audio.sessionSampleRate,
                 ioBufferMs: audio.ioBufferMilliseconds,
                 routeChanges: audio.routeChanges,
-                interruptions: audio.interruptions
+                interruptions: audio.interruptions,
+                redundantReceived: stats.redundantReceived,
+                recovered: stats.recovered,
+                underrunFrames: stats.underrunFrames,
+                waitFrames: stats.waitFrames,
+                concealedFrames: audio.concealment.concealedFrames,
+                concealments: audio.concealment.concealments,
+                fadeOuts: audio.concealment.fadeOuts,
+                fadeIns: audio.concealment.fadeIns,
+                crossfades: audio.concealment.crossfades,
+                frameMs: AudioFormat.frameDurationMs
             )
         )
     }
@@ -270,6 +284,8 @@ struct ContentView: View {
             statRow("Late", "\(model.lateCount)")
             statRow("Rebuffers", "\(model.rebufferCount)")
             statRow("Underruns", "\(model.underrunCount)")
+            statRow("Recovered", "\(model.recoveredCount)")
+            statRow("Concealed", "\(model.concealedCount) × \(AudioFormat.frameDurationMs) ms")
             statRow("Malformed", "\(model.malformedCount)")
             statRow(
                 "Audio engine",

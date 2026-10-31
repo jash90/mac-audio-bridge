@@ -46,6 +46,7 @@ final class PlaybackController {
         var ioBufferMilliseconds: Double
         var routeChanges: Int
         var interruptions: Int
+        var concealment: ConcealmentStats
     }
 
     private let jitterBuffer: JitterBuffer
@@ -101,7 +102,8 @@ final class PlaybackController {
             sessionSampleRate: session.sampleRate,
             ioBufferMilliseconds: session.ioBufferDuration * 1000,
             routeChanges: routeChanges,
-            interruptions: interruptions)
+            interruptions: interruptions,
+            concealment: output.concealmentStats)
     }
 
     /// Installs the observers and the supervision loop (once) and starts the

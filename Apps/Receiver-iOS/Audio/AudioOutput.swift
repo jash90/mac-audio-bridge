@@ -5,8 +5,8 @@ import Synchronization
 
 /// Plays the jitter buffer through an `AVAudioSourceNode` (48 kHz stereo,
 /// deinterleaved Float32 render format) via a `PCMFrameReader`, which turns
-/// the jitter buffer's 10 ms playout slots into arbitrary-size render reads
-/// with packet-loss concealment. The render block only touches preallocated
+/// the jitter buffer's 5 ms playout slots into arbitrary-size render reads
+/// with smooth concealment (fades and crossfades, never a hard step). The render block only touches preallocated
 /// state — no allocation, no Swift concurrency; the jitter buffer's short
 /// unfair lock is the only synchronization it meets, plus one relaxed atomic
 /// counter.
@@ -53,7 +53,7 @@ final class AudioOutput {
     init(jitterBuffer: JitterBuffer) {
         self.jitterBuffer = jitterBuffer
         self.renderContext = RenderContext(
-            frameReader: PCMFrameReader(source: { jitterBuffer.pop() }))
+            frameReader: PCMFrameReader(source: Self.makeFrameSource(jitterBuffer: jitterBuffer)))
     }
 
     /// Fraction (in frames, 0..<1) of the playout frame currently being
@@ -167,7 +167,23 @@ final class AudioOutput {
         engine.stop()
     }
 
+    /// Concealment counters of the playout reader (relaxed snapshot).
+    var concealmentStats: ConcealmentStats {
+        renderContext.frameReader.stats
+    }
+
     // MARK: - Realtime callback
+
+    /// The reader's playout source, built in a nonisolated context so it
+    /// carries no actor isolation: it runs on the render thread and only
+    /// calls the jitter buffer's realtime pop, which copies the payload into
+    /// the reader's preallocated buffers (no `Data` reaches the render
+    /// thread, so none is freed there).
+    nonisolated private static func makeFrameSource(jitterBuffer: JitterBuffer) -> PCMFrameReader.Source {
+        { payload, skippedPayload in
+            jitterBuffer.pop(payload: payload, skippedPayload: skippedPayload)
+        }
+    }
 
     /// Builds the render block in a nonisolated context so it carries no actor
     /// isolation; CoreAudio invokes it on the render thread, where hopping,
@@ -217,7 +233,7 @@ private final class RenderContext: @unchecked Sendable {
         }
 
         // The reader serves any request size (render quanta are not
-        // necessarily a multiple of one 10 ms frame) and never runs dry.
+        // necessarily a multiple of one 5 ms frame) and never runs dry.
         let samplesNeeded = min(frameCount * AudioFormat.channelCount, Self.scratchSamples)
         frameReader.read(into: scratch, sampleCount: samplesNeeded)
         let frames = samplesNeeded / AudioFormat.channelCount

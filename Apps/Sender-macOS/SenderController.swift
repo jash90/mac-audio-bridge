@@ -54,6 +54,17 @@ final class FrameStats: @unchecked Sendable {
     }
 }
 
+/// Holds the `RedundancyPacker` for the converter's frame callback. Only
+/// touched on the converter queue (the callback's only caller); a fresh box
+/// per streaming run.
+final class RedundancyPackerBox: @unchecked Sendable {
+    private var packer = RedundancyPacker()
+
+    func pack(_ frame: AudioPacket) -> [Data] {
+        packer.pack(frame)
+    }
+}
+
 /// One second of sender telemetry, appended as a JSON line to
 /// `~/Library/Logs/MacAudioBridge/sender-stats.jsonl`.
 private struct SenderStatsLine: Codable, Sendable {
@@ -399,8 +410,14 @@ final class SenderController: ObservableObject {
         frameStats.reset()
         // Both callbacks run on the converter queue: they are @Sendable, capture
         // only Sendable state (no self), and never touch UI state directly.
+        let packer = RedundancyPackerBox()
         converter.onFrame = { [udpSender, frameStats] packet in
-            udpSender.send(packet.encoded())
+            // Primary datagram first, then the delayed redundant copy (see
+            // AudioRedundancy); every datagram stays ≤ 1200 B (no IP
+            // fragmentation).
+            for datagram in packer.pack(packet) {
+                udpSender.send(datagram)
+            }
             frameStats.record(sequence: packet.sequence)
         }
         converter.onCaptureStalled = { [captureWarningMailbox] in
