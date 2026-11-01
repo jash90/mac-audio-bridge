@@ -28,6 +28,7 @@ struct SettingsView: View {
             Section {
                 if let active = sources.active, let status = active.status {
                     QualityPicker(sources: sources, sourceID: active.id, status: status)
+                    InternetQualityPicker(sources: sources, sourceID: active.id, status: status)
                     if let note = status.qualityNote {
                         Text(note)
                             .font(.footnote)
@@ -41,7 +42,7 @@ struct SettingsView: View {
             } header: {
                 Text("Sound")
             } footer: {
-                Text("Each Mac keeps its own quality. Over the internet the Mac caps it to save data.")
+                Text("Each Mac keeps its own qualities. Over the internet (Tailscale, cellular) the Internet quality applies; the MB/h are what it costs per hour.")
             }
 
             if FeatureFlags.phoneMicrophone {

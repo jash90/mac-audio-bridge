@@ -93,7 +93,7 @@ struct MicDatagramTests {
         #expect(ReceiverKeepalive.decode(mic) == nil)
         let playback = AudioPacket(codec: .opus, sequence: 1, sampleTime: 240, payload: Data(count: 120)).encoded()
         #expect(!MicDatagram.isMicDatagram(playback))
-        #expect(throws: AudioPacketError.unsupportedVersion(4)) { try MicDatagram.decode(playback) }
+        #expect(throws: AudioPacketError.unsupportedVersion(AudioDatagram.version)) { try MicDatagram.decode(playback) }
         #expect(!MicDatagram.isMicDatagram(ReceiverKeepalive.encode([])))
         var truncated = mic
         truncated.removeLast()
@@ -122,14 +122,14 @@ struct MicControlTests {
 
     @Test("Version gating: v4 is the mic version; a mic message under an older envelope is malformed")
     func versionGating() {
-        #expect(ControlProtocol.version == 4)
+        #expect(ControlProtocol.version == 5)
         #expect(ControlProtocol.micVersion == 4)
         #expect(ControlProtocol.mediaVersion == 2)
         for text in [#"{"v":3,"type":"micStart"}"#, #"{"v":3,"type":"micState","mic":{"armed":true,"sending":true,"muted":false}}"#, #"{"v":4,"type":"micState"}"#] {
             #expect(throws: ControlProtocolError.malformed) { try ControlMessage.decode(payload: Data(text.utf8)) }
         }
-        #expect(throws: ControlProtocolError.versionMismatch(5)) {
-            try ControlMessage.decode(payload: Data(#"{"v":5,"type":"micStart"}"#.utf8))
+        #expect(throws: ControlProtocolError.versionMismatch(6)) {
+            try ControlMessage.decode(payload: Data(#"{"v":6,"type":"micStart"}"#.utf8))
         }
         // Older messages keep their envelope versions.
         #expect(ControlMessage.connect.requiredVersion == 1)

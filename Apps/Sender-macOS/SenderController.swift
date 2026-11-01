@@ -205,6 +205,8 @@ final class SenderController: ObservableObject {
     @Published private(set) var manualHost: String
     /// Codec / bitrate picked in the menu (persisted under `streamQuality`).
     @Published private(set) var quality: StreamQuality
+    /// The Internet profile's quality (persisted under `internetQuality`).
+    @Published private(set) var internetQuality: InternetQuality
     /// Bytes sent per second (all datagrams), in kB/s, for the menu.
     @Published private(set) var kilobytesPerSecond: Double = 0
 
@@ -309,6 +311,8 @@ final class SenderController: ObservableObject {
     private static let manualAddressEnabledKey = "manualAddressEnabled"
     /// Shared with the menu's `@AppStorage("streamQuality")`.
     static let qualityKey = "streamQuality"
+    /// Shared with the menu's `@AppStorage("internetQuality")`.
+    static let internetQualityKey = "internetQuality"
 
     init() {
         // Persisted choices — read here so streaming can start at launch
@@ -320,7 +324,10 @@ final class SenderController: ObservableObject {
             .trimmingCharacters(in: .whitespaces)
         manualAddressEnabled = manualEnabled
         manualHost = host
-        quality = defaults.string(forKey: Self.qualityKey).flatMap(StreamQuality.init(rawValue:)) ?? .default
+        quality = defaults.string(forKey: Self.qualityKey).flatMap(StreamQuality.init(rawValue:))
+            .flatMap { StreamQuality.lanChoices.contains($0) ? $0 : nil } ?? .default
+        internetQuality = defaults.string(forKey: Self.internetQualityKey).flatMap(InternetQuality.init(rawValue:))
+            ?? .default
         let book = (defaults.dictionary(forKey: Self.tailnetAddressesKey) as? [String: [String]]) ?? [:]
         let chosenHost = defaults.string(forKey: Self.storedHostKey)
         tailnetBook = book
@@ -339,7 +346,7 @@ final class SenderController: ObservableObject {
                     uid: uid, name: defaults.string(forKey: Self.rememberedOutputNameKey) ?? uid,
                     isBuiltIn: false)
             })
-        converter.qualityGate.value = quality
+        converter.encodingGate.value = .lan(quality)
         udpSender.setMicEngine(micEngine)
         tailscaleMonitor = Self.makeTailscaleMonitor(controller: self)
         ownTailnetAddresses = InterfaceAddresses.tailnet()
@@ -407,9 +414,19 @@ final class SenderController: ObservableObject {
     /// also mid-stream (the receiver follows each frame's codec), and is
     /// persisted.
     func setQuality(_ newQuality: StreamQuality) {
-        guard newQuality != quality else { return }
+        guard newQuality != quality, StreamQuality.lanChoices.contains(newQuality) else { return }
         quality = newQuality
         UserDefaults.standard.set(newQuality.rawValue, forKey: Self.qualityKey)
+        applyEffectiveQuality()
+        remoteStateChanged()
+    }
+
+    /// The Internet quality was picked (menu or phone): applies from the next
+    /// frame while the stream runs the Internet profile, and is persisted.
+    func setInternetQuality(_ newQuality: InternetQuality) {
+        guard newQuality != internetQuality else { return }
+        internetQuality = newQuality
+        UserDefaults.standard.set(newQuality.rawValue, forKey: Self.internetQualityKey)
         applyEffectiveQuality()
         remoteStateChanged()
     }
@@ -817,7 +834,8 @@ final class SenderController: ObservableObject {
         let encoder = converter.encoderStats.take()
         let codecBitrate: Int
         switch encoder.codec {
-        case .opus?: codecBitrate = streamProfile.effectiveQuality(quality).opusBitrate ?? 0
+        case .opus?:
+            codecBitrate = streamProfile.effectiveQuality(lan: quality, internet: internetQuality).opusBitrate ?? 0
         case .pcm16?: codecBitrate = StreamQuality.pcm.payloadBitrate
         case nil: codecBitrate = 0
         }

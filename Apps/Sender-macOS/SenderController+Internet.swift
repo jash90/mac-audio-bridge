@@ -108,13 +108,14 @@ extension SenderController {
         }
     }
 
-    /// The encoded quality: the pick, capped on WAN (PCM → Opus 128).
+    /// The encoding: the LAN pick, or on WAN the Internet quality (20 ms
+    /// Opus frames with low-rate copies).
     func applyEffectiveQuality() {
-        let effective = streamProfile.effectiveQuality(quality)
-        if converter.qualityGate.value != effective {
-            converter.qualityGate.value = effective
+        let encoding = streamProfile.encoding(lan: quality, internet: internetQuality)
+        if converter.encodingGate.value != encoding {
+            converter.encodingGate.value = encoding
         }
-        let note = streamProfile.qualityNote(requested: quality)
+        let note = streamProfile.qualityNote(lan: quality, internet: internetQuality)
         if note != qualityNote {
             qualityNote = note
         }

@@ -188,6 +188,18 @@ final class SourcesModel: ObservableObject {
         clients[id]?.send(.setQuality(quality))
     }
 
+    /// The Internet quality — only to a Mac that speaks it (version 5; an
+    /// older Mac would close the session on the unknown envelope version).
+    func setInternetQuality(_ quality: InternetQuality, for id: String) {
+        guard supportsInternetQuality(id) else { return }
+        clients[id]?.send(.setInternetQuality(quality))
+    }
+
+    /// Whether the Mac `id` has the Internet quality ladder.
+    func supportsInternetQuality(_ id: String) -> Bool {
+        (macVersions[id] ?? 0) >= ControlProtocol.internetQualityVersion
+    }
+
     /// A playback command (in-app buttons, lock screen, Control Center,
     /// AirPods): to the active Mac's player when it takes commands,
     /// otherwise play / pause unmute / mute it.

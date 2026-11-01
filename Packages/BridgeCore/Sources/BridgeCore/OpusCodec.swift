@@ -2,20 +2,31 @@ import COpus
 import COpusShim
 import Foundation
 
-/// The stream quality picked in the Mac menu: what the sender encodes.
+/// One codec setting the sender can encode. The LAN picker offers
+/// `lanChoices` (5 ms frames); the Internet profile encodes the Opus rung of
+/// the `InternetQuality` ladder (20 ms frames, see `StreamEncoding`).
 public enum StreamQuality: String, CaseIterable, Sendable {
-    /// Opus, 192 kbit/s CBR (the default).
+    /// Opus, 192 kbit/s CBR (the LAN default).
     case opus192
     /// Opus, 128 kbit/s CBR.
     case opus128
+    /// Opus, 96 kbit/s CBR.
+    case opus96
+    /// Opus, 64 kbit/s CBR (Internet "Saver").
+    case opus64
+    /// Opus, 48 kbit/s CBR (Internet "Floor"; only at 20 ms frames).
+    case opus48
     /// Uncompressed PCM16 (1536 kbit/s), the fallback.
     case pcm
 
     public static let `default` = StreamQuality.opus192
 
+    /// What the LAN quality picker offers (Mac menu and phone).
+    public static let lanChoices: [StreamQuality] = [.opus192, .opus128, .opus96, .pcm]
+
     public var codec: AudioCodec {
         switch self {
-        case .opus192, .opus128: .opus
+        case .opus192, .opus128, .opus96, .opus64, .opus48: .opus
         case .pcm: .pcm16
         }
     }
@@ -25,6 +36,9 @@ public enum StreamQuality: String, CaseIterable, Sendable {
         switch self {
         case .opus192: 192_000
         case .opus128: 128_000
+        case .opus96: 96_000
+        case .opus64: 64_000
+        case .opus48: 48_000
         case .pcm: nil
         }
     }
@@ -36,9 +50,8 @@ public enum StreamQuality: String, CaseIterable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .opus192: "Opus 192 kbit/s"
-        case .opus128: "Opus 128 kbit/s"
         case .pcm: "PCM (uncompressed)"
+        default: "Opus \((opusBitrate ?? 0) / 1000) kbit/s"
         }
     }
 
@@ -52,13 +65,15 @@ public enum StreamQuality: String, CaseIterable, Sendable {
 
     /// What the receiver shows for a stream it plays: the codec and, for
     /// Opus, the bitrate derived from the frame size (the sender encodes
-    /// CBR, so payload bytes per 5 ms frame pin the bitrate exactly: 120 B
-    /// = 192 kbit/s, 80 B = 128 kbit/s).
-    public static func receiverDescription(codec: AudioCodec, payloadBytes: Int) -> String {
+    /// CBR, so payload bytes per frame pin the bitrate exactly: 120 B per
+    /// 5 ms = 192 kbit/s, 240 B per 20 ms = 96 kbit/s).
+    public static func receiverDescription(codec: AudioCodec, payloadBytes: Int, frameSlots: Int = 1) -> String {
         switch codec {
         case .opus:
-            let bitsPerSecond = payloadBytes * 8 * 1000 / AudioFormat.frameDurationMs
-            return "Opus \(Int((Double(bitsPerSecond) / 1000).rounded())) kbit/s"
+            let durationMs = AudioFormat.frameDurationMs * max(frameSlots, 1)
+            let bitsPerSecond = payloadBytes * 8 * 1000 / durationMs
+            let name = "Opus \(Int((Double(bitsPerSecond) / 1000).rounded())) kbit/s"
+            return frameSlots > 1 ? name + " · \(durationMs) ms" : name
         case .pcm16:
             return "PCM (uncompressed)"
         }
@@ -76,6 +91,8 @@ public enum OpusCodecError: Error, Equatable {
 public enum OpusSettings {
     /// The largest Opus packet for one frame (RFC 6716).
     public static let maxPacketBytes = 1275
+    /// Longest Opus frame the stream uses, in 5 ms slots (20 ms on WAN).
+    public static let maxFrameSlots = 4
     /// Encoder complexity: 10 (the maximum). A 5 ms CELT stereo frame costs
     /// tens of microseconds at 10 on Apple silicon (see the encode-cost
     /// test), far below the 5 ms budget.
@@ -160,8 +177,16 @@ public final class OpusEncoderBox: @unchecked Sendable {
     /// (nominally −1...1). The returned bytes live in the encoder's packet
     /// buffer and stay valid until the next call.
     public func encode(_ pcm: UnsafePointer<Float>) throws(OpusCodecError) -> UnsafeBufferPointer<UInt8> {
+        try encode(pcm, frames: Self.frameSamples)
+    }
+
+    /// Encodes one frame of `frames` samples per channel (an Opus frame
+    /// size: 240 = 5 ms or 960 = 20 ms). The frame size may change from one
+    /// call to the next within the same stream (each packet's TOC carries
+    /// it), so the decoder follows without a reset.
+    public func encode(_ pcm: UnsafePointer<Float>, frames: Int) throws(OpusCodecError) -> UnsafeBufferPointer<UInt8> {
         let count = opus_encode_float(
-            encoder, pcm, Int32(Self.frameSamples), packet, Int32(OpusSettings.maxPacketBytes))
+            encoder, pcm, Int32(frames), packet, Int32(OpusSettings.maxPacketBytes))
         guard count > 0 else { throw .encodeFailed(count) }
         return UnsafeBufferPointer(start: packet, count: Int(count))
     }
@@ -199,10 +224,19 @@ public final class OpusDecoderBox: @unchecked Sendable {
     public func decode(
         _ bytes: UnsafeRawPointer, count: Int, into out: UnsafeMutablePointer<Float>
     ) -> Int {
+        decode(bytes, count: count, into: out, maxFrames: Self.frameSamples)
+    }
+
+    /// Decodes one packet of up to `maxFrames` samples per channel (`out`
+    /// holds `maxFrames` interleaved stereo frames): a 20 ms packet needs
+    /// 960. Returns the decoded frames per channel or a negative error.
+    public func decode(
+        _ bytes: UnsafeRawPointer, count: Int, into out: UnsafeMutablePointer<Float>, maxFrames: Int
+    ) -> Int {
         Int(
             opus_decode_float(
                 decoder, bytes.assumingMemoryBound(to: UInt8.self), Int32(count), out,
-                Int32(Self.frameSamples), 0))
+                Int32(maxFrames), 0))
     }
 
     /// Opus packet-loss concealment for one missing 5 ms frame: continues the

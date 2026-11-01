@@ -154,8 +154,21 @@ public struct PlayoutFrame: Sendable, Equatable {
     public var skippedByteCount: Int
     /// Played from a redundant copy (the primary never arrived).
     public var recovered: Bool
-    /// Codec of the skipped frame (meaningful when `skippedByteCount > 0`).
+    /// Codec of the skipped frame (meaningful when `hasSkipped`).
     public var skippedCodec: AudioCodec = .pcm16
+    /// 5 ms slots of the coded frame this slot belongs to (4 for a 20 ms
+    /// Opus frame) and this slot's place in it: part 0 carries the payload,
+    /// parts 1... carry none (the reader serves them from the frame it
+    /// decoded at part 0).
+    public var frameSlots: Int = 1
+    public var part: Int = 0
+    /// The latency trim skipped the slot right before this one (its payload,
+    /// if it is a part 0, is in `skippedPayload`).
+    public var hasSkipped = false
+    public var skippedFrameSlots: Int = 1
+    public var skippedPart: Int = 0
+    /// Played from a low-rate redundant copy.
+    public var lowRateCopy = false
 }
 
 /// One playout slot from the realtime `pop(payload:skippedPayload:)`.
@@ -176,6 +189,8 @@ public struct JitterBufferStats: Sendable, Equatable {
     public var played = 0
     /// Frames played from a redundant copy because the primary never arrived.
     public var recovered = 0
+    /// Of `recovered`: slots played from a low-rate copy.
+    public var lowRateRecovered = 0
     /// Frames skipped at playout time because neither copy arrived in time.
     public var lost = 0
     /// Primary frames discarded because their playout slot had already passed.
@@ -288,6 +303,10 @@ public final class JitterBuffer: @unchecked Sendable {
         var slotLength = [Int](repeating: 0, count: JitterBuffer.slotCount)
         var slotCodec = [UInt8](repeating: 0, count: JitterBuffer.slotCount)
         var slotFlags = [UInt8](repeating: 0, count: JitterBuffer.slotCount)
+        /// Slots of the coded frame (1 / 2 / 4) and the slot's part in it.
+        var slotSpan = [UInt8](repeating: 1, count: JitterBuffer.slotCount)
+        var slotPart = [UInt8](repeating: 0, count: JitterBuffer.slotCount)
+        var slotLowRate = [Bool](repeating: false, count: JitterBuffer.slotCount)
         var bufferedCount = 0
         /// Newest sequence accepted since the reset.
         var newestSequence: UInt32?
@@ -444,14 +463,27 @@ public final class JitterBuffer: @unchecked Sendable {
 
         let index = Int(sequence & Self.slotMask)
         let kind = SlotKind(rawValue: state.slotKind[index]) ?? .empty
+        let span = min(max(packet.frameSlots, 1), Int(UInt8.max))
         if kind != .empty, state.slotSequence[index] == sequence {
             if redundant {
                 return nil  // primary (or an earlier copy) already here
             }
             if kind == .redundant {
-                // The primary was only late: it supersedes the copy, which
-                // then does not count as a recovery.
+                // The primary was only late: it supersedes the copy (whose
+                // low-rate payload it replaces), which then does not count
+                // as a recovery.
                 state.slotKind[index] = SlotKind.primary.rawValue
+                if packet.payload.count <= Self.maxFramePayloadBytes {
+                    writeSlot(&state, index, packet, part: 0, span: span)
+                }
+                for part in 1..<max(span, 1) {
+                    let partIndex = Int((sequence &+ UInt32(part)) & Self.slotMask)
+                    if state.slotKind[partIndex] == SlotKind.redundant.rawValue,
+                        state.slotSequence[partIndex] == sequence &+ UInt32(part)
+                    {
+                        state.slotKind[partIndex] = SlotKind.primary.rawValue
+                    }
+                }
                 return state.generation
             }
             state.counters.duplicates += 1
@@ -460,36 +492,27 @@ public final class JitterBuffer: @unchecked Sendable {
         if let expected = state.nextExpected, sequenceIsAfter(expected, sequence) {
             countLate(&state, redundant: redundant)
             // A late primary still feeds the estimator: its delay is real,
-            // and exactly what the target failed to cover.
+            // and exactly what the target failed to cover. A frame whose
+            // first slot has passed is dropped whole: its later slots could
+            // not be decoded without it.
             return redundant ? nil : state.generation
         }
         guard packet.payload.count <= Self.maxFramePayloadBytes else { return nil }
-        if kind != .empty {
-            // Ring collision with a frame 512 slots away: keep the newer one.
-            if sequenceIsAfter(sequence, state.slotSequence[index]) {
-                removeSlot(&state, index)
-                state.counters.overflowDropped += 1
-            } else {
-                state.counters.overflowDropped += 1
-                return nil
+        for part in 0..<span {
+            let slotSequence = sequence &+ UInt32(part)
+            let slotIndex = Int(slotSequence & Self.slotMask)
+            if part > 0, state.slotKind[slotIndex] != SlotKind.empty.rawValue,
+                state.slotSequence[slotIndex] == slotSequence
+            {
+                continue  // already held (an overlapping frame)
             }
-        }
-
-        state.slotSequence[index] = sequence
-        state.slotKind[index] = (redundant ? SlotKind.redundant : .primary).rawValue
-        state.slotSampleTime[index] = packet.sampleTime
-        state.slotLength[index] = packet.payload.count
-        state.slotCodec[index] = packet.codec.rawValue
-        state.slotFlags[index] = packet.flags.rawValue
-        let destination = payloads.slot(index)
-        packet.payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            if let source = raw.baseAddress, raw.count > 0 {
-                destination.copyMemory(from: source, byteCount: raw.count)
+            guard occupy(&state, slotIndex, sequence: slotSequence) else { continue }
+            state.slotKind[slotIndex] = (redundant ? SlotKind.redundant : .primary).rawValue
+            writeSlot(&state, slotIndex, packet, part: part, span: span)
+            state.bufferedCount += 1
+            if state.newestSequence.map({ sequenceIsAfter(slotSequence, $0) }) ?? true {
+                state.newestSequence = slotSequence
             }
-        }
-        state.bufferedCount += 1
-        if state.newestSequence.map({ sequenceIsAfter(sequence, $0) }) ?? true {
-            state.newestSequence = sequence
         }
 
         if state.overflowLimit > state.config.overflowFrames {
@@ -500,6 +523,39 @@ public final class JitterBuffer: @unchecked Sendable {
             dropOldest(&state, keeping: state.target)
         }
         return redundant ? nil : state.generation
+    }
+
+    /// Frees `index` for `sequence`: false when it holds a newer frame (ring
+    /// collision with a frame 512 slots away: keep the newer one).
+    private func occupy(_ state: inout State, _ index: Int, sequence: UInt32) -> Bool {
+        guard state.slotKind[index] != SlotKind.empty.rawValue else { return true }
+        state.counters.overflowDropped += 1
+        guard sequenceIsAfter(sequence, state.slotSequence[index]) else { return false }
+        removeSlot(&state, index)
+        return true
+    }
+
+    /// Fills slot `index` with part `part` of `packet` (the payload goes to
+    /// part 0 only); the slot kind is set by the caller.
+    private func writeSlot(_ state: inout State, _ index: Int, _ packet: AudioPacket, part: Int, span: Int) {
+        state.slotSequence[index] = packet.sequence &+ UInt32(part)
+        state.slotSampleTime[index] = packet.sampleTime &+ UInt64(part * AudioFormat.samplesPerFrame)
+        state.slotCodec[index] = packet.codec.rawValue
+        state.slotFlags[index] = part == 0 ? packet.flags.rawValue : 0
+        state.slotSpan[index] = UInt8(span)
+        state.slotPart[index] = UInt8(part)
+        state.slotLowRate[index] = packet.isRedundant && packet.isLowRateCopy
+        guard part == 0 else {
+            state.slotLength[index] = 0
+            return
+        }
+        state.slotLength[index] = packet.payload.count
+        let destination = payloads.slot(index)
+        packet.payload.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            if let source = raw.baseAddress, raw.count > 0 {
+                destination.copyMemory(from: source, byteCount: raw.count)
+            }
+        }
     }
 
     private func countLate(_ state: inout State, redundant: Bool) {
@@ -548,7 +604,8 @@ public final class JitterBuffer: @unchecked Sendable {
                     flags: AudioPacketFlags(rawValue: frame.flags.rawValue),
                     sequence: frame.sequence,
                     sampleTime: frame.sampleTime,
-                    payload: Data(bytes: payload.baseAddress!, count: frame.byteCount)))
+                    payload: Data(bytes: payload.baseAddress!, count: frame.byteCount),
+                    frameSlots: frame.frameSlots))
         case .lost(let sequence):
             return .lost(sequence: sequence)
         case .underrun:
@@ -587,12 +644,18 @@ public final class JitterBuffer: @unchecked Sendable {
         guard var expected = state.nextExpected else { return .buffering }
         var skippedBytes = 0
         var skippedCodec = AudioCodec.pcm16
+        var hasSkipped = false
+        var skippedSpan = 1
+        var skippedPart = 0
         if shouldTrim(&state, expected: expected) {
             // Skip the oldest frame (its successor is buffered too) and hand
             // it to the reader for the crossfade.
             let index = Int(expected & Self.slotMask)
             skippedBytes = copyOut(state, index, into: skippedPayload)
             skippedCodec = AudioCodec(rawValue: state.slotCodec[index]) ?? .pcm16
+            hasSkipped = true
+            skippedSpan = Int(state.slotSpan[index])
+            skippedPart = Int(state.slotPart[index])
             removeSlot(&state, index)
             state.counters.trimmed += 1
             expected = expected &+ 1
@@ -613,6 +676,7 @@ public final class JitterBuffer: @unchecked Sendable {
             state.waiting = false
             state.growFrames = 0
             let recovered = state.slotKind[index] == SlotKind.redundant.rawValue
+            let lowRate = recovered && state.slotLowRate[index]
             let frame = PlayoutFrame(
                 sequence: expected,
                 sampleTime: state.slotSampleTime[index],
@@ -621,13 +685,22 @@ public final class JitterBuffer: @unchecked Sendable {
                 byteCount: copyOut(state, index, into: payload),
                 skippedByteCount: skippedBytes,
                 recovered: recovered,
-                skippedCodec: skippedCodec)
+                skippedCodec: skippedCodec,
+                frameSlots: Int(state.slotSpan[index]),
+                part: Int(state.slotPart[index]),
+                hasSkipped: hasSkipped,
+                skippedFrameSlots: skippedSpan,
+                skippedPart: skippedPart,
+                lowRateCopy: lowRate)
             removeSlot(&state, index)
             state.consecutiveEmptyPops = 0
             state.inUnderrun = false
             state.counters.played += 1
             if recovered {
                 state.counters.recovered += 1
+            }
+            if lowRate {
+                state.counters.lowRateRecovered += 1
             }
             state.nextExpected = expected &+ 1
             return .frame(frame)

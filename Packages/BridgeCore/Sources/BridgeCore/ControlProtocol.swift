@@ -18,7 +18,9 @@ import Foundation
 /// (see MediaControl.swift) and `SourceStatus.protocolVersion`; version 3
 /// adds the Internet-mode fields of hello / status (optional, so their
 /// envelopes stay `v: 1`); version 4 adds the phone microphone (`micStart`
-/// / `micStop` Mac → phone, `micState` phone → Mac). A malformed frame
+/// / `micStop` Mac → phone, `micState` phone → Mac); version 5 adds the
+/// Internet quality ladder (`setInternetQuality` phone → Mac,
+/// `SourceStatus.internetQuality`). A malformed frame
 /// is skipped (the length prefix keeps the stream in step); only an oversized
 /// or empty length is fatal, because the stream can no longer be trusted.
 ///
@@ -44,8 +46,8 @@ public enum ControlProtocol {
     /// Newest envelope version this build speaks (2: `media` / `nowPlaying`
     /// and `SourceStatus.protocolVersion`; 3: tailnet addresses, network and
     /// path, profile and data usage in hello / status; 4: the phone
-    /// microphone).
-    public static let version = 4
+    /// microphone; 5: the Internet quality ladder).
+    public static let version = 5
     /// Oldest envelope version still accepted.
     public static let minimumVersion = 1
     /// First version with playback control (`media` / `nowPlaying`): the
@@ -56,6 +58,9 @@ public enum ControlProtocol {
     /// `micStop` only to a phone that sent a `micState` (older peers close
     /// the session on an envelope version they do not know).
     public static let micVersion = 4
+    /// First version with the Internet quality ladder: the phone sends
+    /// `setInternetQuality` only to a Mac reporting at least this.
+    public static let internetQualityVersion = 5
     /// TCP port the Mac's control listener binds first (any free port if
     /// taken; Bonjour carries the real one).
     public static let preferredPort: UInt16 = 49_001
@@ -155,6 +160,8 @@ public struct SourceStatus: Codable, Equatable, Sendable {
     public var sessionBytes: Int?
     /// ≈ MB per hour at the current rate.
     public var megabytesPerHour: Double?
+    /// The Mac's Internet quality (version 5; nil from older Macs).
+    public var internetQuality: InternetQuality?
 
     public init(
         sourceID: String, name: String, sourceTag: UInt32, driverInstalled: Bool,
@@ -163,8 +170,9 @@ public struct SourceStatus: Codable, Equatable, Sendable {
         usedBy: String?, problem: String?, protocolVersion: Int? = ControlProtocol.version,
         tailnetAddresses: [String]? = nil, path: StreamPath? = nil,
         profile: StreamProfile? = nil, qualityNote: String? = nil, sessionBytes: Int? = nil,
-        megabytesPerHour: Double? = nil
+        megabytesPerHour: Double? = nil, internetQuality: InternetQuality? = nil
     ) {
+        self.internetQuality = internetQuality
         self.tailnetAddresses = tailnetAddresses
         self.path = path
         self.profile = profile
@@ -190,6 +198,14 @@ public struct SourceStatus: Codable, Equatable, Sendable {
 }
 
 extension StreamQuality: Codable {}
+
+extension SourceStatus {
+    /// What the stream to this phone actually encodes: the LAN pick, or the
+    /// Internet quality's rung on the Internet profile.
+    public var effectiveQuality: StreamQuality {
+        (profile ?? .lan).effectiveQuality(lan: quality, internet: internetQuality ?? .default)
+    }
+}
 
 /// The phone's microphone, as it reports it to the Mac it streams from
 /// (version 4, on change).
@@ -225,6 +241,8 @@ public enum ControlMessage: Equatable, Sendable {
     case setVolume(Float)
     case setMuted(Bool)
     case setQuality(StreamQuality)
+    /// Version 5: the Internet profile's quality.
+    case setInternetQuality(InternetQuality)
     /// Version 2: a playback command for the Mac's Now Playing app.
     case media(MediaCommand)
     /// Version 4: the phone's microphone state.
@@ -247,6 +265,7 @@ public enum ControlMessage: Equatable, Sendable {
         switch self {
         case .media, .nowPlaying: ControlProtocol.mediaVersion
         case .micState, .micStart, .micStop: ControlProtocol.micVersion
+        case .setInternetQuality: ControlProtocol.internetQualityVersion
         default: 1
         }
     }
@@ -260,6 +279,7 @@ public enum ControlMessage: Equatable, Sendable {
         case .setVolume: "setVolume"
         case .setMuted: "setMuted"
         case .setQuality: "setQuality"
+        case .setInternetQuality: "setInternetQuality"
         case .status: "status"
         case .claim: "claim"
         case .media: "media"
@@ -283,6 +303,7 @@ public enum ControlMessage: Equatable, Sendable {
         var media: MediaCommand?
         var nowPlaying: NowPlayingInfo?
         var mic: MicState?
+        var internetQuality: InternetQuality?
     }
 
     /// Only the version, decoded first so a newer envelope reports
@@ -300,6 +321,7 @@ public enum ControlMessage: Equatable, Sendable {
         case .setVolume(let volume): envelope.volume = volume
         case .setMuted(let muted): envelope.muted = muted
         case .setQuality(let quality): envelope.quality = quality
+        case .setInternetQuality(let quality): envelope.internetQuality = quality
         case .status(let status): envelope.status = status
         case .media(let command): envelope.media = command
         case .nowPlaying(let info): envelope.nowPlaying = info
@@ -352,6 +374,11 @@ public enum ControlMessage: Equatable, Sendable {
         case "setQuality":
             guard let quality = envelope.quality else { throw .malformed }
             return .setQuality(quality)
+        case "setInternetQuality":
+            guard envelope.v >= ControlProtocol.internetQualityVersion, let quality = envelope.internetQuality else {
+                throw .malformed
+            }
+            return .setInternetQuality(quality)
         case "status":
             guard let status = envelope.status else { throw .malformed }
             return .status(status)
