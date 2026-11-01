@@ -22,11 +22,18 @@ public enum ReceiverTarget: Hashable, Sendable {
 /// monotonic clock. Output: `target` (nil = nothing to stream to) and
 /// `status` for the menu.
 ///
-/// Precedence: a stored selection always wins (and while it is not visible
-/// the status is `.looking`, never a fallback to something else); with no
-/// stored selection, a single visible receiver is picked automatically (and
-/// stays picked while visible, even if more appear); the manual host is used
-/// only when no service is selected that way.
+/// Precedence: an explicitly chosen host (a typed address or a Tailscale
+/// peer picked in the menu) wins; then a stored selection (while it is not
+/// visible the status is `.looking`, never a fallback to something else);
+/// with no stored selection, a single visible receiver is picked
+/// automatically (and stays picked while visible, even if more appear); the
+/// manual host is used only when no service is selected that way.
+///
+/// Internet mode: a receiver whose tailnet addresses are known
+/// (`remoteReachable`) stays a valid target while Bonjour cannot see it —
+/// the sender's `PathFailover` then streams to its tailnet address. With
+/// nothing visible and exactly one such receiver, it is picked
+/// automatically.
 ///
 /// A service target that vanishes from the browse results is kept for
 /// `serviceLossGrace` seconds: a receiver app restart deregisters and
@@ -53,6 +60,10 @@ public struct ReceiverSelection: Equatable, Sendable {
     public private(set) var visibleServices: [String] = []
     public private(set) var storedSelection: String?
     public private(set) var manualHost: String
+    /// Host chosen explicitly (overrides every Bonjour receiver).
+    public private(set) var storedHost: String?
+    /// Receivers reachable without Bonjour (tailnet addresses known).
+    public private(set) var remoteReachable: Set<String> = []
     public private(set) var target: ReceiverTarget?
     public private(set) var status: Status = .noReceiver
     /// When the current service target dropped out of the browse results.
@@ -61,11 +72,15 @@ public struct ReceiverSelection: Equatable, Sendable {
     public init(
         storedSelection: String?,
         manualHost: String,
+        storedHost: String? = nil,
+        remoteReachable: Set<String> = [],
         serviceLossGrace: TimeInterval = ReceiverSelection.defaultServiceLossGrace,
         now: TimeInterval
     ) {
         self.storedSelection = Self.normalized(storedSelection)
         self.manualHost = manualHost.trimmingCharacters(in: .whitespaces)
+        self.storedHost = Self.normalized(storedHost?.trimmingCharacters(in: .whitespaces))
+        self.remoteReachable = remoteReachable
         self.serviceLossGrace = serviceLossGrace
         recompute(now: now)
     }
@@ -76,9 +91,27 @@ public struct ReceiverSelection: Equatable, Sendable {
         recompute(now: now)
     }
 
-    /// The user picked a receiver (nil = automatic).
+    /// The user picked a receiver (nil = automatic). Clears a chosen host.
     public mutating func select(_ name: String?, now: TimeInterval) {
         storedSelection = Self.normalized(name)
+        storedHost = nil
+        recompute(now: now)
+    }
+
+    /// The user chose a host explicitly (nil = back to the receivers).
+    /// Clears the stored receiver selection.
+    public mutating func selectHost(_ host: String?, now: TimeInterval) {
+        storedHost = Self.normalized(host?.trimmingCharacters(in: .whitespaces))
+        if storedHost != nil {
+            storedSelection = nil
+        }
+        recompute(now: now)
+    }
+
+    /// Receivers whose tailnet addresses are known.
+    public mutating func updateRemoteReachable(_ names: Set<String>, now: TimeInterval) {
+        guard names != remoteReachable else { return }
+        remoteReachable = names
         recompute(now: now)
     }
 
@@ -101,8 +134,14 @@ public struct ReceiverSelection: Equatable, Sendable {
             return false
         }()
 
+        if let host = storedHost {
+            set(.host(host), automatic: false, now: now)
+            return
+        }
         if let stored = storedSelection {
-            if isVisible(stored) || keepsMissingService(stored, previous: previous, now: now) {
+            if isVisible(stored) || keepsMissingService(stored, previous: previous, now: now)
+                || remoteReachable.contains(stored)
+            {
                 set(.service(stored), automatic: false, now: now)
             } else {
                 clear(.looking(stored))
@@ -114,12 +153,17 @@ public struct ReceiverSelection: Equatable, Sendable {
         // (or within the grace), even when a second one appears.
         if previousWasAutomatic, case .service(let current)? = previous,
             isVisible(current) || keepsMissingService(current, previous: previous, now: now)
+                || remoteReachable.contains(current)
         {
             set(.service(current), automatic: true, now: now)
             return
         }
         if visibleServices.count == 1 {
             set(.service(visibleServices[0]), automatic: true, now: now)
+            return
+        }
+        if visibleServices.isEmpty, remoteReachable.count == 1, let only = remoteReachable.first {
+            set(.service(only), automatic: true, now: now)
             return
         }
         if !manualHost.isEmpty {

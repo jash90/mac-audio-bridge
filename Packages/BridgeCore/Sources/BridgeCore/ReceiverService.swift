@@ -13,7 +13,7 @@ public enum ReceiverService {
     public static let preferredPort: UInt16 = 49_000
     /// TXT key / value carrying the wire-protocol version.
     public static let versionKey = "v"
-    public static let protocolVersion = "3"  // AudioDatagram v3: 5 ms frames + redundancy + source tag
+    public static let protocolVersion = "4"  // AudioDatagram v4: v3 + grouped primaries + profile bit
     /// Name used when the device reports an empty name.
     public static let fallbackDeviceName = "iPhone"
     /// Length of the persisted random suffix that keeps the name unique.

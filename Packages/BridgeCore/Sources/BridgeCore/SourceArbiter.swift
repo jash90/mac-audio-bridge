@@ -112,6 +112,15 @@ public struct SourceArbiter: Equatable, Sendable {
         sources[id] = source
     }
 
+    /// A source reached by address (tailnet / typed in), not browsed:
+    /// listed without being marked visible; online once its control
+    /// connection is up.
+    public mutating func sourceKnown(id: String, name: String) {
+        if sources[id] == nil {
+            sources[id] = Source(id: id, name: name)
+        }
+    }
+
     public mutating func sourceVanished(id: String) {
         sources[id]?.visible = false
         refreshPresence(id)
