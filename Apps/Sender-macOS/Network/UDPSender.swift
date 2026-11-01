@@ -10,11 +10,14 @@ import Synchronization
 /// manual host on port 49000.
 ///
 /// Liveness: the receiver answers with a 16-byte "MABK" keepalive every
-/// 20 ms while packets arrive. A timer on the connection queue (every
-/// 500 ms, independent of the UI) feeds the keepalive / send timestamps into
-/// `ReceiverLiveness`; after 3 s of unanswered sends, or 3 s without a ready
-/// path, the connection is cancelled and recreated, which re-resolves the
-/// service — this is what follows the iPhone to a new DHCP address.
+/// 20 ms (200 ms on the WAN profile) while packets arrive; its flags byte
+/// says whether the phone's path is expensive. A timer on the connection
+/// queue (every 500 ms, independent of the UI) feeds the keepalive / send
+/// timestamps into `ReceiverLiveness`; after `livenessTimeout` (3 s, 5 s on
+/// WAN) of unanswered sends, or without a ready path, the connection is
+/// cancelled and recreated, which re-resolves the service — this is what
+/// follows the iPhone to a new DHCP address. The owner watches the
+/// reconnect count to fail over to another path (`PathFailover`).
 ///
 /// Thread-safety: `send` runs on the converter queue (one lock read plus
 /// relaxed atomics — no buffering, no extra hop: datagrams go straight to
@@ -30,12 +33,14 @@ final class UDPSender: @unchecked Sendable {
         var keepaliveAge: TimeInterval?
         /// Connections recreated by the liveness check since launch.
         var reconnects: Int
+        /// The resolved remote address of the ready connection.
+        var remoteAddress: String?
+        var remoteKind: NetworkAddressKind?
+        /// Flags of the latest keepalive (the phone's path).
+        var peerFlags: ReceiverKeepalive.Flags
     }
 
     private static let livenessCheckInterval: DispatchTimeInterval = .milliseconds(500)
-    /// First four bytes of the receiver keepalive ("MABK").
-    private static let keepaliveMagic: [UInt8] = [0x4D, 0x41, 0x42, 0x4B]
-    private static let keepaliveLength = 16
 
     /// User-interactive: the connection's I/O and callbacks run here, and a
     /// throttled queue would add its own pacing jitter to every datagram.
@@ -54,6 +59,9 @@ final class UDPSender: @unchecked Sendable {
     private var lastLinkState: ReceiverLiveness.State?
     private var reconnectCount = 0
     private var livenessTimer: DispatchSourceTimer?
+    private var livenessTimeout = ReceiverLiveness.defaultTimeout
+    private var remoteAddress: String?
+    private var remoteKind: NetworkAddressKind?
 
     /// Uptime (ns) of the last keepalive on the current connection, 0 = none.
     private let lastKeepaliveNanos = Atomic<UInt64>(0)
@@ -64,6 +72,8 @@ final class UDPSender: @unchecked Sendable {
     /// the stats log; relaxed readouts).
     private let sentDatagrams = Atomic<Int>(0)
     private let sentBytes = Atomic<Int>(0)
+    /// Flags byte of the latest keepalive.
+    private let peerFlags = Atomic<UInt8>(0)
 
     // MARK: - Control (main actor)
 
@@ -80,6 +90,11 @@ final class UDPSender: @unchecked Sendable {
                 startLivenessTimerLocked()
             }
         }
+    }
+
+    /// The keepalive timeout of the profile in use.
+    func setLivenessTimeout(_ seconds: TimeInterval) {
+        lock.withLock { livenessTimeout = seconds }
     }
 
     func cancel() {
@@ -123,7 +138,10 @@ final class UDPSender: @unchecked Sendable {
                 connectionState: connectionState,
                 link: connection == nil ? nil : lastLinkState,
                 keepaliveAge: connection == nil ? nil : keepaliveAge,
-                reconnects: reconnectCount)
+                reconnects: reconnectCount,
+                remoteAddress: connection == nil ? nil : remoteAddress,
+                remoteKind: connection == nil ? nil : remoteKind,
+                peerFlags: ReceiverKeepalive.Flags(rawValue: peerFlags.load(ordering: .relaxed)))
         }
     }
 
@@ -139,6 +157,8 @@ final class UDPSender: @unchecked Sendable {
         generation &+= 1
         lastKeepaliveNanos.store(0, ordering: .relaxed)
         unansweredSinceNanos.store(0, ordering: .relaxed)
+        remoteAddress = nil
+        remoteKind = nil
         guard let target else {
             connectionState = "none"
             return
@@ -189,6 +209,9 @@ final class UDPSender: @unchecked Sendable {
         case .ready:
             connectionState = "ready"
             isReady = true
+            if case .hostPort(let host, _)? = connection?.currentPath?.remoteEndpoint {
+                (remoteAddress, remoteKind) = Self.describe(host)
+            }
         case .waiting(let error):
             connectionState = "waiting"
             isReady = false
@@ -228,9 +251,10 @@ final class UDPSender: @unchecked Sendable {
         guard error == nil else { return }
         let current = lock.withLock { generation == self.generation }
         guard current else { return }
-        if let data, Self.isKeepalive(data) {
+        if let data, let flags = ReceiverKeepalive.decode(data) {
             lastKeepaliveNanos.store(Self.nowNanos(), ordering: .relaxed)
             unansweredSinceNanos.store(0, ordering: .relaxed)
+            peerFlags.store(flags.rawValue, ordering: .relaxed)
         }
         receiveLoop(on: connection, generation: generation)
     }
@@ -246,7 +270,8 @@ final class UDPSender: @unchecked Sendable {
                 connectionAge: Self.seconds(from: connectionStartNanos, to: now),
                 isReady: isReady,
                 keepaliveAge: keepalive == 0 ? nil : Self.seconds(from: keepalive, to: now),
-                unansweredSendAge: unanswered == 0 ? nil : Self.seconds(from: unanswered, to: now))
+                unansweredSendAge: unanswered == 0 ? nil : Self.seconds(from: unanswered, to: now),
+                timeout: livenessTimeout)
             if assessment.decision == .reconnect {
                 reconnectCount += 1
                 logger.info(
@@ -308,8 +333,20 @@ final class UDPSender: @unchecked Sendable {
 
     // MARK: - Helpers
 
-    private static func isKeepalive(_ data: Data) -> Bool {
-        data.count == keepaliveLength && data.prefix(keepaliveMagic.count).elementsEqual(keepaliveMagic)
+    /// Text and kind of a resolved address (scope suffix dropped).
+    private static func describe(_ host: NWEndpoint.Host) -> (String?, NetworkAddressKind?) {
+        switch host {
+        case .ipv4(let address):
+            let bytes = [UInt8](address.rawValue)
+            return (bytes.map(String.init).joined(separator: "."), NetworkAddress.kind(ipv4: bytes))
+        case .ipv6(let address):
+            let text = "\(address)".split(separator: "%").first.map(String.init)
+            return (text, NetworkAddress.kind(ipv6: [UInt8](address.rawValue)))
+        case .name(let name, _):
+            return (name, NetworkAddress.kind(name))
+        @unknown default:
+            return (nil, nil)
+        }
     }
 
     /// Monotonic uptime in nanoseconds (never 0 in practice; 0 is "none").

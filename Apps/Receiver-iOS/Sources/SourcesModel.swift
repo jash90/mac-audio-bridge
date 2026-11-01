@@ -9,6 +9,13 @@ import UIKit
 /// the receiver's audio gate in step with it. Also remembers the last used
 /// Mac, publishes the active Mac (name; its track from protocol v2) to Now
 /// Playing and routes playback commands to it (`MediaControlRouter`).
+///
+/// Internet mode: each Mac's status carries its tailnet addresses, stored
+/// per Mac. A `PathFailover` per Mac picks the control endpoint — the
+/// Bonjour service while the Mac is browsed, else its tailnet addresses and
+/// any address the user added ("Add Mac by address"). When the Mac is
+/// browsed again the connection moves back to the LAN. The hello tells the
+/// Mac this phone's tailnet addresses and whether its path is expensive.
 @MainActor
 final class SourcesModel: ObservableObject {
     /// The rows of the Sources list.
@@ -22,6 +29,15 @@ final class SourcesModel: ObservableObject {
     @Published private(set) var activeNowPlaying: NowPlayingInfo?
     /// The active Mac takes playback commands (play / pause / next / previous).
     @Published private(set) var activeCanControl = false
+    /// Addresses the user added; each one's Mac name once it answered.
+    @Published private(set) var manualHosts: [String] = []
+    @Published private(set) var manualHostNames: [String: String] = [:]
+    /// Addresses that could not be reached at the last attempt.
+    @Published private(set) var unreachableHosts: Set<String> = []
+    /// Sources whose control connection runs over a remote address.
+    @Published private(set) var remoteAddresses: [String: String] = [:]
+    /// The phone's network ("Wi-Fi", "Cellular", …) and whether it is metered.
+    @Published private(set) var network = NetworkMonitor.Snapshot(network: "Wi-Fi", isExpensive: false)
 
     private var arbiter: SourceArbiter
     private var mediaRouter = MediaControlRouter()
@@ -39,9 +55,35 @@ final class SourcesModel: ObservableObject {
     private var helloName = ""
     private let nowPlaying = NowPlayingPublisher()
     private let clockStart = ContinuousClock.now
+    private var networkMonitor: NetworkMonitor?
+    /// Each Mac's tailnet addresses (from its status), persisted by source ID.
+    private var macAddresses: [String: [String]]
+    /// Typed host → the source ID that answered on it, persisted.
+    private var hostOwners: [String: String]
+    /// Known names of Macs reachable by address only (for the list before
+    /// the first status of this launch).
+    private var knownNames: [String: String]
+    private var failovers: [String: PathFailover] = [:]
+    /// The path each current client was opened on.
+    private var clientPaths: [String: PathFailover.Path] = [:]
+    /// Clients that reached `.connected` (a disconnect after that is not a
+    /// failed attempt of the path, unless it went silent).
+    private var connectedClients: Set<String> = []
+    /// One-off clients for typed hosts not yet bound to a Mac.
+    private var probes: [String: ControlClient] = [:]
+    private var probeGenerations: [String: Int] = [:]
+    private var probeRetries: [String: Task<Void, Never>] = [:]
+    private var tailnetAddresses: [String] = []
 
     private static let lastIDKey = "lastSourceID"
     private static let lastNameKey = "lastSourceName"
+    private static let macAddressesKey = "macTailnetAddresses"
+    private static let manualHostsKey = "manualMacHosts"
+    private static let hostOwnersKey = "manualMacHostOwners"
+    private static let knownNamesKey = "remoteMacNames"
+    /// Retry cadence for a Mac reachable only by address (each failed probe
+    /// over the Internet costs a TCP connect timeout).
+    private static let remoteRetryDelay: Duration = .seconds(10)
     private static let phoneIDKey = "phoneID"
     private static let retryDelay: Duration = .seconds(2)
     /// Statuses arrive at least every 2 s; silence for this long = dead.
@@ -64,6 +106,13 @@ final class SourcesModel: ObservableObject {
             (id: id, name: defaults.string(forKey: Self.lastNameKey) ?? "Mac")
         }
         arbiter = SourceArbiter(lastUsed: lastUsed)
+        macAddresses = (defaults.dictionary(forKey: Self.macAddressesKey) as? [String: [String]]) ?? [:]
+        hostOwners = (defaults.dictionary(forKey: Self.hostOwnersKey) as? [String: String]) ?? [:]
+        knownNames = (defaults.dictionary(forKey: Self.knownNamesKey) as? [String: String]) ?? [:]
+        manualHosts = defaults.stringArray(forKey: Self.manualHostsKey) ?? []
+        for host in manualHosts {
+            if let id = hostOwners[host], let name = knownNames[id] { manualHostNames[host] = name }
+        }
         receiver.onSourceAdopted = Self.makeAdoptionHandler(model: self)
         receiver.setGateMode(arbiter.gateMode)
         publish()
@@ -77,10 +126,22 @@ final class SourcesModel: ObservableObject {
     func start() {
         guard browser == nil else { return }
         helloName = currentReceiverName()
+        tailnetAddresses = InterfaceAddresses.tailnet()
+        let monitor = Self.makeNetworkMonitor(model: self)
+        networkMonitor = monitor
+        monitor.start()
         let browser = Self.makeBrowser(model: self)
         self.browser = browser
         browser.start()
         nowPlaying.start(onCommand: Self.makeCommandHandler(model: self))
+        // Macs known by address: try them right away (Bonjour may never see them).
+        for id in remoteIDs() {
+            arbiter.sourceKnown(id: id, name: knownNames[id] ?? "Mac")
+            openClient(id)
+        }
+        for host in manualHosts where hostOwners[host] == nil {
+            openProbe(host)
+        }
         tickLoop = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
@@ -132,6 +193,155 @@ final class SourcesModel: ObservableObject {
         }
     }
 
+    // MARK: - Macs by address
+
+    /// "Add Mac by address": an IP or a host name (e.g. a Tailscale name).
+    func addManualHost(_ text: String) {
+        let host = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty, !manualHosts.contains(host) else { return }
+        manualHosts.append(host)
+        UserDefaults.standard.set(manualHosts, forKey: Self.manualHostsKey)
+        if let id = hostOwners[host] {
+            refreshFailover(id)
+            if clients[id] == nil { openClient(id) }
+        } else {
+            openProbe(host)
+        }
+    }
+
+    func removeManualHost(_ host: String) {
+        manualHosts.removeAll { $0 == host }
+        UserDefaults.standard.set(manualHosts, forKey: Self.manualHostsKey)
+        manualHostNames[host] = nil
+        unreachableHosts.remove(host)
+        probes[host]?.cancel()
+        probes[host] = nil
+        probeGenerations[host] = nil
+        probeRetries[host]?.cancel()
+        probeRetries[host] = nil
+        if let id = hostOwners.removeValue(forKey: host) {
+            UserDefaults.standard.set(hostOwners, forKey: Self.hostOwnersKey)
+            refreshFailover(id)
+            if clientPaths[id] == .remote(host) {
+                clients[id]?.cancel()
+            }
+        }
+    }
+
+    /// Sources with a remote address (stored tailnet IPs or a bound typed host).
+    private func remoteIDs() -> [String] {
+        let bound = manualHosts.compactMap { hostOwners[$0] }
+        return Array(Set(macAddresses.keys).union(bound)).sorted()
+    }
+
+    private func remoteCandidates(_ id: String) -> [String] {
+        let typed = manualHosts.filter { hostOwners[$0] == id }
+        return typed + (macAddresses[id] ?? [])
+    }
+
+    private func localAvailable(_ id: String) -> Bool {
+        arbiter.sources[id]?.visible == true && endpoints[id] != nil
+    }
+
+    /// Brings the source's failover up to date with Bonjour and the known
+    /// addresses (created on first use).
+    @discardableResult
+    private func refreshFailover(_ id: String) -> PathFailover {
+        let now = elapsed()
+        var failover = failovers[id]
+            ?? PathFailover(localAvailable: localAvailable(id), remoteAddresses: remoteCandidates(id), now: now)
+        failover.setLocalAvailable(localAvailable(id), now: now)
+        failover.setRemoteAddresses(remoteCandidates(id), now: now)
+        failover.tick(now: now)
+        failovers[id] = failover
+        return failover
+    }
+
+    private func endpoint(for path: PathFailover.Path?, id: String) -> NWEndpoint? {
+        switch path {
+        case .local?: return endpoints[id]
+        case .remote(let address)?: return ControlClient.endpoint(host: address)
+        case nil: return nil
+        }
+    }
+
+    private func openProbe(_ host: String) {
+        guard probes[host] == nil else { return }
+        nextGeneration += 1
+        let generation = nextGeneration
+        let client = ControlClient(
+            endpoint: ControlClient.endpoint(host: host),
+            onEvent: Self.makeProbeHandler(model: self, host: host, generation: generation))
+        probes[host] = client
+        probeGenerations[host] = generation
+        client.start(hello: hello())
+    }
+
+    /// A typed host answered (or not): the first status names its Mac, which
+    /// then gets a regular client choosing between LAN and this address.
+    private func probeEvent(_ event: ControlClient.Event, host: String, generation: Int) {
+        guard probeGenerations[host] == generation else { return }
+        switch event {
+        case .connected:
+            unreachableHosts.remove(host)
+        case .message(.status(let status)):
+            probes[host]?.cancel()
+            probes[host] = nil
+            probeGenerations[host] = nil
+            bind(host: host, to: status)
+        case .message:
+            break
+        case .incompatible:
+            probes[host]?.cancel()
+            unreachableHosts.insert(host)
+        case .disconnected:
+            probes[host] = nil
+            probeGenerations[host] = nil
+            guard manualHosts.contains(host), hostOwners[host] == nil else { return }
+            unreachableHosts.insert(host)
+            probeRetries[host]?.cancel()
+            probeRetries[host] = Task { [weak self] in
+                try? await Task.sleep(for: Self.remoteRetryDelay)
+                guard let self, !Task.isCancelled else { return }
+                self.probeRetries[host] = nil
+                if self.manualHosts.contains(host), self.hostOwners[host] == nil {
+                    self.openProbe(host)
+                }
+            }
+        }
+    }
+
+    private func bind(host: String, to status: SourceStatus) {
+        let id = status.sourceID
+        hostOwners[host] = id
+        UserDefaults.standard.set(hostOwners, forKey: Self.hostOwnersKey)
+        manualHostNames[host] = status.name
+        rememberName(status.name, for: id)
+        learnAddresses(status, id: id)
+        arbiter.sourceKnown(id: id, name: status.name)
+        refreshFailover(id)
+        if clients[id] == nil, retryTasks[id] == nil {
+            openClient(id)
+        }
+        apply([])
+    }
+
+    private func rememberName(_ name: String, for id: String) {
+        guard knownNames[id] != name else { return }
+        knownNames[id] = name
+        UserDefaults.standard.set(knownNames, forKey: Self.knownNamesKey)
+    }
+
+    /// Stores the Mac's tailnet addresses from its status.
+    private func learnAddresses(_ status: SourceStatus, id: String) {
+        let addresses = InterfaceAddresses.ordered((status.tailnetAddresses ?? []).filter(NetworkAddress.isTailnet))
+        guard !addresses.isEmpty, macAddresses[id] != addresses else { return }
+        macAddresses[id] = addresses
+        UserDefaults.standard.set(macAddresses, forKey: Self.macAddressesKey)
+        rememberName(status.name, for: id)
+        refreshFailover(id)
+    }
+
     // MARK: - Browser
 
     private func browseResults(_ found: [SourceBrowser.Found]) {
@@ -139,8 +349,14 @@ final class SourcesModel: ObservableObject {
         for item in found {
             arbiter.sourceSeen(id: item.id, name: item.name)
             endpoints[item.id] = item.endpoint
-            if clients[item.id] == nil, retryTasks[item.id] == nil {
+            let failover = refreshFailover(item.id)
+            if clients[item.id] == nil {
+                retryTasks[item.id]?.cancel()
+                retryTasks[item.id] = nil
                 openClient(item.id)
+            } else if failover.current == .local, clientPaths[item.id] != .local {
+                // Back on the Mac's LAN: move the control connection there.
+                clients[item.id]?.cancel()
             }
         }
         for (id, source) in arbiter.sources where source.visible && !visible.contains(id) {
@@ -148,6 +364,7 @@ final class SourcesModel: ObservableObject {
             if arbiter.sources[id]?.connected != true {
                 endpoints[id] = nil
             }
+            refreshFailover(id)
         }
         apply([])
     }
@@ -159,7 +376,14 @@ final class SourcesModel: ObservableObject {
     // MARK: - Control connections
 
     private func openClient(_ id: String) {
-        guard let endpoint = endpoints[id] else { return }
+        var path = refreshFailover(id).current
+        if path == .local, !localAvailable(id), !remoteCandidates(id).isEmpty {
+            // Not browsed any more (left the Mac's Wi-Fi): try the tailnet.
+            failovers[id]?.pathFailed(now: elapsed())
+            path = failovers[id]?.current
+        }
+        guard let endpoint = endpoint(for: path, id: id), let path else { return }
+        clientPaths[id] = path
         nextGeneration += 1
         let generation = nextGeneration
         let client = ControlClient(
@@ -177,12 +401,19 @@ final class SourcesModel: ObservableObject {
         case .connected:
             lastMessageAt[id] = elapsed()
             incompatibleIDs.remove(id)
+            connectedClients.insert(id)
+            failovers[id]?.pathAlive(now: elapsed())
+            publishRemoteAddress(id)
             arbiter.controlConnected(id: id)
             apply([])
         case .message(let message):
             lastMessageAt[id] = elapsed()
             switch message {
             case .status(let status):
+                if status.sourceID == id {
+                    rememberNameIfRemote(status.name, id: id)
+                    learnAddresses(status, id: id)
+                }
                 apply(arbiter.statusReceived(id: id, status))
             case .claim:
                 apply(arbiter.claimReceived(id: id))
@@ -195,32 +426,84 @@ final class SourcesModel: ObservableObject {
         case .incompatible:
             incompatibleIDs.insert(id)
         case .disconnected:
+            let failedPath = clientPaths[id]
+            let wasConnected = connectedClients.remove(id) != nil
+            let wentStale = lastMessageAt[id].map { elapsed() - $0 > Self.staleAfter } ?? false
             clients[id] = nil
             clientGenerations[id] = nil
+            clientPaths[id] = nil
             lastMessageAt[id] = nil
             mediaRouter.forget(id: id)
+            // A path that never connected, or went silent, failed; a clean
+            // close (Mac quit, LAN switch-back) did not.
+            let movingToLocal = failedPath != .local && refreshFailover(id).current == .local
+            if (!wasConnected || wentStale), !movingToLocal {
+                failovers[id]?.pathFailed(now: elapsed())
+            }
+            publishRemoteAddress(id)
             arbiter.controlDisconnected(id: id)
             apply([])
-            scheduleRetry(id)
+            scheduleRetry(id, after: failedPath)
         }
     }
 
-    /// Reconnects shortly while the Mac is still browsed.
-    private func scheduleRetry(_ id: String) {
+    /// Reconnects while the Mac is browsed or has a remote address: soon
+    /// when the path changed, every 10 s on the same remote path.
+    private func scheduleRetry(_ id: String, after failedPath: PathFailover.Path?) {
         retryTasks[id]?.cancel()
-        let delay = incompatibleIDs.contains(id) ? Duration.seconds(30) : Self.retryDelay
+        let next = refreshFailover(id).current
+        let delay: Duration
+        if incompatibleIDs.contains(id) {
+            delay = .seconds(30)
+        } else if next != failedPath, next != nil {
+            delay = .milliseconds(300)
+        } else if next?.isRemote == true {
+            delay = Self.remoteRetryDelay
+        } else {
+            delay = Self.retryDelay
+        }
         retryTasks[id] = Task { [weak self] in
             try? await Task.sleep(for: delay)
             guard let self, !Task.isCancelled else { return }
             self.retryTasks[id] = nil
-            if self.arbiter.sources[id]?.visible == true, self.clients[id] == nil {
+            let reachable = self.arbiter.sources[id]?.visible == true || !self.remoteCandidates(id).isEmpty
+            if reachable, self.clients[id] == nil {
                 self.openClient(id)
             }
         }
     }
 
+    private func rememberNameIfRemote(_ name: String, id: String) {
+        if !remoteCandidates(id).isEmpty { rememberName(name, for: id) }
+        for host in manualHosts where hostOwners[host] == id && manualHostNames[host] != name {
+            manualHostNames[host] = name
+        }
+    }
+
+    private func publishRemoteAddress(_ id: String) {
+        let address = connectedClients.contains(id) ? clientPaths[id]?.remoteAddress : nil
+        if remoteAddresses[id] != address { remoteAddresses[id] = address }
+    }
+
     private func hello() -> PhoneHello {
-        PhoneHello(phoneID: Self.phoneID, phoneName: helloName, receiverService: helloName)
+        PhoneHello(
+            phoneID: Self.phoneID, phoneName: helloName, receiverService: helloName,
+            tailnetAddresses: tailnetAddresses.isEmpty ? nil : tailnetAddresses,
+            network: network.network, expensivePath: network.isExpensive)
+    }
+
+    private func resendHello() {
+        let message = ControlMessage.hello(hello())
+        for client in clients.values {
+            client.send(message)
+        }
+    }
+
+    private func networkChanged(_ snapshot: NetworkMonitor.Snapshot) {
+        guard snapshot != network else { return }
+        network = snapshot
+        receiver.setExpensivePath(snapshot.isExpensive)
+        resendHello()
     }
 
     private func currentReceiverName() -> String {
@@ -289,11 +572,11 @@ final class SourcesModel: ObservableObject {
             apply([])
         }
         let name = currentReceiverName()
-        if name != helloName {
+        let addresses = InterfaceAddresses.tailnet()
+        if name != helloName || addresses != tailnetAddresses {
             helloName = name
-            for client in clients.values {
-                client.send(.hello(hello()))
-            }
+            tailnetAddresses = addresses
+            resendHello()
         }
     }
 
@@ -316,6 +599,24 @@ final class SourcesModel: ObservableObject {
                     MainActor.assumeIsolated { model?.browserStatusChanged(status) }
                 }
             })
+    }
+
+    nonisolated private static func makeNetworkMonitor(model: SourcesModel) -> NetworkMonitor {
+        NetworkMonitor { [weak model] snapshot in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { model?.networkChanged(snapshot) }
+            }
+        }
+    }
+
+    nonisolated private static func makeProbeHandler(
+        model: SourcesModel, host: String, generation: Int
+    ) -> @Sendable (ControlClient.Event) -> Void {
+        { [weak model] event in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { model?.probeEvent(event, host: host, generation: generation) }
+            }
+        }
     }
 
     nonisolated private static func makeClientHandler(
