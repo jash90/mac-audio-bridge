@@ -79,6 +79,15 @@ struct StatsLine: Codable, Sendable {
     var source: String
     /// Datagrams from non-active Macs dropped since launch.
     var foreignDropped: Int
+    /// M7i: "Wi-Fi", "Tailscale direct", "Tailscale relay", "Tailscale",
+    /// "Internet" — how the stream reaches the phone ("" = no stream).
+    var path: String
+    /// "lan" / "wan" (the sender's stream profile).
+    var profile: String
+    /// Audio UDP payload + per-datagram IP/UDP (and WireGuard) overhead
+    /// received this session, and the rolling rate.
+    var bytesTotal: Int
+    var mbPerHour: Double
 }
 
 /// Appends one JSON line per second to `Documents/stats.jsonl` on a utility

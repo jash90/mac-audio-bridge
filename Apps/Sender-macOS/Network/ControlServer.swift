@@ -34,9 +34,11 @@ enum SourceIdentity {
 }
 
 /// Advertises this Mac as `_macaudiosrc._tcp` (TXT `v`, `id`) and serves the
-/// phones' control connections (TCP, `ControlProtocol` frames). A failed
-/// listener is recreated. Connections from non-local addresses are closed
-/// at once (see the trust note in `ControlProtocol`).
+/// phones' control connections (TCP, `ControlProtocol` frames) on port
+/// 49001 (any free port if taken), so a phone off the LAN can reach it by
+/// tailnet address. A failed listener is recreated. Connections from
+/// addresses that are neither local nor tailnet are closed at once (see the
+/// trust note in `ControlProtocol`).
 ///
 /// All state is confined to `queue`; events reach the owner through the
 /// `@Sendable` callback (which hops to the main actor itself). `send` and
@@ -55,7 +57,11 @@ final class ControlServer: @unchecked Sendable {
         case status(Status)
         /// The name Bonjour actually registered (it renames on a conflict).
         case registeredName(String)
-        case opened(SessionID)
+        /// The TCP port the listener is bound to.
+        case listeningPort(UInt16)
+        /// A session opened; the peer's address kind (LAN / tailnet) tells
+        /// whether the phone reaches us locally.
+        case opened(SessionID, NetworkAddressKind)
         case message(SessionID, ControlMessage)
         case closed(SessionID)
     }
@@ -78,6 +84,9 @@ final class ControlServer: @unchecked Sendable {
     private var isRunning = false
     private var sessions: [SessionID: Session] = [:]
     private var nextSessionID: SessionID = 1
+    /// Port 49001 was taken: bind any port (Bonjour still finds us; typed
+    /// addresses then need the port the menu shows).
+    private var useAnyPort = false
 
     init(serviceName: String, onEvent: @escaping @Sendable (Event) -> Void) {
         self.serviceName = serviceName
@@ -125,7 +134,8 @@ final class ControlServer: @unchecked Sendable {
         generation &+= 1
         let newListener: NWListener
         do {
-            newListener = try Self.makeListener(serviceName: serviceName)
+            newListener = try Self.makeListener(
+                serviceName: serviceName, port: useAnyPort ? nil : ControlProtocol.preferredPort)
         } catch {
             logger.error("Control listener creation failed: \(error.localizedDescription, privacy: .public)")
             onEvent(.status(.failed(error.localizedDescription)))
@@ -155,6 +165,9 @@ final class ControlServer: @unchecked Sendable {
         switch state {
         case .ready:
             onEvent(.status(.advertising))
+            if let port = listener?.port?.rawValue {
+                onEvent(.listeningPort(port))
+            }
             logger.info("Control listener on port \(self.listener?.port?.rawValue ?? 0)")
         case .waiting(let error):
             onEvent(.status(Self.isPolicyDenied(error) ? .localNetworkDenied : .failed(error.localizedDescription)))
@@ -163,6 +176,9 @@ final class ControlServer: @unchecked Sendable {
             onEvent(.status(Self.isPolicyDenied(error) ? .localNetworkDenied : .failed(error.localizedDescription)))
             listener?.cancel()
             listener = nil
+            if case .posix(let code) = error, code == .EADDRINUSE {
+                useAnyPort = true
+            }
             scheduleRestart()
         default:
             break
@@ -183,8 +199,9 @@ final class ControlServer: @unchecked Sendable {
             connection.cancel()
             return
         }
-        guard Self.isLocal(connection.endpoint) else {
-            logger.notice("Rejected control connection from non-local \(String(describing: connection.endpoint), privacy: .public)")
+        let kind = Self.addressKind(connection.endpoint)
+        guard NetworkAddress.isTrustedForControl(kind) else {
+            logger.notice("Rejected control connection from untrusted \(String(describing: connection.endpoint), privacy: .public)")
             connection.cancel()
             return
         }
@@ -194,7 +211,7 @@ final class ControlServer: @unchecked Sendable {
         connection.stateUpdateHandler = Self.makeSessionStateHandler(server: self, id: id)
         connection.start(queue: queue)
         receive(on: connection, id: id)
-        onEvent(.opened(id))
+        onEvent(.opened(id, kind ?? .lan))
     }
 
     private func handleSessionState(_ state: NWConnection.State, id: SessionID) {
@@ -254,7 +271,7 @@ final class ControlServer: @unchecked Sendable {
 
     // MARK: - Nonisolated factories (capture only Sendable state)
 
-    nonisolated private static func makeListener(serviceName: String) throws -> NWListener {
+    nonisolated private static func makeListener(serviceName: String, port: UInt16?) throws -> NWListener {
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
         tcp.enableKeepalive = true
@@ -262,7 +279,12 @@ final class ControlServer: @unchecked Sendable {
         tcp.keepaliveInterval = 1
         tcp.keepaliveCount = 3
         let parameters = NWParameters(tls: nil, tcp: tcp)
-        let listener = try NWListener(using: parameters)
+        let listener: NWListener
+        if let port, let fixed = NWEndpoint.Port(rawValue: port) {
+            listener = try NWListener(using: parameters, on: fixed)
+        } else {
+            listener = try NWListener(using: parameters)
+        }
         listener.service = NWListener.Service(
             name: serviceName,
             type: ControlProtocol.serviceType,
@@ -326,13 +348,13 @@ final class ControlServer: @unchecked Sendable {
 
     // MARK: - Helpers
 
-    /// Whether the peer's address is on the local network.
-    static func isLocal(_ endpoint: NWEndpoint) -> Bool {
-        guard case .hostPort(let host, _) = endpoint else { return false }
+    /// The peer address's kind (nil = not an IP endpoint).
+    static func addressKind(_ endpoint: NWEndpoint) -> NetworkAddressKind? {
+        guard case .hostPort(let host, _) = endpoint else { return nil }
         switch host {
-        case .ipv4(let address): return LocalNetworkAddress.isLocal(ipv4: [UInt8](address.rawValue))
-        case .ipv6(let address): return LocalNetworkAddress.isLocal(ipv6: [UInt8](address.rawValue))
-        default: return false
+        case .ipv4(let address): return NetworkAddress.kind(ipv4: [UInt8](address.rawValue))
+        case .ipv6(let address): return NetworkAddress.kind(ipv6: [UInt8](address.rawValue))
+        default: return nil
         }
     }
 

@@ -26,7 +26,7 @@ struct MediaControlTests {
 
     @Test("Version 1 messages keep v:1 on the wire, the new ones carry v:2")
     func perMessageVersion() throws {
-        #expect(ControlProtocol.version == 2)
+        #expect(ControlProtocol.version == 3)
         for message in ControlProtocolTests.allMessages {
             #expect(message.requiredVersion == 1)
             let probe = try JSONSerialization.jsonObject(with: message.payload()) as? [String: Any]
@@ -38,7 +38,7 @@ struct MediaControlTests {
             == #"{"type":"nowPlaying","v":2}"#)
     }
 
-    @Test("A version 1 status (no protocolVersion) still decodes; a new status reports 2")
+    @Test("A version 1 status (no protocolVersion) still decodes; a new status reports the current version")
     func statusProtocolVersion() throws {
         var old = ControlProtocolTests.status
         old.protocolVersion = nil
@@ -49,7 +49,7 @@ struct MediaControlTests {
             return
         }
         #expect(decodedOld.protocolVersion == nil)
-        #expect(ControlProtocolTests.status.protocolVersion == 2)
+        #expect(ControlProtocolTests.status.protocolVersion == ControlProtocol.version)
     }
 
     @Test("Malformed media frames are rejected")

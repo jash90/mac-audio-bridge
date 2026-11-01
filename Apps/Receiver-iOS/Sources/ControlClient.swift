@@ -3,18 +3,21 @@ import Foundation
 import Network
 import os
 
-/// One control connection to one Mac (TCP to its `_macaudiosrc._tcp`
-/// service, so every new connection resolves the Mac's current address).
-/// Sends the hello on connect, then delivers decoded `ControlMessage`s. A
-/// connection whose resolved peer is not on the local network is refused.
-/// One-shot: after `.disconnected` the owner creates a new client.
+/// One control connection to one Mac: TCP to its `_macaudiosrc._tcp`
+/// service (every new connection resolves the Mac's current address), or to
+/// an address — the Mac's tailnet IP / a typed host — on the fixed control
+/// port. Sends the hello on connect, then delivers decoded `ControlMessage`s.
+/// A connection whose peer is not on the local network or the tailnet
+/// (`NetworkAddress.isTrustedForControl`) is refused. One-shot: after
+/// `.disconnected` the owner creates a new client.
 ///
 /// State is confined to `queue`; events go out through the `@Sendable`
 /// callback (the owner hops to the main actor). `send`/`cancel` may be
 /// called from any thread.
 final class ControlClient: @unchecked Sendable {
     enum Event: Sendable {
-        case connected
+        /// Ready; the peer's address class (nil: not reported).
+        case connected(NetworkAddressKind?)
         case message(ControlMessage)
         /// The Mac runs another protocol version (update one of the apps).
         case incompatible(Int)
@@ -31,6 +34,13 @@ final class ControlClient: @unchecked Sendable {
     private var isReady = false
     private var isFinished = false
     private var pendingHello: PhoneHello?
+
+    /// An address (IP or host name) on the Mac's fixed control port.
+    static func endpoint(host: String) -> NWEndpoint {
+        let trimmed = host.trimmingCharacters(in: CharacterSet(charactersIn: "[] "))
+        return .hostPort(
+            host: NWEndpoint.Host(trimmed), port: NWEndpoint.Port(rawValue: ControlProtocol.preferredPort)!)
+    }
 
     init(endpoint: NWEndpoint, onEvent: @escaping @Sendable (Event) -> Void) {
         self.onEvent = onEvent
@@ -65,8 +75,9 @@ final class ControlClient: @unchecked Sendable {
         guard !isFinished else { return }
         switch state {
         case .ready:
-            guard Self.isLocalPeer(connection) else {
-                logger.notice("Refusing a non-local source address")
+            let kind = Self.peerKind(connection)
+            guard Self.isTrusted(kind, endpoint: connection.endpoint) else {
+                logger.notice("Refusing a source address outside the LAN and the tailnet")
                 finish()
                 return
             }
@@ -74,7 +85,7 @@ final class ControlClient: @unchecked Sendable {
             if let hello = pendingHello {
                 connection.send(content: ControlMessage.hello(hello).frame(), completion: Self.makeSendCompletion())
             }
-            onEvent(.connected)
+            onEvent(.connected(kind))
             receive()
         case .waiting, .failed:
             // Refused / unreachable: the owner retries with a fresh client.
@@ -163,16 +174,25 @@ final class ControlClient: @unchecked Sendable {
         }
     }
 
-    /// The resolved peer address must be on the local network (a path
-    /// without a reported remote address is let through: it was resolved
-    /// from a link-local Bonjour browse).
-    private static func isLocalPeer(_ connection: NWConnection) -> Bool {
-        guard let remote = connection.currentPath?.remoteEndpoint else { return true }
-        guard case .hostPort(let host, _) = remote else { return false }
+    /// The connected peer's address class (nil when the path reports none).
+    private static func peerKind(_ connection: NWConnection) -> NetworkAddressKind? {
+        guard let remote = connection.currentPath?.remoteEndpoint,
+            case .hostPort(let host, _) = remote
+        else { return nil }
         switch host {
-        case .ipv4(let address): return LocalNetworkAddress.isLocal(ipv4: [UInt8](address.rawValue))
-        case .ipv6(let address): return LocalNetworkAddress.isLocal(ipv6: [UInt8](address.rawValue))
-        default: return false
+        case .ipv4(let address): return NetworkAddress.kind(ipv4: [UInt8](address.rawValue))
+        case .ipv6(let address): return NetworkAddress.kind(ipv6: [UInt8](address.rawValue))
+        case .name(let name, _): return NetworkAddress.kind(name)
+        @unknown default: return nil
         }
+    }
+
+    /// Trusted: a LAN / tailnet / loopback peer. A path without a reported
+    /// remote address is let through only for a Bonjour endpoint (resolved
+    /// from a link-local browse).
+    private static func isTrusted(_ kind: NetworkAddressKind?, endpoint: NWEndpoint) -> Bool {
+        if let kind { return NetworkAddress.isTrustedForControl(kind) }
+        if case .service = endpoint { return true }
+        return false
     }
 }

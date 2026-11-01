@@ -33,6 +33,11 @@ final class ReceiverModel: ObservableObject {
     @Published private(set) var engineRestarts = 0
     /// Datagrams dropped because another Mac is the active source.
     @Published private(set) var foreignCount = 0
+    /// Internet mode: how the stream arrives, its profile, and data use.
+    @Published private(set) var streamPath: StreamPath?
+    @Published private(set) var streamProfile: StreamProfile = .lan
+    @Published private(set) var sessionMegabytes: Double = 0
+    @Published private(set) var megabytesPerHour: Double = 0
 
     /// The Macs, the control connections and source arbitration.
     let sources: SourcesModel
@@ -53,6 +58,9 @@ final class ReceiverModel: ObservableObject {
     /// session keeps the app running.
     private var statsLoop: Task<Void, Never>?
     private var tick = 0
+    private var usageMeter = DataUsageMeter()
+    private var countedDatagrams = 0
+    private var countedBytes = 0
 
     init() {
         receiver = UDPReceiver(jitterBuffer: jitterBuffer)
@@ -103,11 +111,13 @@ final class ReceiverModel: ObservableObject {
     }
 
     /// Applies a latency-mode change immediately: the buffer resets and
-    /// prebuffers with the new target range.
+    /// prebuffers with the new target range (the WAN variant while the
+    /// stream runs the Internet profile).
     func setLatencyMode(_ mode: JitterLatencyMode) {
         guard mode != latencyMode else { return }
         latencyMode = mode
-        jitterBuffer.applyConfig(.latency(mode))
+        receiver.setLatencyMode(mode)
+        jitterBuffer.applyConfig(receiver.profile.jitterConfig(mode))
     }
 
     /// Pulls latency and loss snapshots for the UI — called 4×/s by the
@@ -141,6 +151,34 @@ final class ReceiverModel: ObservableObject {
         outputRoute = session.currentRoute.outputs.first?.portName
         engineRunning = playback.isEngineRunning
         engineRestarts = audio.engineRestarts
+        let profile = receiver.profile
+        if streamProfile != profile { streamProfile = profile }
+        let path = currentPath()
+        if streamPath != path { streamPath = path }
+    }
+
+    /// The Mac's view of the path while it streams to us (it knows direct
+    /// vs relay), else the class of the sender's address.
+    private func currentPath() -> StreamPath? {
+        guard (receiver.secondsSinceLastAudio() ?? .infinity) < 2 else { return nil }
+        if let status = sources.active?.status, status.streamingToYou, let path = status.path {
+            return path
+        }
+        return StreamPath.classify(remoteKind: receiver.currentSenderKind, tailscalePath: nil)
+    }
+
+    /// 1 Hz: datagrams and bytes received since the last call, with the
+    /// path's per-datagram overhead.
+    private func recordUsage() {
+        let datagrams = receiver.datagramCount
+        let bytes = receiver.byteCount
+        usageMeter.record(
+            datagrams: datagrams - countedDatagrams, payloadBytes: bytes - countedBytes,
+            path: streamPath ?? .local)
+        countedDatagrams = datagrams
+        countedBytes = bytes
+        sessionMegabytes = usageMeter.totalMegabytes
+        megabytesPerHour = usageMeter.megabytesPerHour
     }
 
     /// Writes one JSON line of telemetry to `Documents/stats.jsonl` — called
@@ -148,6 +186,7 @@ final class ReceiverModel: ObservableObject {
     /// crosses to the writer's utility queue.
     func logStats() {
         guard phase == .running else { return }
+        recordUsage()
         let stats = jitterBuffer.stats
         let session = AVAudioSession.sharedInstance()
         let outputSeconds = session.outputLatency + session.ioBufferDuration
@@ -201,7 +240,11 @@ final class ReceiverModel: ObservableObject {
                 decodeErrors: audio.concealment.decodeErrors,
                 opusPlcFrames: audio.concealment.opusPlcFrames,
                 source: sources.active?.name ?? "",
-                foreignDropped: receiver.foreignCount
+                foreignDropped: receiver.foreignCount,
+                path: streamPath?.displayName ?? "",
+                profile: streamProfile.statsName,
+                bytesTotal: usageMeter.totalBytes,
+                mbPerHour: (usageMeter.megabytesPerHour * 10).rounded() / 10
             )
         )
     }
@@ -255,6 +298,13 @@ struct ContentView: View {
 
                 SourcesView(model: model.sources)
 
+                if let path = model.streamPath {
+                    Text(streamSummary(path))
+                        .font(.footnote.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+
                 DisclosureGroup(isExpanded: $detailsExpanded) {
                     VStack(spacing: 16) {
                         address
@@ -286,6 +336,12 @@ struct ContentView: View {
         }
     }
 
+    /// "Tailscale direct · 12.3 MB · ≈199 MB/h · total ≈180 ms"
+    private func streamSummary(_ path: StreamPath) -> String {
+        "\(path.displayName) · \(String(format: "%.1f", model.sessionMegabytes)) MB · "
+            + "≈\(Int(model.megabytesPerHour.rounded())) MB/h · total ≈\(model.totalMilliseconds) ms"
+    }
+
     private var latencyPicker: some View {
         VStack(spacing: 4) {
             Text("Latency mode")
@@ -309,6 +365,9 @@ struct ContentView: View {
     private var stats: some View {
         VStack(spacing: 6) {
             statRow("Codec", model.codecDescription ?? "—")
+            statRow("Path", model.streamPath?.displayName ?? "—")
+            statRow("Profile", model.streamProfile.displayName)
+            statRow("Data", String(format: "%.1f MB · ≈%.0f MB/h", model.sessionMegabytes, model.megabytesPerHour))
             statRow("Buffer", "\(model.bufferMilliseconds) ms")
             statRow("Target", "\(model.targetMilliseconds) ms")
             statRow("Output", "\(model.outputMilliseconds) ms")

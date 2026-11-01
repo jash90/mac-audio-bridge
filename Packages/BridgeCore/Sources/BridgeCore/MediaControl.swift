@@ -295,7 +295,7 @@ public struct MediaControlRouter: Equatable, Sendable {
     /// Whether `source` takes playback commands from the phone.
     public func canControl(_ source: SourceArbiter.Source?) -> Bool {
         guard let source, source.connected, let status = source.status,
-            (status.protocolVersion ?? 1) >= 2,
+            (status.protocolVersion ?? 1) >= ControlProtocol.mediaVersion,
             let info = nowPlaying[source.id]
         else { return false }
         return info.canControl

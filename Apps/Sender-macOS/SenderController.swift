@@ -54,20 +54,37 @@ final class FrameStats: @unchecked Sendable {
     }
 }
 
+/// The stream profile (LAN / WAN) the packer marks and lays out datagrams
+/// with — set on the main actor, read per frame on the converter queue.
+final class ProfileGate: @unchecked Sendable {
+    private let raw = Atomic<UInt8>(StreamProfile.lan.rawValue)
+
+    var value: StreamProfile {
+        get { StreamProfile(rawValue: raw.load(ordering: .relaxed)) ?? .lan }
+        set { raw.store(newValue.rawValue, ordering: .relaxed) }
+    }
+}
+
 /// Holds the `RedundancyPacker` for the converter's frame callback. Only
 /// touched on the converter queue (the callback's only caller); a fresh box
 /// per streaming run.
 final class RedundancyPackerBox: @unchecked Sendable {
     private var packer = RedundancyPacker()
+    private let profileGate: ProfileGate
 
     /// `sourceTag` goes into every datagram, so the phone can tell this
     /// Mac's stream from another Mac's.
-    init(sourceTag: UInt32) {
+    init(sourceTag: UInt32, profileGate: ProfileGate) {
         packer.sourceTag = sourceTag
+        self.profileGate = profileGate
     }
 
+    /// A profile switch first sends the frames held for an incomplete WAN
+    /// group, so the sequence stays continuous across the switch.
     func pack(_ frame: AudioPacket) -> [Data] {
-        packer.pack(frame)
+        let flushed = packer.setProfile(profileGate.value)
+        let packed = packer.pack(frame)
+        return flushed.isEmpty ? packed : flushed + packed
     }
 }
 
@@ -119,6 +136,19 @@ private struct SenderStatsLine: Codable, Sendable {
     var avgPayloadBytes: Double
     /// p99 of the per-frame encode time in the last second, ms.
     var encodeMsP99: Double
+    /// Where the audio travels: "Wi-Fi", "Tailscale direct", "Tailscale
+    /// relay", "Tailscale", "Internet" ("" = not streaming).
+    var path: String
+    /// Stream profile: "lan" / "wan".
+    var profile: String
+    /// Concrete address streamed to (Bonjour service, or the tailnet IP the
+    /// failover picked).
+    var endpoint: String
+    /// Wire bytes this streaming session (payload + IP/UDP/WireGuard
+    /// header estimate per datagram).
+    var bytesTotal: Int
+    /// ≈ MB per hour at the rate of the last 10 s.
+    var mbPerHour: Double
 }
 
 /// Owns tap → frame converter → UDP sender and drives them from the virtual
@@ -178,6 +208,48 @@ final class SenderController: ObservableObject {
     /// Bytes sent per second (all datagrams), in kB/s, for the menu.
     @Published private(set) var kilobytesPerSecond: Double = 0
 
+    // MARK: Internet mode state (see SenderController+Internet.swift)
+
+    @Published var streamProfile: StreamProfile = .lan
+    @Published var streamPath: StreamPath = .local
+    /// Why the encoded quality differs from the pick (WAN cap).
+    @Published var qualityNote: String?
+    @Published var sessionMegabytes: Double = 0
+    @Published var megabytesPerHour: Double = 0
+    /// The concrete endpoint in use ("" = none): the service name or the
+    /// tailnet address the failover picked.
+    @Published var endpointName = ""
+    @Published var tailscaleState: TailscaleMonitor.State = .unknown
+    /// iOS peers of the tailnet (from `tailscale status`).
+    @Published var tailscalePeers: [TailscaleStatus.Peer] = []
+    /// Receivers whose tailnet addresses are known, sorted.
+    @Published var remoteReceivers: [String] = []
+    /// Host chosen explicitly in the menu (typed address / Tailscale peer).
+    @Published var storedHost: String?
+    @Published var controlPort: UInt16?
+    var tailscaleStatus: TailscaleStatus?
+    var tailscaleMonitor: TailscaleMonitor?
+    /// Receiver service → its tailnet addresses (from the phone's hello),
+    /// persisted under `tailnetAddressesKey`.
+    var tailnetBook: [String: [String]] = [:]
+    /// Receiver service → its phone reports an expensive path.
+    var phoneExpensive: [String: Bool] = [:]
+    /// Address kind of each control session's peer.
+    var sessionKinds: [ControlServer.SessionID: NetworkAddressKind] = [:]
+    var failover: PathFailover?
+    /// The logical target `failover` belongs to.
+    var failoverTarget: ReceiverTarget?
+    /// The concrete target the UDP sender is pointed at.
+    var concreteTarget: ReceiverTarget?
+    /// Reconnect count seen at the last failover check.
+    var lastReconnects = 0
+    var usageMeter = DataUsageMeter()
+    let profileGate = ProfileGate()
+    var ownTailnetAddresses: [String] = []
+    var menuOpen = false
+    static let tailnetAddressesKey = "tailnetAddresses"
+    static let storedHostKey = "receiverChosenHost"
+
     // MARK: Remote control state (see SenderController+Remote.swift)
 
     /// Phone currently controlling the stream (its control session targets
@@ -211,7 +283,7 @@ final class SenderController: ObservableObject {
     static let rememberedOutputUIDKey = "rememberedOutputUID"
     static let rememberedOutputNameKey = "rememberedOutputName"
 
-    private(set) var selection: ReceiverSelection
+    var selection: ReceiverSelection
     private(set) var activeTarget: ReceiverTarget?
     private var browser: ReceiverBrowser?
 
@@ -238,9 +310,16 @@ final class SenderController: ObservableObject {
         manualAddressEnabled = manualEnabled
         manualHost = host
         quality = defaults.string(forKey: Self.qualityKey).flatMap(StreamQuality.init(rawValue:)) ?? .default
+        let book = (defaults.dictionary(forKey: Self.tailnetAddressesKey) as? [String: [String]]) ?? [:]
+        let chosenHost = defaults.string(forKey: Self.storedHostKey)
+        tailnetBook = book
+        storedHost = chosenHost
+        remoteReceivers = book.keys.sorted()
         selection = ReceiverSelection(
             storedSelection: storedService,
             manualHost: manualEnabled ? host : "",
+            storedHost: chosenHost,
+            remoteReachable: Set(book.keys),
             now: Self.uptime())
         outputModel = OutputRestoreModel(
             bridgeUID: BridgeDevice.uid,
@@ -250,6 +329,8 @@ final class SenderController: ObservableObject {
                     isBuiltIn: false)
             })
         converter.qualityGate.value = quality
+        tailscaleMonitor = Self.makeTailscaleMonitor(controller: self)
+        ownTailnetAddresses = InterfaceAddresses.tailnet()
         // Bonjour browsing runs for the whole app lifetime, from launch.
         let browser = Self.makeBrowser(controller: self)
         self.browser = browser
@@ -317,7 +398,7 @@ final class SenderController: ObservableObject {
         guard newQuality != quality else { return }
         quality = newQuality
         UserDefaults.standard.set(newQuality.rawValue, forKey: Self.qualityKey)
-        converter.qualityGate.value = newQuality
+        applyEffectiveQuality()
         remoteStateChanged()
     }
 
@@ -332,6 +413,8 @@ final class SenderController: ObservableObject {
         } else {
             UserDefaults.standard.removeObject(forKey: Self.serviceNameKey)
         }
+        UserDefaults.standard.removeObject(forKey: Self.storedHostKey)
+        storedHost = nil
         selection.select(name, now: Self.uptime())
         evaluate()
     }
@@ -489,13 +572,36 @@ final class SenderController: ObservableObject {
         default:
             break
         }
+        updateInternetPath(snapshot: nil)
         remoteStateChanged()
     }
 
+    /// The logical target (receiver) changed: a fresh failover for it, then
+    /// the concrete endpoint goes to the UDP sender.
     private func setActiveTarget(_ target: ReceiverTarget?) {
         activeTarget = target
         activeReceiver = target?.displayName ?? ""
-        udpSender.setTarget(target)
+        if target != failoverTarget {
+            failoverTarget = target
+            failover = makeFailover(for: target)
+            lastReconnects = udpSender.linkSnapshot().reconnects
+        }
+        applyConcreteTarget()
+    }
+
+    /// Points the UDP sender at the failover's current path.
+    func applyConcreteTarget() {
+        let concrete = resolveConcreteTarget()
+        guard concrete != concreteTarget else { return }
+        concreteTarget = concrete
+        endpointName = concrete?.displayName ?? ""
+        udpSender.setTarget(concrete)
+    }
+
+    var linkSnapshot: UDPSender.LinkSnapshot { udpSender.linkSnapshot() }
+
+    func setLivenessTimeout(_ seconds: TimeInterval) {
+        udpSender.setLivenessTimeout(seconds)
     }
 
     private func startStreaming(target: ReceiverTarget, deviceID: AudioObjectID) {
@@ -529,7 +635,10 @@ final class SenderController: ObservableObject {
         frameStats.reset()
         // Both callbacks run on the converter queue: they are @Sendable, capture
         // only Sendable state (no self), and never touch UI state directly.
-        let packer = RedundancyPackerBox(sourceTag: SourceIdentity.tag)
+        usageMeter.reset()
+        sessionMegabytes = 0
+        megabytesPerHour = 0
+        let packer = RedundancyPackerBox(sourceTag: SourceIdentity.tag, profileGate: profileGate)
         converter.onFrame = { [udpSender, frameStats] packet in
             // Primary datagram first (Opus: carrying the previous 4 frames),
             // then any redundancy-only datagram (PCM16's delayed copy, see
@@ -557,6 +666,10 @@ final class SenderController: ObservableObject {
         udpSender.cancel()
         activeTarget = nil
         activeReceiver = ""
+        failover = nil
+        failoverTarget = nil
+        concreteTarget = nil
+        endpointName = ""
         link = nil
         tap.stop()
         if let activity = streamingActivity {
@@ -664,7 +777,9 @@ final class SenderController: ObservableObject {
         if link != snapshot.link {
             link = snapshot.link
         }
-        logStats(link: snapshot)
+        updateInternetPath(snapshot: snapshot)
+        refreshInternetHousekeeping()
+        logStats(link: udpSender.linkSnapshot())
     }
 
     /// Appends one JSON line of sender telemetry to
@@ -680,10 +795,15 @@ final class SenderController: ObservableObject {
         let droppedSamples = ring.droppedSampleCount
         let sent = udpSender.takeSentCounts()
         kilobytesPerSecond = mode == .streaming ? Double(sent.bytes) / 1000 : 0
+        if mode == .streaming {
+            usageMeter.record(datagrams: sent.datagrams, payloadBytes: sent.bytes, path: streamPath)
+            sessionMegabytes = usageMeter.totalMegabytes
+            megabytesPerHour = usageMeter.megabytesPerHour
+        }
         let encoder = converter.encoderStats.take()
         let codecBitrate: Int
         switch encoder.codec {
-        case .opus?: codecBitrate = quality.opusBitrate ?? 0
+        case .opus?: codecBitrate = streamProfile.effectiveQuality(quality).opusBitrate ?? 0
         case .pcm16?: codecBitrate = StreamQuality.pcm.payloadBitrate
         case nil: codecBitrate = 0
         }
@@ -708,7 +828,12 @@ final class SenderController: ObservableObject {
             codec: encoder.codec.map(StreamQuality.statsName) ?? "",
             bitrate: codecBitrate,
             avgPayloadBytes: (encoder.averagePayloadBytes * 10).rounded() / 10,
-            encodeMsP99: (encoder.encodeMsP99 * 1000).rounded() / 1000)
+            encodeMsP99: (encoder.encodeMsP99 * 1000).rounded() / 1000,
+            path: mode == .streaming ? streamPath.displayName : "",
+            profile: streamProfile.statsName,
+            endpoint: endpointName,
+            bytesTotal: usageMeter.totalBytes,
+            mbPerHour: usageMeter.megabytesPerHour)
         lastRingWriteCalls = writeCalls
         lastRingCapturedSamples = capturedSamples
         lastRingDroppedSamples = droppedSamples
