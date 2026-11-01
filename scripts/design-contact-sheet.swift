@@ -9,15 +9,15 @@ let directory = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? 
 
 /// Display order and caption for each screen-state-appearance suffix.
 let order: [(suffix: String, caption: String)] = [
-    ("home-wifi-light", "Home · Wi‑Fi · light"),
-    ("homescrolled-wifi-light", "Home, scrolled · Wi‑Fi"),
-    ("home-wifi-dark", "Home · Wi‑Fi · dark"),
-    ("home-cellular-dark", "Home · Tailscale relay on 5G"),
-    ("home-idle-light", "Home · no Mac connected"),
-    ("details-wifi-light", "Details · Wi‑Fi"),
-    ("detailsscrolled-wifi-light", "Details, scrolled · Wi‑Fi"),
-    ("details-cellular-dark", "Details · cellular · dark"),
-    ("sources-wifi-light", "Sources"),
+    ("now-wifi-light", "Now · Wi‑Fi · light"),
+    ("nowscrolled-wifi-light", "Now, scrolled · Wi‑Fi"),
+    ("now-wifi-dark", "Now · Wi‑Fi · dark"),
+    ("now-cellular-dark", "Now · Tailscale relay on 5G"),
+    ("now-idle-light", "Now · no Mac connected"),
+    ("sources-wifi-light", "Sources tab"),
+    ("details-wifi-light", "Details tab · Wi‑Fi"),
+    ("details-cellular-dark", "Details tab · cellular · dark"),
+    ("settings-wifi-light", "Settings tab"),
 ]
 
 let titles = [

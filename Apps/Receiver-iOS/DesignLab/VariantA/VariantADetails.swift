@@ -6,27 +6,18 @@ import SwiftUI
 struct VariantADetails: View {
     @ObservedObject var store: LabStore
     @Environment(\.labScrollAnchor) private var scrollAnchor
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if let link = store.link {
-                    content(link)
-                } else {
-                    ContentUnavailableView(
-                        "No Mac connected", systemImage: "waveform.slash",
-                        description: Text("Details appear while a Mac is playing to this iPhone."))
-                }
-            }
-            .navigationTitle("Connection")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
+        Group {
+            if let link = store.link {
+                content(link)
+            } else {
+                ContentUnavailableView(
+                    "No Mac connected", systemImage: "waveform.slash",
+                    description: Text("Details appear while a Mac is playing to this iPhone."))
             }
         }
+        .navigationTitle("Details")
     }
 
     private func content(_ link: LabLink) -> some View {

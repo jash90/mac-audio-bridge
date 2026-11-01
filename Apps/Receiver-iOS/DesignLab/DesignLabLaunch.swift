@@ -4,7 +4,7 @@ import SwiftUI
 /// UserDefaults entries (`-DesignLab A` → "DesignLab" = "A"), so:
 ///
 ///     -DesignLab <A|B|C> [-DesignState <wifi|cellular|idle>]
-///                        [-DesignScreen <home|details|sources>]
+///                        [-DesignScreen <home|sources|details|settings>]
 ///                        [-DesignAppearance <light|dark>]
 ///                        [-DesignScroll end]   (home/details open scrolled to the bottom)
 ///

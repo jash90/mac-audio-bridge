@@ -1,64 +1,69 @@
 import SwiftUI
 
-/// Variant C — "Glance". One screen, no scrolling: a big status orb that
-/// says how it sounds in one word and one number, one latency control, a
-/// glass control dock. Everything else lives in Details.
+/// Variant C — "Glance". The Now tab is one screen with no scrolling: a big
+/// status orb that says how it sounds in one word and one number, one
+/// latency control, a glass control dock. Sources, Details and Settings
+/// are tabs in the bottom Liquid Glass tab bar.
 struct VariantCRoot: View {
     @ObservedObject var store: LabStore
-    @State private var path: [LabScreen]
+    @State private var tab: LabScreen
 
     init(store: LabStore, initialScreen: LabScreen) {
         self.store = store
-        _path = State(initialValue: initialScreen == .home ? [] : [initialScreen])
+        _tab = State(initialValue: initialScreen)
     }
 
     var body: some View {
-        NavigationStack(path: $path) {
-            VariantCHome(store: store, path: $path)
-                .navigationDestination(for: LabScreen.self) { screen in
-                    switch screen {
-                    case .details: VariantCDetails(store: store)
-                    case .sources:
-                        LabSourcesList(store: store)
-                            .navigationTitle("Sources")
-                    case .home: EmptyView()
-                    }
+        TabView(selection: $tab) {
+            Tab("Now", systemImage: "circle.circle.fill", value: LabScreen.home) {
+                VariantCHome(store: store, tab: $tab)
+            }
+            Tab("Sources", systemImage: "laptopcomputer.and.iphone", value: LabScreen.sources) {
+                NavigationStack {
+                    LabSourcesList(store: store)
+                        .navigationTitle("Sources")
                 }
+            }
+            Tab("Details", systemImage: "chart.bar.doc.horizontal", value: LabScreen.details) {
+                NavigationStack { VariantCDetails(store: store) }
+            }
+            Tab("Settings", systemImage: "gearshape", value: LabScreen.settings) {
+                NavigationStack { LabSettingsForm(store: store) }
+            }
         }
     }
 }
 
 struct VariantCHome: View {
     @ObservedObject var store: LabStore
-    @Binding var path: [LabScreen]
+    @Binding var tab: LabScreen
 
     var body: some View {
         VStack(spacing: 0) {
             header
                 .padding(.top, 8)
-            Spacer(minLength: 12)
+            Spacer(minLength: 8)
             VariantCOrb(store: store)
-            Spacer(minLength: 12)
+            Spacer(minLength: 8)
             if store.isConnected {
                 nowPlaying
-                    .padding(.bottom, 18)
+                    .padding(.bottom, 14)
                 VariantCLatencyControl(store: store)
-                    .padding(.bottom, 16)
-                VariantCDock(store: store) { path.append(.details) }
+                    .padding(.bottom, 12)
+                VariantCDock(store: store)
             } else {
                 idleActions
             }
         }
         .padding(.horizontal, 20)
-        .padding(.bottom, 8)
+        .padding(.bottom, 12)
         .background { VariantCBackground(health: store.link?.health ?? .none) }
-        .toolbar(.hidden, for: .navigationBar)
     }
 
     private var header: some View {
         HStack {
             Button {
-                path.append(.sources)
+                tab = .sources
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: store.activeMac?.symbol ?? "laptopcomputer.slash")
@@ -123,7 +128,7 @@ struct VariantCHome: View {
                 .controlSize(.large)
             }
             Button {
-                path.append(.sources)
+                tab = .sources
             } label: {
                 Text("Other Macs")
                     .font(.headline)
@@ -180,10 +185,10 @@ struct VariantCOrb: View {
             Circle()
                 .fill(.clear)
                 .labGlassCircle()
-                .frame(width: 280, height: 280)
+                .frame(width: 244, height: 244)
             Circle()
                 .stroke(health.color.opacity(health == .none ? 0.25 : 0.6), lineWidth: 3)
-                .frame(width: 248, height: 248)
+                .frame(width: 216, height: 216)
             VStack(spacing: 10) {
                 HStack(alignment: .center, spacing: 4) {
                     ForEach(bars.indices, id: \.self) { index in
@@ -196,7 +201,7 @@ struct VariantCOrb: View {
                 if let link = store.link {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
                         Text("\(link.breakdown.totalMs)")
-                            .font(.system(size: 64, weight: .bold, design: .rounded))
+                            .font(.system(size: 56, weight: .bold, design: .rounded))
                             .monospacedDigit()
                         Text("ms")
                             .font(.title3.weight(.semibold))
@@ -270,10 +275,9 @@ struct VariantCLatencyControl: View {
     }
 }
 
-/// Bottom dock: volume + mute, quality, mic, details.
+/// Bottom dock: volume + mute, quality, mic.
 struct VariantCDock: View {
     @ObservedObject var store: LabStore
-    let openDetails: () -> Void
 
     var body: some View {
         VStack(spacing: 10) {
@@ -325,15 +329,6 @@ struct VariantCDock: View {
                     .labGlassCircle()
                     .accessibilityLabel(store.micMuted ? "Unmute microphone" : "Mute microphone")
                 }
-                Button(action: openDetails) {
-                    Label("Details", systemImage: "chart.bar.doc.horizontal")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
-                        .contentShape(.capsule)
-                }
-                .buttonStyle(.plain)
-                .labGlassCapsule()
             }
         }
     }
@@ -346,8 +341,9 @@ struct VariantCDock: View {
                 Image(systemName: store.micEnabled ? "mic.fill" : "mic.slash")
                     .foregroundStyle(store.micEnabled ? .red : .primary)
                 if store.micEnabled {
-                    LabLevelMeter(level: store.snapshot.mic.level, segments: 8, muted: store.micMuted)
-                        .frame(width: 56)
+                    Text(store.micMuted ? "Mic muted" : "Mic live")
+                    LabLevelMeter(level: store.snapshot.mic.level, segments: 10, muted: store.micMuted)
+                        .frame(width: 90)
                 } else {
                     Text("Talk through iPhone")
                         .lineLimit(1)

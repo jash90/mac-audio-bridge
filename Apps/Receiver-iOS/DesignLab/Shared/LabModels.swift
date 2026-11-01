@@ -13,11 +13,13 @@ enum LabScenario: String, CaseIterable, Sendable {
     case idle
 }
 
-/// Which screen a variant opens on.
+/// Which tab a variant opens on. Every variant has the same four tabs in a
+/// bottom tab bar: Now, Sources, Details, Settings.
 enum LabScreen: String, Sendable {
     case home
-    case details
     case sources
+    case details
+    case settings
 }
 
 /// How the audio reaches the phone.
