@@ -10,9 +10,12 @@ import Foundation
 ///        0      4   payload length n (big-endian, 1...maxFrameBytes)
 ///        4      n   UTF-8 JSON envelope {"v": 1, "type": "...", ...}
 ///
-/// The envelope's `v` is `ControlProtocol.version`; a frame of any other
-/// version is rejected with `versionMismatch` (both apps ship together, so
-/// there is no negotiation — the peer is told to update). A malformed frame
+/// The envelope's `v` is the version that introduced the message
+/// (`ControlMessage.requiredVersion`): version 1 messages still go out as
+/// `v: 1`, so a Mac on version 1 keeps working with a newer phone. A frame
+/// outside `minimumVersion...version` is rejected with `versionMismatch`
+/// (the peer is told to update). Version 2 adds `media` / `nowPlaying`
+/// (see MediaControl.swift) and `SourceStatus.protocolVersion`. A malformed frame
 /// is skipped (the length prefix keeps the stream in step); only an oversized
 /// or empty length is fatal, because the stream can no longer be trusted.
 ///
@@ -26,8 +29,10 @@ public enum ControlProtocol {
     public static let versionKey = "v"
     public static let idKey = "id"
     public static let txtVersion = "1"
-    /// Envelope version carried in every frame.
-    public static let version = 1
+    /// Newest envelope version this build speaks.
+    public static let version = 2
+    /// Oldest envelope version still accepted.
+    public static let minimumVersion = 1
     public static let lengthPrefixBytes = 4
     /// Largest accepted payload; real frames are a few hundred bytes.
     public static let maxFrameBytes = 64 * 1024
@@ -95,12 +100,14 @@ public struct SourceStatus: Codable, Equatable, Sendable {
     public var usedBy: String?
     /// Problem worth showing on the phone (driver missing, capture denied).
     public var problem: String?
+    /// The Mac's `ControlProtocol.version` (absent from version 1 Macs).
+    public var protocolVersion: Int?
 
     public init(
         sourceID: String, name: String, sourceTag: UInt32, driverInstalled: Bool,
         outputIsOurs: Bool, streamingToYou: Bool, streamingTo: String?, audioPlaying: Bool,
         outputDeviceName: String?, volume: Float, muted: Bool, quality: StreamQuality,
-        usedBy: String?, problem: String?
+        usedBy: String?, problem: String?, protocolVersion: Int? = ControlProtocol.version
     ) {
         self.sourceID = sourceID
         self.name = name
@@ -116,6 +123,7 @@ public struct SourceStatus: Codable, Equatable, Sendable {
         self.quality = quality
         self.usedBy = usedBy
         self.problem = problem
+        self.protocolVersion = protocolVersion
     }
 }
 
@@ -134,11 +142,23 @@ public enum ControlMessage: Equatable, Sendable {
     case setVolume(Float)
     case setMuted(Bool)
     case setQuality(StreamQuality)
+    /// Version 2: a playback command for the Mac's Now Playing app.
+    case media(MediaCommand)
     // Mac → phone
     case status(SourceStatus)
     /// The Mac's user just selected our output (an explicit Mac-side action):
     /// the phone makes this Mac active and releases the others.
     case claim
+    /// Version 2: what plays on the Mac (nil: nothing).
+    case nowPlaying(NowPlayingInfo?)
+
+    /// The envelope version that introduced this message.
+    public var requiredVersion: Int {
+        switch self {
+        case .media, .nowPlaying: 2
+        default: 1
+        }
+    }
 
     var type: String {
         switch self {
@@ -151,6 +171,8 @@ public enum ControlMessage: Equatable, Sendable {
         case .setQuality: "setQuality"
         case .status: "status"
         case .claim: "claim"
+        case .media: "media"
+        case .nowPlaying: "nowPlaying"
         }
     }
 
@@ -164,6 +186,8 @@ public enum ControlMessage: Equatable, Sendable {
         var muted: Bool?
         var quality: StreamQuality?
         var status: SourceStatus?
+        var media: MediaCommand?
+        var nowPlaying: NowPlayingInfo?
     }
 
     /// Only the version, decoded first so a newer envelope reports
@@ -174,7 +198,7 @@ public enum ControlMessage: Equatable, Sendable {
 
     /// The JSON payload of one frame (no length prefix).
     public func payload() -> Data {
-        var envelope = Envelope(v: ControlProtocol.version, type: type)
+        var envelope = Envelope(v: requiredVersion, type: type)
         switch self {
         case .hello(let hello): envelope.hello = hello
         case .release(let name): envelope.byName = name
@@ -182,6 +206,8 @@ public enum ControlMessage: Equatable, Sendable {
         case .setMuted(let muted): envelope.muted = muted
         case .setQuality(let quality): envelope.quality = quality
         case .status(let status): envelope.status = status
+        case .media(let command): envelope.media = command
+        case .nowPlaying(let info): envelope.nowPlaying = info
         case .connect, .disconnect, .claim: break
         }
         let encoder = JSONEncoder()
@@ -208,7 +234,7 @@ public enum ControlMessage: Equatable, Sendable {
         guard let probe = try? decoder.decode(VersionProbe.self, from: payload) else {
             throw .malformed
         }
-        guard probe.v == ControlProtocol.version else { throw .versionMismatch(probe.v) }
+        guard (ControlProtocol.minimumVersion...ControlProtocol.version).contains(probe.v) else { throw .versionMismatch(probe.v) }
         guard let envelope = try? decoder.decode(Envelope.self, from: payload) else {
             throw .malformed
         }
@@ -234,6 +260,11 @@ public enum ControlMessage: Equatable, Sendable {
             guard let status = envelope.status else { throw .malformed }
             return .status(status)
         case "claim": return .claim
+        case "media":
+            guard let command = envelope.media else { throw .malformed }
+            return .media(command)
+        case "nowPlaying":
+            return .nowPlaying(envelope.nowPlaying)
         default:
             throw .malformed
         }

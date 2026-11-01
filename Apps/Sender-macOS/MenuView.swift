@@ -37,6 +37,8 @@ struct MenuView: View {
 
             remoteStatus
 
+            MediaMenuSection(media: controller.media)
+
             if controller.defaultOutputIsOurs {
                 if controller.releasedHold {
                     Button("Resume streaming to iPhone") {

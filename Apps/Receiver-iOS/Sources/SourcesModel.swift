@@ -7,7 +7,8 @@ import UIKit
 /// the Macs, keeps one control connection to each, runs the pure
 /// `SourceArbiter`, carries out its effects (control messages) and keeps
 /// the receiver's audio gate in step with it. Also remembers the last used
-/// Mac and publishes the active Mac's name to Now Playing.
+/// Mac, publishes the active Mac (name; its track from protocol v2) to Now
+/// Playing and routes playback commands to it (`MediaControlRouter`).
 @MainActor
 final class SourcesModel: ObservableObject {
     /// The rows of the Sources list.
@@ -17,8 +18,13 @@ final class SourcesModel: ObservableObject {
     @Published private(set) var browserStatus: SourceBrowser.Status = .starting
     /// Sources running another protocol version.
     @Published private(set) var incompatibleIDs: Set<String> = []
+    /// What plays on the active Mac (protocol v2), nil when not known.
+    @Published private(set) var activeNowPlaying: NowPlayingInfo?
+    /// The active Mac takes playback commands (play / pause / next / previous).
+    @Published private(set) var activeCanControl = false
 
     private var arbiter: SourceArbiter
+    private var mediaRouter = MediaControlRouter()
     private let receiver: UDPReceiver
     private var browser: SourceBrowser?
     private var clients: [String: ControlClient] = [:]
@@ -112,13 +118,17 @@ final class SourcesModel: ObservableObject {
         clients[id]?.send(.setQuality(quality))
     }
 
-    /// Lock-screen play/pause: unmute / mute the active Mac.
-    private func lockScreenCommand(_ command: NowPlayingPublisher.Command) {
-        guard let active, let status = active.status else { return }
-        switch command {
-        case .play: setMuted(false, for: active.id)
-        case .pause: setMuted(true, for: active.id)
-        case .toggle: setMuted(!status.muted, for: active.id)
+    /// A playback command (in-app buttons, lock screen, Control Center,
+    /// AirPods): to the active Mac's player when it takes commands,
+    /// otherwise play / pause unmute / mute it.
+    func media(_ command: MediaCommand) {
+        switch mediaRouter.route(command, active: arbiter.active) {
+        case .mac(let id, let command):
+            clients[id]?.send(.media(command))
+        case .setMuted(let id, let muted):
+            setMuted(muted, for: id)
+        case .none:
+            break
         }
     }
 
@@ -176,6 +186,9 @@ final class SourcesModel: ObservableObject {
                 apply(arbiter.statusReceived(id: id, status))
             case .claim:
                 apply(arbiter.claimReceived(id: id))
+            case .nowPlaying(let info):
+                mediaRouter.nowPlayingReceived(id: id, info)
+                publish()
             default:
                 break  // phone → Mac messages are not expected here
             }
@@ -185,6 +198,7 @@ final class SourcesModel: ObservableObject {
             clients[id] = nil
             clientGenerations[id] = nil
             lastMessageAt[id] = nil
+            mediaRouter.forget(id: id)
             arbiter.controlDisconnected(id: id)
             apply([])
             scheduleRetry(id)
@@ -248,7 +262,15 @@ final class SourcesModel: ObservableObject {
         if sources != listed { sources = listed }
         if activeID != arbiter.activeID { activeID = arbiter.activeID }
         if lastUsedID != arbiter.lastUsedID { lastUsedID = arbiter.lastUsedID }
-        nowPlaying.update(sourceName: arbiter.active?.name, muted: arbiter.active?.status?.muted ?? false)
+        let active = arbiter.active
+        let track = active.flatMap { mediaRouter.nowPlaying[$0.id] }
+        let canControl = mediaRouter.canControl(active)
+        if activeNowPlaying != track { activeNowPlaying = track }
+        if activeCanControl != canControl { activeCanControl = canControl }
+        nowPlaying.update(
+            NowPlayingPublisher.Content(
+                sourceName: active?.name, muted: active?.status?.muted ?? false,
+                track: track, canControl: canControl))
     }
 
     /// 1 Hz: dead connections, an unknown stream gone silent, a renamed
@@ -316,10 +338,10 @@ final class SourcesModel: ObservableObject {
 
     nonisolated private static func makeCommandHandler(
         model: SourcesModel
-    ) -> @Sendable (NowPlayingPublisher.Command) -> Void {
+    ) -> @Sendable (MediaCommand) -> Void {
         { [weak model] command in
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { model?.lockScreenCommand(command) }
+                MainActor.assumeIsolated { model?.media(command) }
             }
         }
     }
