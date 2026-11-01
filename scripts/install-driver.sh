@@ -1,6 +1,7 @@
 #!/bin/bash
 # Installs the MacAudioBridge HAL driver — the virtual output device
-# "iPhone (Mac Audio Bridge)" that the sender streams from.
+# "iPhone (Mac Audio Bridge)" that the sender streams from, plus the virtual
+# microphone "iPhone Mic (Mac Audio Bridge)" and its hidden feeder device.
 #
 # Usage: ./scripts/install-driver.sh
 #
@@ -40,3 +41,6 @@ echo "Then pick \"iPhone (Mac Audio Bridge)\" as the output device in"
 echo "System Settings -> Sound (or the menu-bar volume menu) — it can take a"
 echo "few seconds to appear after the reload. The sender app streams once"
 echo "it is selected and an iPhone is found (or pick this Mac on the iPhone)."
+echo ""
+echo "The microphone \"iPhone Mic (Mac Audio Bridge)\" is listed as an input."
+echo "Self-test (from the repo): swift scripts/mic-loopback-check.swift"
