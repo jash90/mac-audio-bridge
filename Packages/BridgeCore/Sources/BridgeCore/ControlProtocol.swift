@@ -16,18 +16,29 @@ import Foundation
 /// is skipped (the length prefix keeps the stream in step); only an oversized
 /// or empty length is fatal, because the stream can no longer be trusted.
 ///
-/// Trust: local network only, no authentication (personal MVP). Both ends
-/// drop peers whose address is not local (`LocalNetworkAddress`); anyone on
-/// the same LAN can control a Mac's stream.
+/// Trust: no authentication of our own (personal MVP). Both ends drop peers
+/// whose address is neither local nor on the Tailscale tailnet
+/// (`NetworkAddress.isTrustedForControl`): anyone on the same LAN, and any
+/// device of the user's own tailnet (Tailscale authenticates its peers), can
+/// control a Mac's stream; everything else is refused.
+///
+/// Internet mode (version 2): the Mac listens on `preferredPort` so a phone
+/// can reach it by address (tailnet IP / MagicDNS name) without Bonjour;
+/// hello and status carry each side's tailnet addresses, learnt while both
+/// are on the same LAN and used for the failover.
 public enum ControlProtocol {
     public static let serviceType = "_macaudiosrc._tcp"
     public static let domain = "local."
     /// TXT keys / values.
     public static let versionKey = "v"
     public static let idKey = "id"
-    public static let txtVersion = "1"
-    /// Envelope version carried in every frame.
-    public static let version = 1
+    public static let txtVersion = "2"
+    /// Envelope version carried in every frame (2: tailnet addresses, path
+    /// and data usage in hello / status).
+    public static let version = 2
+    /// TCP port the Mac's control listener binds first (any free port if
+    /// taken; Bonjour carries the real one).
+    public static let preferredPort: UInt16 = 49_001
     public static let lengthPrefixBytes = 4
     /// Largest accepted payload; real frames are a few hundred bytes.
     public static let maxFrameBytes = 64 * 1024
@@ -60,11 +71,25 @@ public struct PhoneHello: Codable, Equatable, Sendable {
     public var phoneName: String
     /// The phone's `_macaudiobridge._udp` service name: where the Mac streams.
     public var receiverService: String
+    /// The phone's tailnet addresses (IPv4 first): where the Mac streams
+    /// when Bonjour cannot see the phone. Nil/empty = no Tailscale.
+    public var tailnetAddresses: [String]?
+    /// The phone's current network ("wifi", "cellular", "wired", "other").
+    public var network: String?
+    /// The phone's path is expensive (cellular, personal hotspot): the Mac
+    /// uses the WAN profile.
+    public var expensivePath: Bool?
 
-    public init(phoneID: String, phoneName: String, receiverService: String) {
+    public init(
+        phoneID: String, phoneName: String, receiverService: String,
+        tailnetAddresses: [String]? = nil, network: String? = nil, expensivePath: Bool? = nil
+    ) {
         self.phoneID = phoneID
         self.phoneName = phoneName
         self.receiverService = receiverService
+        self.tailnetAddresses = tailnetAddresses
+        self.network = network
+        self.expensivePath = expensivePath
     }
 }
 
@@ -95,13 +120,34 @@ public struct SourceStatus: Codable, Equatable, Sendable {
     public var usedBy: String?
     /// Problem worth showing on the phone (driver missing, capture denied).
     public var problem: String?
+    /// The Mac's tailnet addresses (IPv4 first); the phone keeps them to
+    /// reach the Mac over Tailscale.
+    public var tailnetAddresses: [String]?
+    /// Path of the audio stream to this phone (nil = not streaming to it).
+    public var path: StreamPath?
+    /// Profile of that stream.
+    public var profile: StreamProfile?
+    /// Why the stream's quality differs from `quality` (WAN cap).
+    public var qualityNote: String?
+    /// Wire bytes sent to this phone in the current streaming session.
+    public var sessionBytes: Int?
+    /// ≈ MB per hour at the current rate.
+    public var megabytesPerHour: Double?
 
     public init(
         sourceID: String, name: String, sourceTag: UInt32, driverInstalled: Bool,
         outputIsOurs: Bool, streamingToYou: Bool, streamingTo: String?, audioPlaying: Bool,
         outputDeviceName: String?, volume: Float, muted: Bool, quality: StreamQuality,
-        usedBy: String?, problem: String?
+        usedBy: String?, problem: String?, tailnetAddresses: [String]? = nil, path: StreamPath? = nil,
+        profile: StreamProfile? = nil, qualityNote: String? = nil, sessionBytes: Int? = nil,
+        megabytesPerHour: Double? = nil
     ) {
+        self.tailnetAddresses = tailnetAddresses
+        self.path = path
+        self.profile = profile
+        self.qualityNote = qualityNote
+        self.sessionBytes = sessionBytes
+        self.megabytesPerHour = megabytesPerHour
         self.sourceID = sourceID
         self.name = name
         self.sourceTag = sourceTag

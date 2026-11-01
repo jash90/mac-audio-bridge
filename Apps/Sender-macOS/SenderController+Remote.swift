@@ -31,10 +31,14 @@ extension SenderController {
         case .registeredName(let name):
             advertisedName = name
             remoteStateChanged(force: true)
-        case .opened(let id):
+        case .opened(let id, let kind):
             sessions[id] = .some(nil)
+            sessionKinds[id] = kind
+        case .listeningPort(let port):
+            if controlPort != port { controlPort = port }
         case .closed(let id):
             sessions[id] = nil
+            sessionKinds[id] = nil
             lastSentStatus[id] = nil
             remoteStateChanged()
         case .message(let id, let message):
@@ -48,9 +52,11 @@ extension SenderController {
             for (other, existing) in sessions where other != id && existing?.phoneID == hello.phoneID {
                 controlServer?.close(other)
                 sessions[other] = nil
+                sessionKinds[other] = nil
                 lastSentStatus[other] = nil
             }
             sessions[id] = .some(hello)
+            recordPhoneHello(hello)
             lastSentStatus[id] = nil
             sendPendingClaim()
             remoteStateChanged(force: true)
@@ -109,7 +115,7 @@ extension SenderController {
     private func phoneRelease(_ hello: PhoneHello, byName: String?) {
         let phoneTarget = ReceiverTarget.service(hello.receiverService)
         // A phone we are not streaming to cannot stop our stream elsewhere.
-        guard activeTarget == phoneTarget || selection.target == phoneTarget else {
+        guard activeTarget == phoneTarget || selection.target == phoneTarget || isStreaming(to: hello) else {
             remoteStateChanged(force: true)
             return
         }
@@ -194,7 +200,7 @@ extension SenderController {
     }
 
     private func makeStatus(for hello: PhoneHello) -> SourceStatus {
-        let streamingToPhone = mode == .streaming && activeTarget == .service(hello.receiverService)
+        let streamingToPhone = isStreaming(to: hello)
         let audioPlaying = mode == .streaming
             ? converter.audibility.audible(within: 1.5)
             : defaultOutputIsOurs && BridgeDevice.isRunningSomewhere()
@@ -212,7 +218,13 @@ extension SenderController {
             muted: deviceMuted,
             quality: quality,
             usedBy: usedBy,
-            problem: problem(for: hello))
+            problem: problem(for: hello),
+            tailnetAddresses: ownTailnetAddresses.isEmpty ? nil : ownTailnetAddresses,
+            path: streamingToPhone ? streamPath : nil,
+            profile: streamingToPhone ? streamProfile : nil,
+            qualityNote: streamingToPhone ? qualityNote : nil,
+            sessionBytes: streamingToPhone ? usageMeter.totalBytes : nil,
+            megabytesPerHour: streamingToPhone ? (megabytesPerHour * 10).rounded() / 10 : nil)
     }
 
     private func problem(for hello: PhoneHello) -> String? {

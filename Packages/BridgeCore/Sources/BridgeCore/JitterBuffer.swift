@@ -319,10 +319,16 @@ public final class JitterBuffer: @unchecked Sendable {
         var trimWindowMaxDepth = 0
         var trimPending = false
         var counters = JitterBufferStats()
+        /// Overflow resync threshold in effect: `config.overflowFrames`,
+        /// except right after a `retune` to a smaller limit than the current
+        /// depth — then it follows the depth down (the latency trim drains it
+        /// smoothly) instead of dropping the excess at once.
+        var overflowLimit: Int
 
         init(config: JitterBufferConfig) {
             self.config = config
             target = config.minTargetFrames
+            overflowLimit = config.overflowFrames
         }
     }
 
@@ -486,7 +492,11 @@ public final class JitterBuffer: @unchecked Sendable {
             state.newestSequence = sequence
         }
 
-        if state.bufferedCount > state.config.overflowFrames {
+        if state.overflowLimit > state.config.overflowFrames {
+            state.overflowLimit = max(
+                state.config.overflowFrames, min(state.overflowLimit, state.bufferedCount + Self.retuneOverflowSlack))
+        }
+        if state.bufferedCount > state.overflowLimit {
             dropOldest(&state, keeping: state.target)
         }
         return redundant ? nil : state.generation
@@ -689,9 +699,49 @@ public final class JitterBuffer: @unchecked Sendable {
         }
         lock.withLock { (state: inout State) in
             state.config = newConfig
+            state.overflowLimit = newConfig.overflowFrames
             state.target = newConfig.minTargetFrames
             self.resetPlayout(&state)
         }
+    }
+
+    /// Headroom above the current depth kept by a retune that lowers the
+    /// overflow limit (40 ms).
+    private static let retuneOverflowSlack = AudioFormat.frames(milliseconds: 40)
+
+    /// Swaps the configuration in place — no reset, no gap: the buffered
+    /// frames keep playing and the adaptive target is clamped into the new
+    /// range. A higher floor takes effect at the next stall (the cushion
+    /// grows inside that one concealment, as for any target rise); a lower
+    /// ceiling is reached by the latency trim's crossfaded skips, never by
+    /// dropping buffered audio at once. Used for the LAN ↔ WAN profile
+    /// switch (`StreamProfile.jitterConfig`).
+    public func retune(_ newConfig: JitterBufferConfig) {
+        precondition(newConfig.overflowFrames < Self.slotCount - 16, "overflowFrames exceeds the slot ring")
+        let target: Int = estimatorLock.withLock { (estimator: inout Estimator) -> Int in
+            let windowChanged = estimator.config.delayWindowSeconds != newConfig.delayWindowSeconds
+                || estimator.config.frameDuration != newConfig.frameDuration
+            estimator.config = newConfig
+            if windowChanged {
+                estimator.histogram = Estimator.makeHistogram(newConfig)
+            }
+            estimator.target = min(max(estimator.target, newConfig.minTargetFrames), newConfig.maxTargetFrames)
+            estimator.lowEstimateSince = nil
+            return estimator.target
+        }
+        lock.withLock { (state: inout State) in
+            let previousLimit = state.overflowLimit
+            state.config = newConfig
+            state.overflowLimit = max(
+                newConfig.overflowFrames,
+                min(previousLimit, state.bufferedCount + Self.retuneOverflowSlack))
+            state.target = target
+        }
+    }
+
+    /// The configuration in effect.
+    public var config: JitterBufferConfig {
+        lock.withLock { $0.config }
     }
 
     /// Current session statistics and buffer state.

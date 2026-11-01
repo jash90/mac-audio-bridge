@@ -45,20 +45,11 @@ final class UDPReceiver: @unchecked Sendable {
     private static let expectedPayloadBytes = AudioFormat.pcm16FrameBytes
     /// Accepted Opus packet sizes: one byte up to what a jitter-buffer slot holds.
     private static let opusPayloadBytes = 1...min(OpusSettings.maxPacketBytes, JitterBuffer.maxFramePayloadBytes)
-    /// Keepalive cadence, and how recently the last packet must have arrived
-    /// for keepalives to keep flowing ("while playing").
-    private static let keepaliveInterval: TimeInterval = 0.020
+    /// How recently the last packet must have arrived for keepalives to
+    /// keep flowing ("while playing"). The cadence follows the stream
+    /// profile: 20 ms on the LAN (radio wake-ups), 200 ms over the Internet
+    /// (liveness only — every byte counts on cellular).
     private static let keepaliveActivityWindow: TimeInterval = 1.0
-    /// 16-byte datagram, "MABK" magic + zeros. The sender drains and ignores
-    /// everything that is not a valid audio packet.
-    private static let keepalivePayload: Data = {
-        var data = Data(count: 16)
-        data[0] = 0x4D
-        data[1] = 0x41
-        data[2] = 0x42
-        data[3] = 0x4B
-        return data
-    }()
 
     private let jitterBuffer: JitterBuffer
     /// User-interactive: arrival timestamps are taken here, and a throttled
@@ -76,6 +67,17 @@ final class UDPReceiver: @unchecked Sendable {
     /// Arrival-clock epoch. `ContinuousClock` never goes backwards, which the
     /// jitter buffer's interarrival estimates rely on.
     private let clockStart = ContinuousClock.now
+    /// Latency mode the WAN / LAN jitter configs are built for (main actor writes).
+    private let latencyMode = Mutex(JitterLatencyMode.balanced)
+    /// The stream profile the sender marks its datagrams with (raw value).
+    private let profileValue = Atomic<UInt8>(StreamProfile.lan.rawValue)
+    /// Keepalive flags (expensive path), set from the network monitor.
+    private let keepaliveFlags = Atomic<UInt8>(0)
+    /// Accepted audio datagrams and their UDP payload bytes, since launch.
+    private let acceptedDatagrams = Atomic<Int>(0)
+    private let acceptedBytes = Atomic<Int>(0)
+    /// Address class of the sender whose datagrams were accepted last.
+    private let senderKind = Mutex<NetworkAddressKind?>(nil)
 
     /// An accepted sender connection, whether its path is ready (keepalive
     /// sends are dropped until it is), and when it last delivered a packet
@@ -83,6 +85,7 @@ final class UDPReceiver: @unchecked Sendable {
     private struct Peer {
         let connection: NWConnection
         let acceptedAt: TimeInterval
+        let kind: NetworkAddressKind?
         var isReady = false
         var lastPacketArrival: TimeInterval?
     }
@@ -104,6 +107,10 @@ final class UDPReceiver: @unchecked Sendable {
     /// consecutive packets since the last `takeMaxInterArrivalGapSeconds`.
     private var lastPacketArrival: TimeInterval?
     private var maxInterArrivalGap: TimeInterval = 0
+    /// Follows the profile mark of the newest datagram only (stragglers of
+    /// the previous profile do not flip it back).
+    private var profileFollower = ProfileFollower()
+    private var keepaliveInterval = StreamProfile.lan.keepaliveInterval
 
     init(jitterBuffer: JitterBuffer) {
         self.jitterBuffer = jitterBuffer
@@ -121,6 +128,30 @@ final class UDPReceiver: @unchecked Sendable {
     /// Datagrams dropped since launch because another source is active.
     var foreignCount: Int {
         foreignDatagrams.load(ordering: .relaxed)
+    }
+
+    /// The stream profile of the current stream (from the datagram marks).
+    var profile: StreamProfile {
+        StreamProfile(rawValue: profileValue.load(ordering: .relaxed)) ?? .lan
+    }
+
+    /// Accepted audio datagrams / UDP payload bytes since launch.
+    var datagramCount: Int { acceptedDatagrams.load(ordering: .relaxed) }
+    var byteCount: Int { acceptedBytes.load(ordering: .relaxed) }
+
+    /// Address class of the sender currently streaming (nil before any).
+    var currentSenderKind: NetworkAddressKind? { senderKind.withLock { $0 } }
+
+    /// Latency mode for profile retunes; the caller applies it to the buffer.
+    func setLatencyMode(_ mode: JitterLatencyMode) {
+        latencyMode.withLock { $0 = mode }
+    }
+
+    /// Tells the sender (in every keepalive) that this phone is on an
+    /// expensive path (cellular / hotspot), which selects the WAN profile.
+    func setExpensivePath(_ expensive: Bool) {
+        let flags: ReceiverKeepalive.Flags = expensive ? [.expensivePath] : []
+        keepaliveFlags.store(flags.rawValue, ordering: .relaxed)
     }
 
     /// Which source tags are let through (from the arbiter, main actor).
@@ -269,7 +300,8 @@ final class UDPReceiver: @unchecked Sendable {
     private func accept(_ connection: NWConnection) {
         connection.stateUpdateHandler = Self.makePeerStateHandler(receiver: self, connection: connection)
         connection.start(queue: queue)
-        peers.append(Peer(connection: connection, acceptedAt: elapsedSeconds()))
+        peers.append(Peer(
+            connection: connection, acceptedAt: elapsedSeconds(), kind: Self.addressKind(connection.endpoint)))
         receiveLoop(on: connection)
     }
 
@@ -307,7 +339,16 @@ final class UDPReceiver: @unchecked Sendable {
     ) {
         if let data, isComplete, ingest(data) {
             let arrival = lastPacketArrival
-            updatePeer(for: connection) { $0.lastPacketArrival = arrival }
+            var kind: NetworkAddressKind?
+            updatePeer(for: connection) {
+                $0.lastPacketArrival = arrival
+                kind = $0.kind
+            }
+            if kind != nil, kind != currentSenderKind {
+                senderKind.withLock { $0 = kind }
+            }
+            acceptedDatagrams.wrappingAdd(1, ordering: .relaxed)
+            acceptedBytes.wrappingAdd(data.count, ordering: .relaxed)
         }
         if let error {
             logger.error("Receive failed: \(error.localizedDescription, privacy: .public)")
@@ -352,10 +393,21 @@ final class UDPReceiver: @unchecked Sendable {
         var packets = datagram.packets()
         if newStream {
             // Another Mac's stream (or the first one): a fresh sequence
-            // space — reset the buffer, crossfade at the reader.
-            for index in packets.indices where !packets[index].isRedundant {
+            // space — reset the buffer (once: on the oldest primary of the
+            // group), crossfade at the reader.
+            if let index = packets.firstIndex(where: { !$0.isRedundant }) {
                 packets[index].flags.insert(.discontinuity)
             }
+            profileFollower.reset()
+        }
+        if let profile = profileFollower.observe(datagram.profile, sequence: datagram.sequence) {
+            // LAN ↔ WAN: retune in place (no reset, no audible switch),
+            // before this datagram's frames go in.
+            let mode = latencyMode.withLock { $0 }
+            jitterBuffer.retune(profile.jitterConfig(mode))
+            profileValue.store(profile.rawValue, ordering: .relaxed)
+            setKeepaliveInterval(profile.keepaliveInterval)
+            logger.info("Stream profile: \(profile.displayName, privacy: .public)")
         }
         if packets.contains(where: { !$0.isRedundant }) {
             if let last = lastPacketArrival {
@@ -379,12 +431,18 @@ final class UDPReceiver: @unchecked Sendable {
         guard receiverKeepaliveEnabled, keepaliveTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(
-            deadline: .now() + Self.keepaliveInterval,
-            repeating: Self.keepaliveInterval
+            deadline: .now() + keepaliveInterval,
+            repeating: keepaliveInterval
         )
         timer.setEventHandler(handler: Self.makeKeepaliveHandler(receiver: self))
         timer.resume()
         keepaliveTimer = timer
+    }
+
+    private func setKeepaliveInterval(_ interval: TimeInterval) {
+        guard interval != keepaliveInterval else { return }
+        keepaliveInterval = interval
+        keepaliveTimer?.schedule(deadline: .now() + interval, repeating: interval)
     }
 
     /// Sends one keepalive per ready peer that delivered packets within the
@@ -397,12 +455,14 @@ final class UDPReceiver: @unchecked Sendable {
         guard let lastArrival = lastPacketArrival,
             now - lastArrival < Self.keepaliveActivityWindow
         else { return }
+        let payload = ReceiverKeepalive.encode(
+            ReceiverKeepalive.Flags(rawValue: keepaliveFlags.load(ordering: .relaxed)))
         for peer in peers where peer.isReady {
             guard let peerArrival = peer.lastPacketArrival,
                 now - peerArrival < Self.keepaliveActivityWindow
             else { continue }
             peer.connection.send(
-                content: Self.keepalivePayload,
+                content: payload,
                 completion: .contentProcessed { _ in
                     // Errors surface through the state handler; per-datagram
                     // logging would spam.
@@ -494,6 +554,21 @@ final class UDPReceiver: @unchecked Sendable {
     nonisolated private static func makeKeepaliveHandler(receiver: UDPReceiver) -> @Sendable () -> Void {
         { [weak receiver] in
             receiver?.sendKeepaliveIfStreaming()
+        }
+    }
+
+    /// Address class of a sender flow's remote endpoint.
+    nonisolated private static func addressKind(_ endpoint: NWEndpoint) -> NetworkAddressKind? {
+        guard case .hostPort(let host, _) = endpoint else { return nil }
+        switch host {
+        case .ipv4(let address):
+            return NetworkAddress.kind(ipv4: [UInt8](address.rawValue))
+        case .ipv6(let address):
+            return NetworkAddress.kind(ipv6: [UInt8](address.rawValue))
+        case .name(let name, _):
+            return NetworkAddress.kind(name)
+        @unknown default:
+            return nil
         }
     }
 

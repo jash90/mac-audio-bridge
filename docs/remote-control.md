@@ -6,8 +6,8 @@ plays. Several Macs can run the sender at once; the phone plays exactly one of t
 ## Discovery
 
 - Each Mac advertises `_macaudiosrc._tcp` (`Apps/Sender-macOS/Network/ControlServer.swift`):
-  instance name = computer name, TXT `v=1`, `id=<UUID>` (generated once, UserDefaults
-  `sourceID`). A TCP `NWListener` (any port) serves the phones.
+  instance name = computer name, TXT `v=2`, `id=<UUID>` (generated once, UserDefaults
+  `sourceID`). A TCP `NWListener` on port 49001 (any port if taken) serves the phones.
 - The phone browses it (`Apps/Receiver-iOS/Sources/SourceBrowser.swift`) and keeps one TCP
   connection per Mac (`ControlClient`), reconnecting every 2 s while the Mac is browsed; a
   connection silent for 6 s (statuses come every 2 s at least) is recycled.
@@ -58,9 +58,12 @@ events needs the Accessibility permission on the Mac.
 
 ## Trust assumption
 
-Personal MVP: local network only, no authentication. The Mac closes control connections from
-non-local addresses (RFC 1918, link-local, loopback, IPv6 ULA/link-local), the phone refuses a
-resolved non-local peer. Anyone on the same LAN who runs the app can control a Mac's stream.
+Personal MVP: no authentication. Control connections are accepted only from the local network
+and from the tailnet (`NetworkAddress.isTrustedForControl`): loopback, RFC 1918, link-local,
+IPv6 ULA, and the Tailscale ranges `100.64.0.0/10` and `fd7a:115c:a1e0::/48`. Everything else
+is refused — the Mac closes the connection, the phone refuses a peer outside these ranges.
+Anyone on the same LAN or the same tailnet who runs the app can control a Mac's stream; the
+tailnet is the user's own (Tailscale ACLs decide who is on it). See `docs/internet-mode.md`.
 
 ## Second Mac
 

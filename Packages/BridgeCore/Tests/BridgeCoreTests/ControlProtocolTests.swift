@@ -57,13 +57,13 @@ struct ControlProtocolTests {
         let payload = ControlMessage.connect.payload()
         #expect(frame.count == 4 + payload.count)
         #expect(Array(frame.prefix(4)) == [0, 0, UInt8(payload.count >> 8), UInt8(payload.count & 0xFF)])
-        #expect(String(decoding: payload, as: UTF8.self) == #"{"type":"connect","v":1}"#)
+        #expect(String(decoding: payload, as: UTF8.self) == #"{"type":"connect","v":2}"#)
     }
 
     @Test("A different envelope version is reported as a version mismatch")
     func versionMismatch() {
-        let payload = Data(#"{"v":2,"type":"connect"}"#.utf8)
-        #expect(throws: ControlProtocolError.versionMismatch(2)) {
+        let payload = Data(#"{"v":1,"type":"connect"}"#.utf8)
+        #expect(throws: ControlProtocolError.versionMismatch(1)) {
             try ControlMessage.decode(payload: payload)
         }
         // Even when the rest of a newer envelope is unknown to us.
@@ -78,12 +78,12 @@ struct ControlProtocolTests {
         let bad: [String] = [
             "not json",
             #"{"type":"connect"}"#,  // no version
-            #"{"v":1}"#,  // no type
-            #"{"v":1,"type":"teleport"}"#,  // unknown type
-            #"{"v":1,"type":"release"}"#,  // missing field
-            #"{"v":1,"type":"setVolume","volume":"loud"}"#,  // wrong type
-            #"{"v":1,"type":"setQuality","quality":"mp3"}"#,  // unknown quality
-            #"{"v":1,"type":"status","status":{"name":"x"}}"#,  // incomplete status
+            #"{"v":2}"#,  // no type
+            #"{"v":2,"type":"teleport"}"#,  // unknown type
+            #"{"v":2,"type":"release"}"#,  // missing field
+            #"{"v":2,"type":"setVolume","volume":"loud"}"#,  // wrong type
+            #"{"v":2,"type":"setQuality","quality":"mp3"}"#,  // unknown quality
+            #"{"v":2,"type":"status","status":{"name":"x"}}"#,  // incomplete status
         ]
         for text in bad {
             #expect(throws: ControlProtocolError.malformed) {
@@ -118,9 +118,9 @@ struct ControlProtocolTests {
 
     @Test("Volume is clamped to 0...1")
     func volumeClamped() throws {
-        let loud = Data(#"{"v":1,"type":"setVolume","volume":3}"#.utf8)
+        let loud = Data(#"{"v":2,"type":"setVolume","volume":3}"#.utf8)
         #expect(try ControlMessage.decode(payload: loud) == .setVolume(1))
-        let negative = Data(#"{"v":1,"type":"setVolume","volume":-1}"#.utf8)
+        let negative = Data(#"{"v":2,"type":"setVolume","volume":-1}"#.utf8)
         #expect(try ControlMessage.decode(payload: negative) == .setVolume(0))
     }
 
@@ -135,8 +135,8 @@ struct ControlProtocolTests {
     @Test("TXT version compatibility")
     func txtCompatibility() {
         #expect(ControlProtocol.isCompatible(txtVersion: nil))
-        #expect(ControlProtocol.isCompatible(txtVersion: "1"))
-        #expect(!ControlProtocol.isCompatible(txtVersion: "2"))
+        #expect(ControlProtocol.isCompatible(txtVersion: "2"))
+        #expect(!ControlProtocol.isCompatible(txtVersion: "1"))
     }
 
     @Test("Only local addresses are trusted")
