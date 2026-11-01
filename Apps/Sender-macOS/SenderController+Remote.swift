@@ -40,6 +40,7 @@ extension SenderController {
             sessions[id] = nil
             sessionKinds[id] = nil
             lastSentStatus[id] = nil
+            micSessionClosed(id)
             remoteStateChanged()
         case .message(let id, let message):
             handle(message, from: id)
@@ -89,7 +90,9 @@ extension SenderController {
             setQuality(newQuality)
         case .media(let command):
             media.perform(command)
-        case .hello, .status, .claim, .nowPlaying:
+        case .micState(let state):
+            handleMicState(state, from: id)
+        case .hello, .status, .claim, .nowPlaying, .micStart, .micStop:
             break  // phone → Mac only / Mac → phone only
         }
     }

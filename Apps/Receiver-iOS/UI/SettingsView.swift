@@ -45,7 +45,7 @@ struct SettingsView: View {
             }
 
             if FeatureFlags.phoneMicrophone {
-                MicrophoneSection()
+                MicrophoneSection(mic: model.mic)
             }
 
             Section("Data usage") {
@@ -119,20 +119,42 @@ struct SettingsView: View {
     }
 }
 
-/// "Talk through iPhone" settings — hidden behind
-/// `FeatureFlags.phoneMicrophone` until the phone side exists.
+/// "Talk through iPhone" settings: the same toggle and mute as on Now,
+/// plus how the mic works.
 private struct MicrophoneSection: View {
-    @AppStorage("phoneMicrophoneEnabled") private var enabled = false
+    @ObservedObject var mic: MicrophoneModel
 
     var body: some View {
         Section {
-            Toggle(isOn: $enabled) {
+            Toggle(isOn: armedBinding) {
                 Label("Talk through iPhone", systemImage: "mic")
+            }
+            .disabled(mic.phase == .arming)
+            if mic.isArmed {
+                Toggle(isOn: $mic.muted) {
+                    Label("Mute", systemImage: "mic.slash")
+                }
+                LabeledContent("Level") {
+                    MicLevelMeter(level: mic.muted ? 0 : mic.level).frame(width: 140)
+                }
+                LabeledContent("Echo cancellation") {
+                    Text(mic.echoCancellation ? "On (speaker)" : "Off (headphones)")
+                }
+            }
+            if case .unavailable(let message) = mic.phase {
+                Text(message).font(.footnote).foregroundStyle(.orange)
             }
         } header: {
             Text("Microphone")
         } footer: {
-            Text("Your Mac gets this iPhone's microphone as an input.")
+            Text(
+                "Your Mac gets this iPhone's built-in microphone as “iPhone Mic (Mac Audio Bridge)”. Turn it on here before the call — iOS only lets it start while the app is open; it then keeps running in the background. AirPods stay on full-quality sound.")
         }
+    }
+
+    private var armedBinding: Binding<Bool> {
+        Binding(
+            get: { mic.isArmed || mic.phase == .arming },
+            set: { on in Task { await mic.setArmed(on) } })
     }
 }

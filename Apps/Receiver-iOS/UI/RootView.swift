@@ -12,6 +12,7 @@ struct RootView: View {
     @StateObject private var model = ReceiverModel()
     @AppStorage("latencyMode") private var latencyMode: JitterLatencyMode = .balanced
     @State private var tab: AppTab = .now
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         TabView(selection: $tab) {
@@ -42,6 +43,9 @@ struct RootView: View {
         }
         .onChange(of: latencyMode) { _, mode in
             model.setLatencyMode(mode)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { model.mic.appBecameActive() }
         }
     }
 }

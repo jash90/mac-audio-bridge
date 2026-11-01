@@ -4,9 +4,8 @@ import UIKit
 
 /// Switches for UI that waits on a later milestone.
 enum FeatureFlags {
-    /// "Talk through iPhone": the Mac side (virtual mic driver) exists, the
-    /// phone side does not yet. Flip to show the mic card and settings.
-    static let phoneMicrophone = false
+    /// "Talk through iPhone": the mic card on Now and its Settings section.
+    static let phoneMicrophone = true
 }
 
 /// The app icon's indigo → cyan gradient.

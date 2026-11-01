@@ -16,7 +16,7 @@ struct NowView: View {
                         PlayerCard(sources: sources, source: active)
                         ConnectionCard(model: model, source: active) { tab = .details }
                         if FeatureFlags.phoneMicrophone {
-                            MicCard()
+                            MicCard(mic: model.mic, macSupportsMic: sources.activeSupportsMic)
                         }
                     } else {
                         EmptyNowState(sources: sources) { tab = .sources }
@@ -305,28 +305,105 @@ private struct ConnectionCard: View {
     }
 }
 
-/// "Talk through iPhone" — hidden behind `FeatureFlags.phoneMicrophone`
-/// until the phone side exists. The toggle only keeps the choice for now.
+/// "Talk through iPhone": arm the mic (foreground only), see the level,
+/// mute. The Mac asks for the audio when a call opens its "iPhone Mic".
 private struct MicCard: View {
-    @AppStorage("phoneMicrophoneEnabled") private var enabled = false
+    @ObservedObject var mic: MicrophoneModel
+    let macSupportsMic: Bool
 
     var body: some View {
-        Toggle(isOn: $enabled.animation(.snappy)) {
-            Label {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Talk through iPhone")
-                        .font(.headline)
-                    Text("Use the iPhone as your Mac's microphone")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 14) {
+            Toggle(isOn: armedBinding.animation(.snappy)) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Talk through iPhone")
+                            .font(.headline)
+                        Text(MicPresentation.subtitle(mic.phase, muted: mic.muted, macSupportsMic: macSupportsMic))
+                            .font(.subheadline)
+                            .foregroundStyle(MicPresentation.isWarning(mic.phase) ? .orange : .secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } icon: {
+                    Image(systemName: MicPresentation.symbol(mic.phase, muted: mic.muted))
+                        .foregroundStyle(mic.isArmed ? (mic.muted ? .orange : Brand.blue) : .secondary)
                 }
-            } icon: {
-                Image(systemName: enabled ? "mic.fill" : "mic.slash")
-                    .foregroundStyle(enabled ? Brand.blue : .secondary)
+            }
+            .disabled(mic.phase == .arming)
+            if mic.isArmed {
+                HStack(spacing: 12) {
+                    MicLevelMeter(level: mic.muted ? 0 : mic.level)
+                    Button {
+                        mic.muted.toggle()
+                    } label: {
+                        Label(mic.muted ? "Unmute" : "Mute", systemImage: mic.muted ? "mic.slash.fill" : "mic.fill")
+                            .labelStyle(.iconOnly)
+                            .font(.title3)
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(mic.muted ? .orange : Brand.blue)
+                    .accessibilityLabel(mic.muted ? "Unmute microphone" : "Mute microphone")
+                }
             }
         }
         .padding(18)
         .glassCard(cornerRadius: 26)
+    }
+
+    private var armedBinding: Binding<Bool> {
+        Binding(
+            get: { mic.isArmed || mic.phase == .arming },
+            set: { on in Task { await mic.setArmed(on) } })
+    }
+}
+
+/// Texts and symbols shared by the mic card and the Settings section.
+enum MicPresentation {
+    static func subtitle(_ phase: MicrophoneModel.Phase, muted: Bool, macSupportsMic: Bool) -> String {
+        switch phase {
+        case .off:
+            macSupportsMic
+                ? "Use the iPhone as your Mac's microphone in calls"
+                : "Update Mac Audio Bridge on the Mac to use the iPhone mic"
+        case .arming: "Starting the microphone…"
+        case .armed: "Ready — pick “iPhone Mic (Mac Audio Bridge)” in your call"
+        case .live(let name): muted ? "Muted — \(name) hears silence" : "Live — \(name) hears you"
+        case .unavailable(let message): message
+        }
+    }
+
+    static func symbol(_ phase: MicrophoneModel.Phase, muted: Bool) -> String {
+        switch phase {
+        case .live: muted ? "mic.slash.fill" : "mic.fill"
+        case .armed, .arming: "mic"
+        case .unavailable: "mic.badge.xmark"
+        case .off: "mic.slash"
+        }
+    }
+
+    static func isWarning(_ phase: MicrophoneModel.Phase) -> Bool {
+        if case .unavailable = phase { return true }
+        return false
+    }
+}
+
+/// Input level, RMS mapped to −60…0 dBFS.
+struct MicLevelMeter: View {
+    let level: Float
+
+    var body: some View {
+        let db = level > 0 ? 20 * log10(Double(level)) : -60
+        let fraction = min(max((db + 60) / 60, 0), 1)
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule().fill(Brand.gradient).frame(width: proxy.size.width * fraction)
+            }
+        }
+        .frame(height: 8)
+        .animation(.linear(duration: 0.1), value: fraction)
+        .accessibilityLabel("Microphone level")
+        .accessibilityValue("\(Int(db.rounded())) decibels")
     }
 }
 

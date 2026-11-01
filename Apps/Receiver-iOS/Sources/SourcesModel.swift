@@ -74,6 +74,15 @@ final class SourcesModel: ObservableObject {
     private var probeGenerations: [String: Int] = [:]
     private var probeRetries: [String: Task<Void, Never>] = [:]
     private var tailnetAddresses: [String] = []
+    /// The phone mic's state, reported to every Mac on protocol version 4
+    /// (each Mac asks with `micStart` only while it streams to us).
+    private var micState: MicState?
+    private var micStateSent: [String: MicState] = [:]
+    private var macTags: [String: UInt32] = [:]
+    private var macVersions: [String: Int] = [:]
+    /// A Mac asked for (true) or released (false) the mic; its source tag
+    /// picks the UDP flow. Called on the main actor.
+    var onMicCommand: ((_ sourceID: String, _ start: Bool, _ sourceTag: UInt32) -> Void)?
 
     private static let lastIDKey = "lastSourceID"
     private static let lastNameKey = "lastSourceName"
@@ -414,7 +423,14 @@ final class SourcesModel: ObservableObject {
                     rememberNameIfRemote(status.name, id: id)
                     learnAddresses(status, id: id)
                 }
+                macTags[id] = status.sourceTag
+                macVersions[id] = status.protocolVersion ?? 1
                 apply(arbiter.statusReceived(id: id, status))
+                sendMicStateIfNeeded(id)
+            case .micStart:
+                onMicCommand?(id, true, macTags[id] ?? 0)
+            case .micStop:
+                onMicCommand?(id, false, macTags[id] ?? 0)
             case .claim:
                 apply(arbiter.claimReceived(id: id))
             case .nowPlaying(let info):
@@ -433,6 +449,8 @@ final class SourcesModel: ObservableObject {
             clientGenerations[id] = nil
             clientPaths[id] = nil
             lastMessageAt[id] = nil
+            micStateSent[id] = nil
+            onMicCommand?(id, false, macTags[id] ?? 0)
             mediaRouter.forget(id: id)
             // A path that never connected, or went silent, failed; a clean
             // close (Mac quit, LAN switch-back) did not.
@@ -511,6 +529,31 @@ final class SourcesModel: ObservableObject {
     }
 
     // MARK: - Arbiter plumbing
+
+    // MARK: - Microphone
+
+    /// The phone mic changed: tell every Mac that understands it.
+    func setMicState(_ state: MicState) {
+        guard state != micState else { return }
+        micState = state
+        for id in clients.keys {
+            sendMicStateIfNeeded(id)
+        }
+    }
+
+    /// Whether the active Mac speaks the mic protocol (version 4).
+    var activeSupportsMic: Bool {
+        guard let id = activeID else { return false }
+        return (macVersions[id] ?? 0) >= ControlProtocol.micVersion
+    }
+
+    private func sendMicStateIfNeeded(_ id: String) {
+        guard let micState, (macVersions[id] ?? 0) >= ControlProtocol.micVersion,
+            micStateSent[id] != micState, let client = clients[id]
+        else { return }
+        client.send(.micState(micState))
+        micStateSent[id] = micState
+    }
 
     private func apply(_ effects: [SourceArbiter.Effect]) {
         for effect in effects {

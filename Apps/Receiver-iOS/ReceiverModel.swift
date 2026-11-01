@@ -51,6 +51,8 @@ final class ReceiverModel: ObservableObject {
 
     /// The Macs, the control connections and source arbitration.
     let sources: SourcesModel
+    /// "Talk through iPhone".
+    let mic: MicrophoneModel
 
     private let jitterBuffer = JitterBuffer(config: .latency(.balanced))
     private let receiver: UDPReceiver
@@ -84,6 +86,7 @@ final class ReceiverModel: ObservableObject {
         receiver = UDPReceiver(jitterBuffer: jitterBuffer)
         playback = PlaybackController(jitterBuffer: jitterBuffer)
         sources = SourcesModel(receiver: receiver)
+        mic = MicrophoneModel(playback: playback, sources: sources, receiver: receiver)
     }
 
     deinit {
@@ -103,6 +106,7 @@ final class ReceiverModel: ObservableObject {
             phase = .running
             sources.start()
             startStatsLoop()
+            mic.restoreAtLaunch()
         } catch {
             phase = .failed("Start failed: \(error.localizedDescription)")
         }

@@ -62,8 +62,8 @@ struct ControlProtocolTests {
 
     @Test("A different envelope version is reported as a version mismatch")
     func versionMismatch() throws {
-        #expect(ControlProtocol.version == 3)
-        for version in [0, 4] {
+        #expect(ControlProtocol.version == 4)
+        for version in [0, 5] {
             let payload = Data(#"{"v":\#(version),"type":"connect"}"#.utf8)
             #expect(throws: ControlProtocolError.versionMismatch(version)) {
                 try ControlMessage.decode(payload: payload)
@@ -74,8 +74,8 @@ struct ControlProtocolTests {
             let payload = Data(#"{"v":\#(version),"type":"connect"}"#.utf8)
             #expect(try ControlMessage.decode(payload: payload) == .connect)
         }
-        let payload = Data(#"{"v":4,"type":"connect"}"#.utf8)
-        #expect(throws: ControlProtocolError.versionMismatch(4)) {
+        let payload = Data(#"{"v":5,"type":"connect"}"#.utf8)
+        #expect(throws: ControlProtocolError.versionMismatch(5)) {
             try ControlMessage.decode(payload: payload)
         }
         // Even when the rest of a newer envelope is unknown to us.

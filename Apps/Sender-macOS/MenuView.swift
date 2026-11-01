@@ -39,6 +39,8 @@ struct MenuView: View {
 
             MediaMenuSection(media: controller.media)
 
+            MicMenuSection(controller: controller)
+
             if controller.defaultOutputIsOurs {
                 if controller.releasedHold {
                     Button("Resume streaming to iPhone") {

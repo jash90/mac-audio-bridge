@@ -26,7 +26,7 @@ struct MediaControlTests {
 
     @Test("Version 1 messages keep v:1 on the wire, the new ones carry v:2")
     func perMessageVersion() throws {
-        #expect(ControlProtocol.version == 3)
+        #expect(ControlProtocol.version == 4)
         for message in ControlProtocolTests.allMessages {
             #expect(message.requiredVersion == 1)
             let probe = try JSONSerialization.jsonObject(with: message.payload()) as? [String: Any]

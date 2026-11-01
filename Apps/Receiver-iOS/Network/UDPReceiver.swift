@@ -88,6 +88,8 @@ final class UDPReceiver: @unchecked Sendable {
         let kind: NetworkAddressKind?
         var isReady = false
         var lastPacketArrival: TimeInterval?
+        /// Source tag of the audio this flow carries (its Mac).
+        var sourceTag: UInt32?
     }
 
     /// Posts advertisement state to the main actor in FIFO order.
@@ -111,6 +113,11 @@ final class UDPReceiver: @unchecked Sendable {
     /// the previous profile do not flip it back).
     private var profileFollower = ProfileFollower()
     private var keepaliveInterval = StreamProfile.lan.keepaliveInterval
+    /// Source tag of the datagram `ingest` accepted last.
+    private var lastIngestedTag: UInt32 = 0
+    /// Mic datagrams handed to a flow / dropped for want of one.
+    private let micSent = Atomic<Int>(0)
+    private let micMisses = Atomic<Int>(0)
 
     init(jitterBuffer: JitterBuffer) {
         self.jitterBuffer = jitterBuffer
@@ -340,8 +347,10 @@ final class UDPReceiver: @unchecked Sendable {
         if let data, isComplete, ingest(data) {
             let arrival = lastPacketArrival
             var kind: NetworkAddressKind?
+            let tag = lastIngestedTag
             updatePeer(for: connection) {
                 $0.lastPacketArrival = arrival
+                $0.sourceTag = tag
                 kind = $0.kind
             }
             if kind != nil, kind != currentSenderKind {
@@ -389,6 +398,7 @@ final class UDPReceiver: @unchecked Sendable {
         if adopted {
             onSourceAdopted?(datagram.source)
         }
+        lastIngestedTag = datagram.source
         let arrival = elapsedSeconds()
         var packets = datagram.packets()
         if newStream {
@@ -424,6 +434,32 @@ final class UDPReceiver: @unchecked Sendable {
     private func countMalformed() {
         malformedDatagrams.wrappingAdd(1, ordering: .relaxed)
     }
+
+    // MARK: - Microphone
+
+    /// Sends the phone's mic datagrams back on the flow of the Mac with
+    /// source tag `tag` (the reply direction of its stream, like the
+    /// keepalives: no new port, works through NAT and Tailscale). Dropped
+    /// when that Mac is not streaming to us right now.
+    func sendMic(_ datagrams: [Data], toSource tag: UInt32) {
+        queue.async { [self] in
+            let flow = peers
+                .filter { $0.isReady && $0.sourceTag == tag }
+                .max { ($0.lastPacketArrival ?? 0) < ($1.lastPacketArrival ?? 0) }
+            guard let flow else {
+                micMisses.wrappingAdd(datagrams.count, ordering: .relaxed)
+                return
+            }
+            for datagram in datagrams {
+                flow.connection.send(content: datagram, completion: .contentProcessed { _ in })
+            }
+            micSent.wrappingAdd(datagrams.count, ordering: .relaxed)
+        }
+    }
+
+    /// Mic datagrams sent / dropped (no flow to that Mac) since launch.
+    var micSentCount: Int { micSent.load(ordering: .relaxed) }
+    var micMissCount: Int { micMisses.load(ordering: .relaxed) }
 
     // MARK: - Radio keepalive
 

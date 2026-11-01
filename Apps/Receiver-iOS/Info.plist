@@ -27,6 +27,8 @@
 		<string>_macaudiobridge._udp</string>
 		<string>_macaudiosrc._tcp</string>
 	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>With “Talk through iPhone” on, your Mac uses this iPhone's microphone in calls.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Mac Audio Bridge uses the local network to find your Macs, control them, and receive their audio.</string>
 	<key>UIBackgroundModes</key>

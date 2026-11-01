@@ -19,6 +19,10 @@ import Synchronization
 /// follows the iPhone to a new DHCP address. The owner watches the
 /// reconnect count to fail over to another path (`PathFailover`).
 ///
+/// The phone's microphone ("Talk through iPhone") comes back on the same
+/// flow: datagrams that are `MicDatagram`s go to `micEngine` (set once at
+/// launch, before any connection), on `stateQueue`.
+///
 /// Thread-safety: `send` runs on the converter queue (one lock read plus
 /// relaxed atomics — no buffering, no extra hop: datagrams go straight to
 /// `NWConnection.send`), `setTarget`/`cancel`/`linkSnapshot` on the main
@@ -74,6 +78,13 @@ final class UDPSender: @unchecked Sendable {
     private let sentBytes = Atomic<Int>(0)
     /// Flags byte of the latest keepalive.
     private let peerFlags = Atomic<UInt8>(0)
+    /// Receives the phone's mic datagrams (nil until set at launch).
+    private let micSink = Mutex<MicEngine?>(nil)
+
+    /// Routes mic datagrams arriving on the phone's flow to `engine`.
+    func setMicEngine(_ engine: MicEngine) {
+        micSink.withLock { $0 = engine }
+    }
 
     // MARK: - Control (main actor)
 
@@ -255,6 +266,11 @@ final class UDPSender: @unchecked Sendable {
             lastKeepaliveNanos.store(Self.nowNanos(), ordering: .relaxed)
             unansweredSinceNanos.store(0, ordering: .relaxed)
             peerFlags.store(flags.rawValue, ordering: .relaxed)
+        } else if let data, MicDatagram.isMicDatagram(data) {
+            // The phone is alive too: its mic datagrams count as keepalives.
+            lastKeepaliveNanos.store(Self.nowNanos(), ordering: .relaxed)
+            unansweredSinceNanos.store(0, ordering: .relaxed)
+            micSink.withLock { $0 }?.ingest(data)
         }
         receiveLoop(on: connection, generation: generation)
     }

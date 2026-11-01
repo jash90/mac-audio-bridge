@@ -739,6 +739,14 @@ public final class JitterBuffer: @unchecked Sendable {
         }
     }
 
+    /// Frames buffered and the adaptive target, read under the playout lock
+    /// only (no estimator work, no allocation): cheap enough for the render
+    /// thread, where the mic reader's drift correction reads it once per
+    /// frame.
+    public func playoutDepth() -> (depth: Int, target: Int) {
+        lock.withLock { ($0.bufferedCount, $0.target) }
+    }
+
     /// The configuration in effect.
     public var config: JitterBufferConfig {
         lock.withLock { $0.config }
