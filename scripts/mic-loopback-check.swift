@@ -21,6 +21,11 @@ let toneHz = 1_000.0
 let toneAmplitude: Float = 0.5
 let silenceLead = 0.5 // s of silence before the tone starts
 let recordSeconds = 3.0
+// The tone's onset is the first sample above this. Other apps may feed the
+// mic at the same time (the Sender plays the phone's microphone into the feed
+// device whenever an app opens "iPhone Mic"), so a near-zero threshold would
+// fire on their background signal instead of the tone.
+let onsetThreshold: Float = 0.1
 
 func deviceID(forUID uid: String) -> AudioObjectID? {
     var address = AudioObjectPropertyAddress(
@@ -145,7 +150,7 @@ status = AudioDeviceCreateIOProcIDWithBlock(&micProc, mic, nil) { _, inData, inT
     state.expectedNextInputTime = t0 + Double(frames)
     for frame in 0..<frames where state.recorded < state.capacity {
         let value = data[frame * channels]
-        if state.micOnsetSampleTime < 0, abs(value) > 1e-4 {
+        if state.micOnsetSampleTime < 0, abs(value) > onsetThreshold {
             state.micOnsetSampleTime = t0 + Double(frame)
             state.micOnsetHostTime = mach_absolute_time()
         }
@@ -211,6 +216,10 @@ for value in tone {
     }
 }
 
+// Anything before the tone (up to one cycle before the onset, which is the
+// tone rising towards the threshold) is another feeder client (e.g. the Sender playing
+// the phone's mic) — it is mixed into the tone too and skews the level.
+let background = samples[0..<max(0, min(onsetIndex - 48, count))].reduce(Float(0)) { max($0, abs($1)) }
 let sampleOffset = state.micOnsetSampleTime - state.toneOnsetSampleTime
 let wallLatency = hostTicksToMs(Int64(state.micOnsetHostTime) - Int64(state.toneOnsetHostTime))
 
@@ -218,9 +227,13 @@ print(String(format: "frequency  %.1f Hz (expected %.0f)", frequency, toneHz))
 print(String(format: "level      RMS %.1f dBFS, peak %.3f (expected RMS %.1f dBFS at full mic volume)",
              20 * log10(max(rms, 1e-9)), peak, 20 * log10(expectedRms)))
 print("dropouts   \(dropouts) (silent runs >= 8 frames), input timestamp gaps \(state.inputTimeGaps)")
-print(String(format: "latency    ring offset %.0f frames (expected %u = mic latency), callback-to-callback %.1f ms",
-             sampleOffset, micLatency, wallLatency))
+print(String(format: "latency    ring offset %.0f frames = %.1f ms (expected %u = mic latency), callback-to-callback %.1f ms",
+             sampleOffset, sampleOffset / sampleRate * 1000, micLatency, wallLatency))
 
-let ok = abs(frequency - toneHz) < 5 && dropouts == 0 && rms > 0.01
+if background > 1e-4 {
+    print(String(format: "background peak %.4f before the tone: another app feeds the mic (is the iPhone sending its mic?) — level and frequency include it", background))
+}
+let latencyOK = abs(sampleOffset - Double(micLatency)) <= 2
+let ok = abs(frequency - toneHz) < 5 && dropouts == 0 && rms > 0.01 && latencyOK
 print(ok ? "RESULT: PASS" : "RESULT: FAIL")
 exit(ok ? 0 : 1)
