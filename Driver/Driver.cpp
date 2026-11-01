@@ -10,7 +10,13 @@
 // The user selects the device as the system output; the Mac speakers are simply
 // not used then (nothing is played to them), like an AirPlay receiver.
 //
+// The same driver also publishes the virtual iPhone microphone and its hidden
+// feeder device (MicDevices.hpp). They are created after the output device and
+// share nothing with it, so the output device is exactly as before.
+//
 // Built on libASPL (ThirdParty/libASPL, MIT license).
+
+#include "MicDevices.hpp"
 
 #include <aspl/Driver.hpp>
 
@@ -63,6 +69,8 @@ std::shared_ptr<aspl::Driver> CreateBridgeDriver()
 
     auto plugin = std::make_shared<aspl::Plugin>(context);
     plugin->AddDevice(device);
+
+    mab::AddMicDevices(context, plugin);
 
     return std::make_shared<aspl::Driver>(context, plugin);
 }

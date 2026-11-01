@@ -59,6 +59,8 @@ targets:
       - path: Driver
         excludes:
           - "Info.plist"
+          # Host-side unit tests (scripts/test-driver.sh), never in the bundle.
+          - "Tests/**"
       - path: ThirdParty/libASPL/src
     dependencies:
       - sdk: CoreFoundation.framework
