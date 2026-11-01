@@ -282,11 +282,14 @@ struct ReceiverServiceTests {
         #expect(!ReceiverService.isValidSuffix("ABC"))
     }
 
-    @Test("Only protocol version 1 (or a not-yet-known TXT) is compatible")
+    @Test("Only protocol version 4 (or a not-yet-known TXT) is compatible")
     func versionCompatibility() {
-        #expect(ReceiverService.isCompatible(version: "1"))
+        #expect(ReceiverService.isCompatible(version: "4"))
         #expect(ReceiverService.isCompatible(version: nil))
-        #expect(!ReceiverService.isCompatible(version: "2"))
+        #expect(!ReceiverService.isCompatible(version: "1"))  // 10 ms single-frame datagrams
+        #expect(!ReceiverService.isCompatible(version: "2"))  // no source tag
+        #expect(!ReceiverService.isCompatible(version: "3"))  // one primary per datagram, no profile
+        #expect(!ReceiverService.isCompatible(version: "5"))
     }
 }
 

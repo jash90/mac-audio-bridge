@@ -5,7 +5,7 @@ import UIKit
 
 /// What the Mac sees of this receiver: the Bonjour name the listener is
 /// registered under and whether the advertisement is up. Written by
-/// `UDPReceiver` (hopping to the main actor), read by `ReceiverVisibilityView`.
+/// `UDPReceiver` (hopping to the main actor), read by the Details and Settings tabs.
 @MainActor
 final class ReceiverAdvertisement: ObservableObject {
     enum Status: Equatable, Sendable {

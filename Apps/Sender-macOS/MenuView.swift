@@ -2,8 +2,8 @@ import AppKit
 import BridgeCore
 import SwiftUI
 
-/// Menu bar window: receiver picker, output-device switcher, status, and a
-/// manual-address fallback. Streaming is automatic — it runs while
+/// Menu bar window: receiver picker, stream-quality picker, output-device
+/// switcher, status, and a manual-address fallback. Streaming is automatic — it runs while
 /// "iPhone (Mac Audio Bridge)" is the selected output device and a receiver
 /// is known (see SenderController.evaluate). The controller (created in
 /// SenderApp) owns the 1 Hz loop and the Bonjour browser; this view owns no
@@ -30,8 +30,21 @@ struct MenuView: View {
 
             receiverPicker
 
+            qualityPicker
+
+            remoteStatus
+
+            MediaMenuSection(media: controller.media)
+
+            MicMenuSection(controller: controller)
+
             if controller.defaultOutputIsOurs {
-                Button("Switch back to \(controller.previousDeviceName ?? "previous device")") {
+                if controller.releasedHold {
+                    Button("Resume streaming to iPhone") {
+                        controller.resumeAfterRelease()
+                    }
+                }
+                Button("Switch back to \(controller.previousDeviceName ?? "built-in output")") {
                     controller.switchBackToPreviousOutput()
                 }
                 .disabled(!controller.hasPreviousDevice)
@@ -55,6 +68,39 @@ struct MenuView: View {
         }
         .padding(12)
         .frame(width: 340)
+        .onAppear { controller.setMenuOpen(true) }
+        .onDisappear { controller.setMenuOpen(false) }
+    }
+
+    // MARK: - Remote control
+
+    /// Who controls the stream: a phone, or another Mac that took it over.
+    @ViewBuilder
+    private var remoteStatus: some View {
+        if let phone = controller.controllingPhone, controller.isStreaming {
+            Label("Controlled from \(phone)", systemImage: "iphone.radiowaves.left.and.right")
+                .font(.footnote)
+                .foregroundStyle(.green)
+        }
+        if let other = controller.usedBy {
+            Label("iPhone used by \(other)", systemImage: "arrow.left.arrow.right")
+                .font(.footnote)
+                .foregroundStyle(.orange)
+        }
+        switch controller.controlServerStatus {
+        case .localNetworkDenied:
+            Text("The iPhone cannot find this Mac — allow Local Network for Mac Audio Bridge in System Settings")
+                .font(.footnote)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        case .failed(let message):
+            Text("Remote control unavailable: \(message)")
+                .font(.footnote)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        case .starting, .advertising:
+            EmptyView()
+        }
     }
 
     // MARK: - Receiver picker
@@ -63,27 +109,75 @@ struct MenuView: View {
         Picker("Receiver", selection: selectionBinding) {
             Text(automaticLabel).tag("")
             ForEach(pickerNames, id: \.self) { name in
-                Text(controller.visibleReceivers.contains(name) ? name : "\(name) (not found)")
-                    .tag(name)
+                Text(receiverLabel(name)).tag(Self.serviceTag(name))
+            }
+            if !controller.tailscalePeers.isEmpty || chosenHostIsCustom {
+                Divider()
+            }
+            ForEach(controller.tailscalePeers, id: \.id) { peer in
+                Text(peerLabel(peer)).tag(Self.hostTag(peerHost(peer)))
+            }
+            if chosenHostIsCustom, let host = controller.storedHost {
+                Text("\(host) (address)").tag(Self.hostTag(host))
             }
         }
         .pickerStyle(.menu)
     }
 
+    private static func serviceTag(_ name: String) -> String { "service:" + name }
+    private static func hostTag(_ host: String) -> String { "host:" + host }
+
     private var selectionBinding: Binding<String> {
         Binding(
-            get: { controller.selectedReceiver ?? "" },
-            set: { controller.selectReceiver($0.isEmpty ? nil : $0) })
+            get: {
+                if let host = controller.storedHost { return Self.hostTag(host) }
+                return controller.selectedReceiver.map(Self.serviceTag) ?? ""
+            },
+            set: { tag in
+                if tag.hasPrefix("host:") {
+                    controller.chooseHost(String(tag.dropFirst(5)))
+                } else if tag.hasPrefix("service:") {
+                    controller.selectReceiver(String(tag.dropFirst(8)))
+                } else {
+                    controller.selectReceiver(nil)
+                }
+            })
     }
 
-    /// Visible receivers plus the stored selection while it is missing, so
-    /// the picker can always show (and change) the current choice.
+    /// Visible receivers, receivers known by their tailnet addresses, plus
+    /// the stored selection while it is missing, so the picker can always
+    /// show (and change) the current choice.
     private var pickerNames: [String] {
         var names = controller.visibleReceivers
+        for name in controller.remoteReceivers where !names.contains(name) {
+            names.append(name)
+        }
         if let selected = controller.selectedReceiver, !names.contains(selected) {
             names.append(selected)
         }
         return names
+    }
+
+    private func receiverLabel(_ name: String) -> String {
+        if controller.visibleReceivers.contains(name) { return name }
+        if controller.remoteReceivers.contains(name) { return "\(name) (via Tailscale)" }
+        return "\(name) (not found)"
+    }
+
+    /// The address a Tailscale peer is reached at (its IPv4, else its name).
+    private func peerHost(_ peer: TailscaleStatus.Peer) -> String {
+        peer.preferredAddress ?? peer.name
+    }
+
+    private func peerLabel(_ peer: TailscaleStatus.Peer) -> String {
+        let name = controller.receiverName(for: peer) ?? peer.name
+        return "\(name) — via Tailscale, \(peer.online ? "online" : "offline")"
+    }
+
+    /// A chosen host that is not one of the listed Tailscale peers.
+    private var chosenHostIsCustom: Bool {
+        guard let host = controller.storedHost else { return false }
+        return !controller.tailscalePeers.contains { peerHost($0) == host }
     }
 
     private var automaticLabel: String {
@@ -93,21 +187,60 @@ struct MenuView: View {
         return "Automatic"
     }
 
+    // MARK: - Quality picker
+
+    /// The LAN quality and, separately, the Internet quality (used whenever
+    /// the stream runs the Internet profile), each with what it costs. Both
+    /// are persisted by the controller and can also be changed from the phone.
+    @ViewBuilder
+    private var qualityPicker: some View {
+        Picker(
+            "Quality",
+            selection: Binding(get: { controller.quality }, set: { controller.setQuality($0) })
+        ) {
+            ForEach(StreamQuality.lanChoices, id: \.self) { quality in
+                Text(quality.displayName).tag(quality)
+            }
+        }
+        .pickerStyle(.menu)
+        Picker(
+            "Internet quality",
+            selection: Binding(get: { controller.internetQuality }, set: { controller.setInternetQuality($0) })
+        ) {
+            ForEach(InternetQuality.allCases, id: \.self) { quality in
+                Text(quality.menuName).tag(quality)
+            }
+        }
+        .pickerStyle(.menu)
+    }
+
     // MARK: - Manual address
 
-    /// Fallback for networks where Bonjour does not get through. Used only
-    /// when no discovered receiver is selected; always editable.
+    /// An iPhone by address: an IP (LAN or Tailscale) or a host name such
+    /// as a Tailscale MagicDNS name (`iphone171`). "Use this address" picks
+    /// it even while receivers are found on Wi-Fi; typed alone, it is the
+    /// fallback used when no discovered receiver is selected.
     private var manualAddress: some View {
         DisclosureGroup(isExpanded: $manualSectionExpanded) {
             VStack(alignment: .leading, spacing: 4) {
-                TextField("iPhone IP address", text: $manualHostText)
-                    .textFieldStyle(.roundedBorder)
-                    .onChange(of: manualHostText) { _, newValue in
-                        controller.setManualHost(newValue)
-                    }
-                Text("Used only when no discovered receiver is selected.")
+                HStack {
+                    TextField("IP address or Tailscale name", text: $manualHostText)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: manualHostText) { _, newValue in
+                            controller.setManualHost(newValue)
+                        }
+                        .onSubmit { useManualAddress() }
+                    Button("Use") { useManualAddress() }
+                        .disabled(manualHostText.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                Text("Use streams to this address even when receivers are found on Wi-Fi (e.g. iphone171 over Tailscale).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if controller.storedHost != nil {
+                    Button("Back to receivers on Wi-Fi") { controller.chooseHost(nil) }
+                        .font(.caption)
+                }
             }
             .padding(.top, 4)
         } label: {
@@ -119,6 +252,12 @@ struct MenuView: View {
                 controller.enableManualAddress()
             }
         }
+    }
+
+    private func useManualAddress() {
+        let host = manualHostText.trimmingCharacters(in: .whitespaces)
+        guard !host.isEmpty else { return }
+        controller.chooseHost(host)
     }
 
     private var manualAddressInUse: Bool {
@@ -143,6 +282,11 @@ struct MenuView: View {
             }
             Text("Volume: \(controller.volumePercent)%\(controller.deviceMuted ? " (muted)" : "")")
             Text("Packets: \(controller.packetsPerSecond)/s")
+            tailscaleStatus
+            if controller.isStreaming {
+                Text("\(controller.streamProfile.encoding(lan: controller.quality, internet: controller.internetQuality).displayName) — \(String(format: "%.0f", controller.kilobytesPerSecond)) kB/s")
+                internetStatus
+            }
             if controller.browserStatus == .localNetworkDenied {
                 Text("Local Network access is off — allow Mac Audio Bridge in System Settings → Privacy & Security → Local Network")
                     .foregroundStyle(.red)
@@ -161,6 +305,35 @@ struct MenuView: View {
         }
         .font(.footnote)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Path, profile and data use of the running stream.
+    @ViewBuilder
+    private var internetStatus: some View {
+        let endpoint = controller.endpointName
+        Text("Path: \(controller.streamPath.displayName)\(endpoint.isEmpty || endpoint == controller.activeReceiver ? "" : " (\(endpoint))")")
+        if controller.streamProfile == .wan {
+            Text("Internet profile: 20 ms Opus frames, 24 kbit/s backup copies, larger buffer")
+        }
+        if let note = controller.qualityNote {
+            Text(note)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        Text("Data: \(String(format: "%.1f", controller.sessionMegabytes)) MB this session, ≈ \(String(format: "%.0f", controller.megabytesPerHour)) MB/h")
+    }
+
+    @ViewBuilder
+    private var tailscaleStatus: some View {
+        switch controller.tailscaleState {
+        case .running:
+            Text("Tailscale: on — \(controller.tailscalePeers.filter(\.online).count) of \(controller.tailscalePeers.count) iPhones online")
+        case .notRunning(let reason):
+            Text("Tailscale: \(reason)")
+                .foregroundStyle(.secondary)
+        case .notInstalled, .unknown:
+            EmptyView()
+        }
     }
 
     /// One line on where the audio goes and whether the receiver answers.

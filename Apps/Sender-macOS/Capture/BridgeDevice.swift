@@ -1,3 +1,4 @@
+import BridgeCore
 import CoreAudio
 import Foundation
 
@@ -101,6 +102,93 @@ enum BridgeDevice {
         guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &muted) == noErr
         else { return nil }
         return muted != 0
+    }
+
+    /// Sets the device's output volume scalar (0...1) — the phone's volume
+    /// slider. The volume listener then feeds the stream gain.
+    @discardableResult
+    static func setVolumeScalar(_ deviceID: AudioObjectID, _ volume: Float) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        var value = Float32(min(max(volume, 0), 1))
+        return AudioObjectSetPropertyData(
+            deviceID, &address, 0, nil, UInt32(MemoryLayout<Float32>.size), &value) == noErr
+    }
+
+    /// Sets the device's mute state — the phone's mute button.
+    @discardableResult
+    static func setMuted(_ deviceID: AudioObjectID, _ muted: Bool) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        var value: UInt32 = muted ? 1 : 0
+        return AudioObjectSetPropertyData(
+            deviceID, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value) == noErr
+    }
+
+    /// The device's persistent UID.
+    static func deviceUID(_ deviceID: AudioObjectID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var uid: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        let status = withUnsafeMutablePointer(to: &uid) { pointer in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
+        }
+        guard status == noErr else { return nil }
+        return uid as String
+    }
+
+    /// UID, name and built-in-ness of a device, for the output switch model.
+    static func outputDeviceInfo(_ deviceID: AudioObjectID) -> OutputDeviceInfo? {
+        guard let uid = deviceUID(deviceID) else { return nil }
+        return OutputDeviceInfo(
+            uid: uid, name: deviceName(deviceID) ?? uid, isBuiltIn: isBuiltIn(deviceID))
+    }
+
+    /// Every device with at least one output stream (candidates to restore).
+    static func outputDevices() -> [(id: AudioObjectID, info: OutputDeviceInfo)] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        guard AudioObjectGetPropertyDataSize(system, &address, 0, nil, &size) == noErr, size > 0
+        else { return [] }
+        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(system, &address, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids.compactMap { id in
+            guard hasOutputStreams(id), let info = outputDeviceInfo(id) else { return nil }
+            return (id, info)
+        }
+    }
+
+    private static func hasOutputStreams(_ deviceID: AudioObjectID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size) == noErr else { return false }
+        return size > 0
+    }
+
+    private static func isBuiltIn(_ deviceID: AudioObjectID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr
+        else { return false }
+        return transport == kAudioDeviceTransportTypeBuiltIn
     }
 
     /// Whether any process currently runs IO on the device — tells "selected
