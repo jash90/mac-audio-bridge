@@ -207,16 +207,32 @@ private struct PlayerCard: View {
         .accessibilityLabel(label)
     }
 
+    /// The quality chip: on the Internet profile it picks the Internet
+    /// quality (with its MB/h), otherwise the Wi‑Fi quality.
     private func qualityChip(_ status: SourceStatus) -> some View {
-        let effective = (status.profile ?? .lan).effectiveQuality(status.quality)
+        let effective = status.effectiveQuality
         return Menu {
-            Picker("Quality", selection: Binding(get: { status.quality }, set: { sources.setQuality($0, for: source.id) })) {
-                ForEach(StreamQuality.allCases, id: \.self) { quality in
-                    Text(quality.menuName).tag(quality)
+            if status.profile == .wan, sources.supportsInternetQuality(source.id) {
+                Picker(
+                    "Internet quality",
+                    selection: Binding(
+                        get: { status.internetQuality ?? .default },
+                        set: { sources.setInternetQuality($0, for: source.id) })
+                ) {
+                    ForEach(InternetQuality.allCases, id: \.self) { quality in
+                        Text(quality.menuName).tag(quality)
+                    }
                 }
-            }
-            if let note = status.qualityNote {
-                Text(note)
+                Text("Now ≈ \(Int((status.megabytesPerHour ?? 0).rounded())) MB/h")
+            } else {
+                Picker("Quality", selection: Binding(get: { status.quality }, set: { sources.setQuality($0, for: source.id) })) {
+                    ForEach(StreamQuality.lanChoices, id: \.self) { quality in
+                        Text(quality.menuName).tag(quality)
+                    }
+                }
+                if let note = status.qualityNote {
+                    Text(note)
+                }
             }
         } label: {
             Text(effective.shortName)

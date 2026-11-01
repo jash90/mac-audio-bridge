@@ -4,8 +4,9 @@ import Foundation
 public enum AudioCodec: UInt8, Sendable {
     /// Uncompressed 16-bit PCM samples in the payload.
     case pcm16 = 0
-    /// One Opus packet (one 5 ms CELT frame, CBR) per entry; entries are
-    /// length-prefixed by the datagram layout.
+    /// One Opus packet (one CELT frame, CBR: 5 ms on the LAN, 20 ms on the
+    /// Internet profile — see the entry's frame duration) per entry; entries
+    /// are length-prefixed by the datagram layout.
     case opus = 1
 }
 
@@ -61,6 +62,15 @@ public struct AudioPacket: Sendable, Equatable {
     /// offset), not the datagram's primary frame. The jitter buffer uses a
     /// redundant copy only to fill a slot whose primary never arrived.
     public var isRedundant: Bool
+    /// 5 ms sequence slots this frame covers (1; 4 for a 20 ms Opus frame,
+    /// which occupies `sequence ..< sequence + 4`).
+    public var frameSlots: Int
+    /// Sender side: what the redundant copies of this frame carry instead of
+    /// `payload` (the low-rate encoding of the same audio); nil = copies
+    /// repeat `payload`.
+    public var copyPayload: Data?
+    /// Receiver side: this redundant copy carries a low-rate encoding.
+    public var isLowRateCopy: Bool
 
     public init(
         codec: AudioCodec,
@@ -68,7 +78,10 @@ public struct AudioPacket: Sendable, Equatable {
         sequence: UInt32,
         sampleTime: UInt64,
         payload: Data,
-        isRedundant: Bool = false
+        isRedundant: Bool = false,
+        frameSlots: Int = 1,
+        copyPayload: Data? = nil,
+        isLowRateCopy: Bool = false
     ) {
         self.codec = codec
         self.flags = flags
@@ -76,6 +89,9 @@ public struct AudioPacket: Sendable, Equatable {
         self.sampleTime = sampleTime
         self.payload = payload
         self.isRedundant = isRedundant
+        self.frameSlots = frameSlots
+        self.copyPayload = copyPayload
+        self.isLowRateCopy = isLowRateCopy
     }
 
     /// Wire encoding of a datagram that carries only this frame.
@@ -103,7 +119,7 @@ public struct AudioPacket: Sendable, Equatable {
 ///
 ///     offset  size  field
 ///        0      4   magic "MABA" (0x4D414241)
-///        4      1   version (4)
+///        4      1   version (6)
 ///        5      1   codec (AudioCodec raw value)
 ///        6      1   bits 0–3: frame flags (AudioPacketFlags) of the oldest
 ///                   primary frame; bits 4–6: primary count − 1 (1...8);
@@ -114,25 +130,57 @@ public struct AudioPacket: Sendable, Equatable {
 ///       20      4   source tag (`SourceTag` of the sending Mac; 0 =
 ///                   untagged) — the receiver plays one source at a time
 ///       24      …   entries, each:
-///                     1  back offset k: this entry is frame
-///                        (sequence − k), sampleTime − k × samplesPerFrame
-///                     2  payload length (big-endian)
+///                     1  back offset k (in 5 ms slots): this entry is
+///                        frame (sequence − k), sampleTime − k × samplesPerFrame
+///                     2  big-endian: bits 0–10 payload length; bits 13–14
+///                        frame duration, log2 of its 5 ms slots (0 = 5 ms,
+///                        1 = 10 ms, 2 = 20 ms); bit 15 low-rate copy (the
+///                        entry is a copy from the sender's second, low-rate
+///                        encoder); bits 11–12 zero
 ///                     n  payload
 ///
-/// Offsets below the primary count are the datagram's primary frames (the
-/// LAN layout has one: offset 0; the WAN layout carries four consecutive
-/// 5 ms frames, offsets 0...3); larger offsets are redundant copies of
-/// earlier frames. A datagram may carry redundant entries only (no offset
-/// below the primary count) — e.g. PCM16's delayed copy.
+/// Sequence numbers and offsets always count 5 ms slots: a 20 ms Opus frame
+/// is frame `sequence` and covers slots `sequence ..< sequence + 4`, so the
+/// receiver's jitter buffer and the LAN ↔ WAN switch keep one continuous
+/// sequence space. Offsets below the primary count are the datagram's
+/// primary frames (both production layouts carry one, offset 0); larger
+/// offsets are redundant copies of earlier frames. A datagram may carry
+/// redundant entries only (no offset below the primary count) — e.g.
+/// PCM16's delayed copy.
+///
+/// Version 6 (this one) adds the per-entry frame duration and low-rate flag
+/// to version 4 (the mic stream uses version 5, see `MicDatagram`).
 public struct AudioDatagram: Sendable, Equatable {
     public struct Entry: Sendable, Equatable {
         /// Frames back from the reference sequence (0 = the reference frame).
         public var offset: UInt8
         public var payload: Data
+        /// 5 ms slots the frame covers (1, 2 or 4).
+        public var frameSlots: Int
+        /// A copy from the sender's low-rate encoder.
+        public var lowRate: Bool
 
-        public init(offset: UInt8, payload: Data) {
+        public init(offset: UInt8, payload: Data, frameSlots: Int = 1, lowRate: Bool = false) {
             self.offset = offset
             self.payload = payload
+            self.frameSlots = frameSlots
+            self.lowRate = lowRate
+        }
+
+        /// A primary entry for `packet`.
+        public static func primary(_ packet: AudioPacket, reference: UInt32) -> Entry {
+            Entry(
+                offset: AudioDatagram.offset(of: packet, from: reference), payload: packet.payload,
+                frameSlots: packet.frameSlots)
+        }
+
+        /// A redundant-copy entry for `packet`: its low-rate payload when it
+        /// has one.
+        public static func copy(_ packet: AudioPacket, reference: UInt32) -> Entry {
+            Entry(
+                offset: AudioDatagram.offset(of: packet, from: reference),
+                payload: packet.copyPayload ?? packet.payload, frameSlots: packet.frameSlots,
+                lowRate: packet.copyPayload != nil || packet.isLowRateCopy)
         }
     }
 
@@ -142,9 +190,17 @@ public struct AudioDatagram: Sendable, Equatable {
     public static let entryHeaderSize = 3
     /// Leading magic value, ASCII "MABA".
     public static let magic: UInt32 = 0x4D41_4241
-    /// Version 4: version 3 (5 ms frames, multi-frame entries, source tag)
-    /// plus several primary frames per datagram and the profile bit.
-    public static let version: UInt8 = 4
+    /// Version 6: version 4 (5 ms slots, multi-frame entries, source tag,
+    /// several primaries, the profile bit) plus each entry's frame duration
+    /// and low-rate flag. Version 5 is the mic stream's.
+    public static let version: UInt8 = 6
+    /// Largest entry payload the length field can carry (11 bits).
+    public static let maxEntryPayloadBytes = 0x07FF
+    private static let lengthMask: UInt16 = 0x07FF
+    private static let slotsShift: UInt16 = 13
+    private static let slotsMask: UInt16 = 0x6000
+    private static let lowRateBit: UInt16 = 0x8000
+    private static let reservedMask: UInt16 = 0x1800
     /// Most primary frames one datagram can carry (3 header bits).
     public static let maxPrimaryCount = 8
 
@@ -209,10 +265,8 @@ public struct AudioDatagram: Sendable, Equatable {
             codec: reference.codec, flags: primaries[0].flags, sequence: reference.sequence,
             sampleTime: reference.sampleTime, source: source, primaryCount: primaries.count,
             profile: profile,
-            entries: primaries.reversed().map {
-                Entry(offset: Self.offset(of: $0, from: reference.sequence), payload: $0.payload)
-            }
-                + redundant.map { Entry(offset: Self.offset(of: $0, from: reference.sequence), payload: $0.payload) })
+            entries: primaries.reversed().map { Entry.primary($0, reference: reference.sequence) }
+                + redundant.map { Entry.copy($0, reference: reference.sequence) })
     }
 
     /// Back offset of `packet` relative to `reference`.
@@ -240,7 +294,9 @@ public struct AudioDatagram: Sendable, Equatable {
                 sequence: sequence &- offset,
                 sampleTime: sampleTime &- UInt64(offset) * UInt64(AudioFormat.samplesPerFrame),
                 payload: entry.payload,
-                isRedundant: Int(entry.offset) >= primaryCount)
+                isRedundant: Int(entry.offset) >= primaryCount,
+                frameSlots: entry.frameSlots,
+                isLowRateCopy: entry.lowRate && Int(entry.offset) >= primaryCount)
         }
         let primaries = entries.filter { Int($0.offset) < primaryCount }.sorted { $0.offset > $1.offset }
         let copies = entries.filter { Int($0.offset) >= primaryCount }
@@ -268,10 +324,15 @@ public struct AudioDatagram: Sendable, Equatable {
         append32(UInt32(truncatingIfNeeded: sampleTime))
         append32(source)
         for entry in entries {
-            precondition(entry.payload.count <= Int(UInt16.max), "entry payload too large")
+            precondition(entry.payload.count <= Self.maxEntryPayloadBytes, "entry payload too large")
+            let slotsCode = UInt16(entry.frameSlots.trailingZeroBitCount)
+            precondition(
+                [1, 2, 4].contains(entry.frameSlots), "frame duration must be 1, 2 or 4 slots")
+            let field = UInt16(entry.payload.count) | slotsCode << Self.slotsShift
+                | (entry.lowRate ? Self.lowRateBit : 0)
             data.append(entry.offset)
-            data.append(UInt8((entry.payload.count >> 8) & 0xFF))
-            data.append(UInt8(entry.payload.count & 0xFF))
+            data.append(UInt8(field >> 8))
+            data.append(UInt8(field & 0xFF))
             data.append(entry.payload)
         }
         return data
@@ -312,12 +373,19 @@ public struct AudioDatagram: Sendable, Equatable {
         for _ in 0..<entryCount {
             guard data.count - cursor >= entryHeaderSize else { throw AudioPacketError.malformedEntries }
             let offset = byte(cursor)
-            let length = Int(byte(cursor + 1)) << 8 | Int(byte(cursor + 2))
+            let field = UInt16(byte(cursor + 1)) << 8 | UInt16(byte(cursor + 2))
+            let length = Int(field & lengthMask)
+            let slotsCode = (field & slotsMask) >> slotsShift
             cursor += entryHeaderSize
-            guard data.count - cursor >= length, seenOffsets.insert(offset).inserted else {
+            guard field & reservedMask == 0, slotsCode <= 2,
+                data.count - cursor >= length, seenOffsets.insert(offset).inserted
+            else {
                 throw AudioPacketError.malformedEntries
             }
-            entries.append(Entry(offset: offset, payload: data[(base + cursor)..<(base + cursor + length)]))
+            entries.append(
+                Entry(
+                    offset: offset, payload: data[(base + cursor)..<(base + cursor + length)],
+                    frameSlots: 1 << Int(slotsCode), lowRate: field & lowRateBit != 0))
             cursor += length
         }
         guard cursor == data.count else { throw AudioPacketError.malformedEntries }
@@ -393,13 +461,15 @@ public struct DatagramLayout: Equatable, Sendable {
         pcmOffsets: AudioRedundancy.enabled ? AudioRedundancy.pcmOffsets : [],
         opusOffsets: AudioRedundancy.enabled ? AudioRedundancy.opusOffsets : [])
 
-    /// Four 5 ms Opus frames per datagram (one datagram per 20 ms), each
-    /// datagram repeating the frames of the previous two (offsets 4...11):
-    /// N = 2 redundancy, loss runs of two datagrams (40 ms) recovered,
-    /// 24 + 12 × 83 = 1020 B at Opus 128.
+    /// One 20 ms Opus frame per datagram (one datagram per 20 ms, as
+    /// before), each datagram repeating the previous two frames (offsets 4
+    /// and 8 slots) as low-rate copies (`StreamEncoding.copyBitrate`): N = 2
+    /// redundancy, loss runs of two datagrams (40 ms) recovered, 24 + 3 + 240
+    /// + 2 × (3 + 60) = 393 B at Opus 96. A 5 ms frame on WAN (the remainder
+    /// of a 20 ms group cut short by a switch) gets the same two offsets.
     public static let wan = DatagramLayout(
-        framesPerDatagram: 4, pcmOffsets: AudioRedundancy.pcmOffsets,
-        opusOffsets: AudioRedundancy.enabled ? Array(4...11) : [])
+        framesPerDatagram: 1, pcmOffsets: AudioRedundancy.pcmOffsets,
+        opusOffsets: AudioRedundancy.enabled ? [4, 8] : [])
 
     func offsets(for codec: AudioCodec) -> [Int] {
         switch codec {
@@ -469,6 +539,14 @@ public struct RedundancyPacker: Sendable {
         profile == .wan ? wanLayout : lanLayout
     }
 
+    /// The layout for `frame`: the profile's, except that a multi-slot
+    /// (20 ms) frame always takes the WAN copy offsets — the encoder and the
+    /// profile mark switch on separate atomics, so the first 20 ms frame can
+    /// reach a packer that still marks LAN.
+    private func layout(for frame: AudioPacket) -> DatagramLayout {
+        frame.frameSlots > 1 ? wanLayout : layout
+    }
+
     public mutating func reset() {
         history.removeAll(keepingCapacity: true)
         pending.removeAll(keepingCapacity: true)
@@ -491,7 +569,7 @@ public struct RedundancyPacker: Sendable {
         guard !pending.isEmpty else { return [] }
         let group = pending
         pending.removeAll(keepingCapacity: true)
-        return emit(group)
+        return emit(group, layout: layout)
     }
 
     /// The datagrams to send for `frame`, in send order: the primaries first
@@ -500,7 +578,8 @@ public struct RedundancyPacker: Sendable {
     /// belong to another codec. Empty while a group is still filling.
     public mutating func pack(_ frame: AudioPacket) -> [Data] {
         var out: [Data] = []
-        let grouped = layout.framesPerDatagram > 1 && frame.codec == .opus
+        let layout = layout(for: frame)
+        let grouped = layout.framesPerDatagram > 1 && frame.codec == .opus && frame.frameSlots == 1
         if !pending.isEmpty,
             !grouped || frame.codec != pending[0].codec || frame.flags.contains(.discontinuity)
         {
@@ -515,14 +594,14 @@ public struct RedundancyPacker: Sendable {
                 out += flush()
             }
         } else {
-            out += emit([frame])
+            out += emit([frame], layout: layout)
         }
         return out
     }
 
     /// Datagrams for consecutive `primaries` (oldest first) plus the copies
     /// due with them; then records the primaries in the history.
-    private mutating func emit(_ primaries: [AudioPacket]) -> [Data] {
+    private mutating func emit(_ primaries: [AudioPacket], layout: DatagramLayout) -> [Data] {
         let reference = primaries[primaries.count - 1]
         let primaryCount = primaries.count
         // Nearest first: history is newest last.
@@ -540,9 +619,8 @@ public struct RedundancyPacker: Sendable {
         var current = AudioDatagram(primaries: primaries, redundant: [], source: sourceTag, profile: profile)
         var size = AudioDatagram.encodedSize(payloadSizes: primaries.map(\.payload.count))
         for copy in redundant {
-            let entry = AudioDatagram.Entry(
-                offset: AudioDatagram.offset(of: copy, from: reference.sequence), payload: copy.payload)
-            let added = AudioDatagram.entryHeaderSize + copy.payload.count
+            let entry = AudioDatagram.Entry.copy(copy, reference: reference.sequence)
+            let added = AudioDatagram.entryHeaderSize + entry.payload.count
             if copy.codec != current.codec || size + added > maxDatagramBytes, !current.entries.isEmpty {
                 datagrams.append(current.encoded())
                 current = AudioDatagram(

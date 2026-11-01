@@ -3,8 +3,9 @@ import Foundation
 /// Transport profile of the audio stream. `.lan` is the M2.8 + Opus layout
 /// tuned for Wi-Fi; `.wan` is used whenever the audio path leaves the LAN
 /// (a tailnet / public remote address, or the phone reports an expensive —
-/// cellular — path): fewer, bigger datagrams, Opus 128, bounded redundancy,
-/// a deeper jitter buffer and a relaxed keepalive.
+/// cellular — path): one 20 ms Opus frame per datagram at the user's
+/// `InternetQuality`, two low-rate redundant copies, a deeper jitter buffer
+/// and a relaxed keepalive.
 ///
 /// The sender decides and marks every datagram with its profile
 /// (`AudioDatagram.profile`); the receiver follows the mark (jitter-buffer
@@ -12,21 +13,23 @@ import Foundation
 /// no restart is needed. A switch keeps the frame sequence continuous: the
 /// buffer is retuned in place (`JitterBuffer.retune`), never reset.
 ///
-/// WAN layout, chosen by overhead vs latency (Opus 128 = 80 B per 5 ms
-/// frame; per-datagram cost over Tailscale ≈ 88 B: inner IPv4/UDP 28 +
-/// WireGuard 32 + outer IPv4/UDP 28, plus our 24 B header and 3 B per
-/// entry), each frame sent three times (primary + 2 copies):
+/// WAN layout (docs/research/compression.md, "best implementation" B + C):
+/// one datagram per 20 ms as before, now carrying ONE 20 ms Opus frame
+/// (instead of four 5 ms frames — at ≤ 96 kbit/s 5 ms frames cost a whole
+/// bitrate step) plus copies of the previous two frames from a second
+/// encoder at 24 kbit/s (instead of full-rate copies, which were 71 % of the
+/// bytes). Per-datagram cost over Tailscale ≈ 88 B (inner IPv4/UDP 28 +
+/// WireGuard 32 + outer IPv4/UDP 28) on top of our 24 B header and 3 B per
+/// entry:
 ///
-///     frames/datagram   datagram   wire B/s   MB/h   loss run covered   added latency
-///          1 (5 ms)       273 B     72 200    260         10 ms              0
-///          2 (10 ms)      522 B     61 000    220         20 ms             +5 ms
-///          4 (20 ms)     1020 B     55 400    199         40 ms            +15 ms
+///     InternetQuality     datagram   MB/h (Tailscale)   loss run covered   added latency
+///     High     Opus 128     473 B        101                40 ms              0
+///     Standard Opus  96     393 B         87                40 ms              0
+///     Saver    Opus  64     313 B         72                40 ms              0
+///     Floor    Opus  48     273 B         65                40 ms              0
 ///
-/// 4 frames per datagram (one datagram per 20 ms, the VoIP ptime) with the
-/// previous two datagrams' frames repeated (offsets 4...11) is the only
-/// layout that meets ≤ ~200 MB/h with N = 2 redundancy, still fits the 1200 B
-/// budget (Tailscale MTU 1280) and covers the longest loss runs; its 15 ms
-/// is small next to the 120–200 ms WAN buffer floor.
+/// The 20 ms frame waits as long as the old 4 × 5 ms group did, so the
+/// latency is unchanged; the 120–200 ms WAN buffer floor dominates anyway.
 public enum StreamProfile: UInt8, Sendable, Equatable, Codable, CaseIterable {
     case lan = 0
     case wan = 1
@@ -55,23 +58,25 @@ public enum StreamProfile: UInt8, Sendable, Equatable, Codable, CaseIterable {
         }
     }
 
-    /// What is actually encoded for a requested quality: on WAN at most
-    /// Opus 128 (a lower Opus pick would be kept), never PCM.
-    public func effectiveQuality(_ requested: StreamQuality) -> StreamQuality {
+    /// What is encoded on this profile: the LAN pick on the LAN, the
+    /// Internet quality's Opus rung (20 ms frames, low-rate copies) on WAN.
+    public func encoding(lan: StreamQuality, internet: InternetQuality) -> StreamEncoding {
         switch self {
-        case .lan: requested
-        case .wan: .opus128
+        case .lan: .lan(lan)
+        case .wan: .wan(internet)
         }
     }
 
-    /// Why the effective quality differs from the requested one (nil = same).
-    public func qualityNote(requested: StreamQuality) -> String? {
-        let effective = effectiveQuality(requested)
-        guard effective != requested else { return nil }
-        if requested == .pcm {
-            return "PCM is not used over the Internet — streaming \(effective.displayName)"
-        }
-        return "Over the Internet: \(effective.displayName) to save data"
+    /// The quality actually encoded (see `encoding(lan:internet:)`).
+    public func effectiveQuality(lan: StreamQuality, internet: InternetQuality) -> StreamQuality {
+        encoding(lan: lan, internet: internet).quality
+    }
+
+    /// Why the stream runs another quality than the LAN pick (nil = it runs
+    /// the pick): on WAN the Internet quality applies.
+    public func qualityNote(lan: StreamQuality, internet: InternetQuality) -> String? {
+        guard self == .wan else { return nil }
+        return "Over the Internet: \(internet.displayName) — \(internet.quality.displayName), ≈ \(internet.expectedMegabytesPerHour) MB/h"
     }
 
     /// Receiver keepalive cadence: 20 ms on the LAN keeps the phone's Wi-Fi
@@ -117,7 +122,9 @@ public enum StreamProfile: UInt8, Sendable, Equatable, Codable, CaseIterable {
         // A datagram delivers 4 frames at once: the depth swings by 20 ms
         // per arrival, which must not look like excess latency to trim.
         config.latencyTrimSlackFrames = AudioFormat.frames(milliseconds: 40)
-        config.lossHorizonFrames = DatagramLayout.wan.maxOffset + 2
+        // A copy trails its frame by up to 8 slots and the copy's 20 ms
+        // frame spans 4 more: only frames newer than that prove it lost.
+        config.lossHorizonFrames = DatagramLayout.wan.maxOffset + StreamEncoding.wanFrameSlots + 2
         return config
     }
 
@@ -134,6 +141,99 @@ public enum StreamProfile: UInt8, Sendable, Equatable, Codable, CaseIterable {
         case .lan?, .loopback?: return .lan
         case nil: return targetIsHostName ? .wan : .lan
         }
+    }
+}
+
+/// The Internet profile's quality ladder (docs/research/compression.md §5),
+/// picked separately from the LAN quality and persisted on the Mac. Every
+/// rung sends 20 ms Opus frames with two 24 kbit/s copies.
+public enum InternetQuality: String, CaseIterable, Sendable, Codable {
+    /// Opus 128, ≈ 101 MB/h over Tailscale.
+    case high
+    /// Opus 96, ≈ 87 MB/h (the default).
+    case standard
+    /// Opus 64, ≈ 72 MB/h.
+    case saver
+    /// Opus 48, ≈ 65 MB/h: the lowest rung that still sounds pleasant.
+    case floor
+
+    public static let `default` = InternetQuality.standard
+
+    /// The Opus setting encoded at this rung.
+    public var quality: StreamQuality {
+        switch self {
+        case .high: .opus128
+        case .standard: .opus96
+        case .saver: .opus64
+        case .floor: .opus48
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .high: "High"
+        case .standard: "Standard"
+        case .saver: "Saver"
+        case .floor: "Floor"
+        }
+    }
+
+    /// Expected data use over Tailscale (direct), whole MB per hour, from
+    /// the real packer (`StreamDataRate.estimate`).
+    public var expectedMegabytesPerHour: Int {
+        Self.expectedRates[self] ?? 0
+    }
+
+    /// "Standard — Opus 96 kbit/s · ≈ 87 MB/h".
+    public var menuName: String {
+        "\(displayName) — \(quality.displayName) · ≈ \(expectedMegabytesPerHour) MB/h"
+    }
+
+    private static let expectedRates: [InternetQuality: Int] = Dictionary(
+        uniqueKeysWithValues: allCases.map { rung in
+            let estimate = StreamDataRate.estimate(.wan(rung), profile: .wan, path: .tailscaleDirect)
+            return (rung, Int(estimate.megabytesPerHour.rounded()))
+        })
+}
+
+/// What the sender encodes for one profile: the codec setting, the Opus
+/// frame duration (in 5 ms slots) and the bitrate of the redundant copies.
+public struct StreamEncoding: Equatable, Sendable {
+    /// 20 ms Opus frames on WAN.
+    public static let wanFrameSlots = 4
+    /// Bitrate of the WAN redundant copies (the study's 24 kbit/s: they
+    /// recover a loss almost as well as a full-rate copy, for a quarter of
+    /// the bytes).
+    public static let wanCopyBitrate = 24_000
+
+    public var quality: StreamQuality
+    /// 5 ms slots per Opus frame (1 or `wanFrameSlots`); PCM16 is always 1.
+    public var frameSlots: Int
+    /// Bitrate of the second encoder whose packets fill the redundant
+    /// copies; nil = copies repeat the primary.
+    public var copyBitrate: Int?
+
+    public init(quality: StreamQuality, frameSlots: Int = 1, copyBitrate: Int? = nil) {
+        precondition([1, 2, 4].contains(frameSlots), "frame duration must be 1, 2 or 4 slots")
+        self.quality = quality
+        self.frameSlots = quality.codec == .opus ? frameSlots : 1
+        self.copyBitrate = quality.codec == .opus ? copyBitrate : nil
+    }
+
+    /// LAN: the pick at 5 ms, full-rate copies.
+    public static func lan(_ quality: StreamQuality) -> StreamEncoding {
+        StreamEncoding(quality: quality)
+    }
+
+    /// WAN: the rung's Opus bitrate at 20 ms with 24 kbit/s copies.
+    public static func wan(_ quality: InternetQuality) -> StreamEncoding {
+        StreamEncoding(quality: quality.quality, frameSlots: wanFrameSlots, copyBitrate: wanCopyBitrate)
+    }
+
+    /// "Opus 96 kbit/s · 20 ms".
+    public var displayName: String {
+        frameSlots > 1
+            ? "\(quality.displayName) · \(frameSlots * AudioFormat.frameDurationMs) ms" : quality.displayName
     }
 }
 
@@ -211,12 +311,14 @@ public enum StreamDataRate {
         public var kilobitsPerSecond: Double { wireBytesPerSecond * 8 / 1000 }
     }
 
-    /// Steady-state rate of `quality` (as encoded on `profile`) on `path`,
+    /// Steady-state rate of `encoding` sent under `profile` on `path`,
     /// measured by running the real packer over CBR-sized frames.
-    public static func estimate(quality requested: StreamQuality, profile: StreamProfile, path: StreamPath) -> Estimate {
-        let quality = profile.effectiveQuality(requested)
-        let payload = quality.opusBitrate.map { $0 / 8 * AudioFormat.frameDurationMs / 1000 }
-            ?? AudioFormat.pcm16FrameBytes
+    public static func estimate(_ encoding: StreamEncoding, profile: StreamProfile, path: StreamPath) -> Estimate {
+        let quality = encoding.quality
+        let slots = encoding.frameSlots
+        let frameMs = AudioFormat.frameDurationMs * slots
+        let payload = quality.opusBitrate.map { $0 / 8 * frameMs / 1000 } ?? AudioFormat.pcm16FrameBytes
+        let copyPayload = encoding.copyBitrate.map { Data(count: $0 / 8 * frameMs / 1000) }
         var packer = RedundancyPacker()
         packer.profile = profile
         let warmUp = 64
@@ -225,17 +327,18 @@ public enum StreamDataRate {
         var bytes = 0
         var largest = 0
         for frame in 0..<(warmUp + measured) {
+            let sequence = frame * slots
             let packet = AudioPacket(
-                codec: quality.codec, sequence: UInt32(frame),
-                sampleTime: UInt64(frame * AudioFormat.samplesPerFrame),
-                payload: Data(count: payload))
+                codec: quality.codec, sequence: UInt32(sequence),
+                sampleTime: UInt64(sequence * AudioFormat.samplesPerFrame),
+                payload: Data(count: payload), frameSlots: slots, copyPayload: copyPayload)
             let out = packer.pack(packet)
             guard frame >= warmUp else { continue }
             datagrams += out.count
             bytes += out.reduce(0) { $0 + $1.count }
             largest = max(largest, out.map(\.count).max() ?? 0)
         }
-        let seconds = Double(measured) * AudioFormat.frameDuration
+        let seconds = Double(measured * slots) * AudioFormat.frameDuration
         let perSecond = Double(datagrams) / seconds
         let payloadRate = Double(bytes) / seconds
         return Estimate(

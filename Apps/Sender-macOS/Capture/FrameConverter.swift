@@ -44,15 +44,31 @@ final class AudibilityTracker: @unchecked Sendable {
     }
 }
 
-/// The stream quality picked in the menu, read once per drain tick on the
-/// converter queue — a plain atomic, like `VolumeGate`. A change applies from
-/// the next frame (within one 2.5 ms tick).
-final class QualityGate: @unchecked Sendable {
-    private let index = Atomic<Int>(StreamQuality.allCases.firstIndex(of: .default) ?? 0)
+/// What the converter encodes (`StreamEncoding`: codec setting, Opus frame
+/// duration, low-rate copies), read once per drain tick on the converter
+/// queue — one atomic word, like `VolumeGate`. A change applies from the
+/// next frame (within one 2.5 ms tick).
+final class EncodingGate: @unchecked Sendable {
+    /// Bits 0–3 quality index, bits 4–7 frame slots, bit 8 low-rate copies.
+    private let word = Atomic<Int>(EncodingGate.pack(.lan(.default)))
 
-    var value: StreamQuality {
-        get { StreamQuality.allCases[index.load(ordering: .relaxed)] }
-        set { index.store(StreamQuality.allCases.firstIndex(of: newValue) ?? 0, ordering: .relaxed) }
+    var value: StreamEncoding {
+        get { Self.unpack(word.load(ordering: .relaxed)) }
+        set { word.store(Self.pack(newValue), ordering: .relaxed) }
+    }
+
+    private static func pack(_ encoding: StreamEncoding) -> Int {
+        (StreamQuality.allCases.firstIndex(of: encoding.quality) ?? 0)
+            | encoding.frameSlots << 4 | (encoding.copyBitrate != nil ? 1 << 8 : 0)
+    }
+
+    private static func unpack(_ word: Int) -> StreamEncoding {
+        let qualities = StreamQuality.allCases
+        let quality = qualities[min(word & 0xF, qualities.count - 1)]
+        let slots = (word >> 4) & 0xF
+        return StreamEncoding(
+            quality: quality, frameSlots: [1, 2, 4].contains(slots) ? slots : 1,
+            copyBitrate: word & (1 << 8) != 0 ? StreamEncoding.wanCopyBitrate : nil)
     }
 }
 
@@ -126,10 +142,11 @@ final class EncoderStats: @unchecked Sendable {
 /// Drains the tap's ring buffer on a dedicated serial `.userInteractive` queue
 /// (strict timer every 2.5 ms), resamples to 48 kHz with `AVAudioConverter` when
 /// the tap rate differs, applies the virtual device's volume (see `VolumeGate`),
-/// and emits fixed 5 ms frames as `AudioPacket`s in the quality picked in the menu
-/// (`QualityGate`: Opus 192/128 kbit/s CBR or PCM16, encoded by `StreamFrameEncoder`
+/// and emits fixed 5 ms frames as `AudioPacket`s in the current encoding
+/// (`EncodingGate`: the LAN pick — Opus 192/128/96 or PCM16 — or, on the Internet
+/// profile, 20 ms Opus frames with low-rate copies, encoded by `StreamFrameEncoder`
 /// right here on the drain path, switching live from one frame to the next). A frame is emitted in the same
-/// tick it completes — no extra queueing — and sequence and sample time advance
+/// tick it completes (a 20 ms frame with its fourth 5 ms part) — no extra queueing — and sequence and sample time advance
 /// continuously for the app's lifetime; the first packet of every run carries
 /// `.discontinuity` so the receiver resets its jitter buffer.
 ///
@@ -156,9 +173,9 @@ final class FrameConverter: @unchecked Sendable {
     /// 0 when muted). Safe to update any time, including while running.
     let volumeGate = VolumeGate()
 
-    /// Stream quality (codec / bitrate) of emitted frames. Safe to update any
-    /// time, including while running.
-    let qualityGate = QualityGate()
+    /// Encoding (codec / bitrate / frame duration) of emitted frames. Safe to
+    /// update any time, including while running.
+    let encodingGate = EncodingGate()
 
     /// Encoder telemetry for the stats line.
     let encoderStats = EncoderStats()
@@ -452,12 +469,13 @@ final class FrameConverter: @unchecked Sendable {
     }
 
     /// Chops the staging buffer into whole 5 ms frames, applies the volume
-    /// gate's gain, encodes each in the selected quality, and hands one
-    /// `AudioPacket` per frame to `onFrame`.
+    /// gate's gain, encodes them in the current encoding, and hands every
+    /// finished `AudioPacket` to `onFrame` (one per 5 ms frame, or one per
+    /// four on the Internet profile).
     private func emitCompleteFrames() {
         // One relaxed atomic load each per drain; mute yields gain 0 (zeros out).
         let gain = volumeGate.value
-        let quality = qualityGate.value
+        let encoding = encodingGate.value
         var frameStart = 0
         while staging.count - frameStart >= Self.samplesPerFrame {
             let flags: AudioPacketFlags = pendingDiscontinuity ? [.discontinuity] : []
@@ -470,15 +488,17 @@ final class FrameConverter: @unchecked Sendable {
             if audible {
                 audibility.recordAudible()
             }
-            let packet = staging.withUnsafeBufferPointer { buffer in
+            staging.withUnsafeBufferPointer { buffer in
                 frameEncoder.encode(
-                    buffer.baseAddress! + frameStart, gain: gain, quality: quality, flags: flags,
-                    sequence: sequence, sampleTime: sampleTime)
+                    buffer.baseAddress! + frameStart, gain: gain, encoding: encoding, flags: flags,
+                    sequence: sequence, sampleTime: sampleTime
+                ) { packet in
+                    encoderStats.record(
+                        codec: packet.codec, payloadBytes: packet.payload.count,
+                        encodeNanos: DispatchTime.now().uptimeNanoseconds - started)
+                    onFrame?(packet)
+                }
             }
-            encoderStats.record(
-                codec: packet.codec, payloadBytes: packet.payload.count,
-                encodeNanos: DispatchTime.now().uptimeNanoseconds - started)
-            onFrame?(packet)
             nextSequence = nextSequence &+ 1
             nextSampleTime &+= UInt64(AudioFormat.samplesPerFrame)
             pendingDiscontinuity = false

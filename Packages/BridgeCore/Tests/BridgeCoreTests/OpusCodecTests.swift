@@ -203,7 +203,13 @@ struct OpusCodecTests {
     @Test("Stream quality names and the receiver's codec readout")
     func qualityNames() {
         #expect(StreamQuality.default == .opus192)
-        #expect(StreamQuality.allCases.map(\.displayName) == ["Opus 192 kbit/s", "Opus 128 kbit/s", "PCM (uncompressed)"])
+        #expect(
+            StreamQuality.allCases.map(\.displayName) == [
+                "Opus 192 kbit/s", "Opus 128 kbit/s", "Opus 96 kbit/s", "Opus 64 kbit/s", "Opus 48 kbit/s",
+                "PCM (uncompressed)",
+            ])
+        #expect(StreamQuality.receiverDescription(codec: .opus, payloadBytes: 240, frameSlots: 4) == "Opus 96 kbit/s · 20 ms")
+        #expect(StreamQuality.receiverDescription(codec: .opus, payloadBytes: 120, frameSlots: 4) == "Opus 48 kbit/s · 20 ms")
         #expect(StreamQuality.receiverDescription(codec: .opus, payloadBytes: 120) == "Opus 192 kbit/s")
         #expect(StreamQuality.receiverDescription(codec: .opus, payloadBytes: 80) == "Opus 128 kbit/s")
         #expect(StreamQuality.receiverDescription(codec: .pcm16, payloadBytes: 960) == "PCM (uncompressed)")

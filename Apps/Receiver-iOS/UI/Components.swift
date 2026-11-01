@@ -251,8 +251,7 @@ struct MacVolumeRow: View {
     }
 }
 
-/// Quality picker for the active Mac (the requested quality; the WAN cap
-/// note explains when the stream runs lower).
+/// Quality picker for the active Mac: its Wi‑Fi (LAN) quality.
 struct QualityPicker: View {
     @ObservedObject var sources: SourcesModel
     let sourceID: String
@@ -260,13 +259,37 @@ struct QualityPicker: View {
 
     var body: some View {
         Picker(selection: Binding(get: { status.quality }, set: { sources.setQuality($0, for: sourceID) })) {
-            ForEach(StreamQuality.allCases, id: \.self) { quality in
+            ForEach(StreamQuality.lanChoices, id: \.self) { quality in
                 Text(quality.menuName).tag(quality)
             }
         } label: {
-            Label("Quality", systemImage: "dial.medium")
+            Label("Wi‑Fi quality", systemImage: "wifi")
         }
         .pickerStyle(.menu)
+    }
+}
+
+/// The active Mac's Internet quality (used over Tailscale / cellular), each
+/// rung with its expected data use.
+struct InternetQualityPicker: View {
+    @ObservedObject var sources: SourcesModel
+    let sourceID: String
+    let status: SourceStatus
+
+    var body: some View {
+        Picker(
+            selection: Binding(
+                get: { status.internetQuality ?? .default },
+                set: { sources.setInternetQuality($0, for: sourceID) })
+        ) {
+            ForEach(InternetQuality.allCases, id: \.self) { quality in
+                Text(quality.menuName).tag(quality)
+            }
+        } label: {
+            Label("Internet quality", systemImage: "antenna.radiowaves.left.and.right")
+        }
+        .pickerStyle(.menu)
+        .disabled(!sources.supportsInternetQuality(sourceID))
     }
 }
 
@@ -274,9 +297,8 @@ extension StreamQuality {
     /// Chip / segment label.
     var shortName: String {
         switch self {
-        case .opus192: "Opus 192"
-        case .opus128: "Opus 128"
         case .pcm: "PCM"
+        default: "Opus \((opusBitrate ?? 0) / 1000)"
         }
     }
 
@@ -285,6 +307,9 @@ extension StreamQuality {
         switch self {
         case .opus192: "Opus 192 — best for Wi‑Fi"
         case .opus128: "Opus 128 — saves data"
+        case .opus96: "Opus 96 — saves more data"
+        case .opus64: "Opus 64"
+        case .opus48: "Opus 48"
         case .pcm: "PCM — uncompressed, Wi‑Fi only"
         }
     }
@@ -403,7 +428,7 @@ enum SourcePresentation {
         guard source.connected, let status = source.status else { return "Connecting…" }
         if let problem = status.problem { return problem }
         if status.streamingToYou {
-            let quality = (status.profile ?? .lan).effectiveQuality(status.quality).shortName
+            let quality = status.effectiveQuality.shortName
             if let path = status.path, path != .local {
                 return "Playing on this iPhone · \(quality) · \(path.displayName)"
             }

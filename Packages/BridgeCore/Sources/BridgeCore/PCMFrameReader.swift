@@ -28,17 +28,20 @@ public struct ConcealmentStats: Sendable, Equatable {
 /// The codec and frame size of the stream being played, for the UI.
 public struct PlayoutStream: Sendable, Equatable {
     public var codec: AudioCodec
-    /// Payload bytes of the last frame played.
+    /// Payload bytes of the last frame played (a primary, not a copy).
     public var payloadBytes: Int
+    /// 5 ms slots of that frame (4 = 20 ms).
+    public var frameSlots: Int
 
-    public init(codec: AudioCodec, payloadBytes: Int) {
+    public init(codec: AudioCodec, payloadBytes: Int, frameSlots: Int = 1) {
         self.codec = codec
         self.payloadBytes = payloadBytes
+        self.frameSlots = frameSlots
     }
 
-    /// "Opus 192 kbit/s" / "PCM (uncompressed)".
+    /// "Opus 192 kbit/s" / "Opus 96 kbit/s · 20 ms" / "PCM (uncompressed)".
     public var displayName: String {
-        StreamQuality.receiverDescription(codec: codec, payloadBytes: payloadBytes)
+        StreamQuality.receiverDescription(codec: codec, payloadBytes: payloadBytes, frameSlots: frameSlots)
     }
 }
 
@@ -62,6 +65,14 @@ public struct PlayoutStream: Sendable, Equatable {
 /// slots, late frames, trims), and whether a slot is lost is only known at
 /// playout time. libopus decode / PLC never allocates (stack scratch via
 /// `USE_ALLOCA`) and takes no locks; one 5 ms frame costs ≈ 40–50 µs.
+///
+/// 20 ms Opus frames (the Internet profile) occupy four consecutive slots:
+/// the frame is decoded whole (960 samples) when its first slot comes up, and
+/// the next three slots are served from that decoded block. A missing slot is
+/// concealed by Opus PLC 5 ms at a time, so a lost 20 ms frame becomes four
+/// PLC slots and the next frame joins the PLC signal as after any loss. A
+/// low-rate copy that stands in for a lost frame goes through the same
+/// decoder (Opus follows bitrate changes from packet to packet).
 ///
 /// Playout rules, one slot at a time:
 /// - a frame continuing the previous one is played as is;
@@ -132,6 +143,8 @@ public final class PCMFrameReader: @unchecked Sendable {
     private let fadeTable: UnsafeMutablePointer<Float>
     private let seamTable: UnsafeMutablePointer<Float>
     private let decayTable: UnsafeMutablePointer<Float>
+    /// The decoded multi-slot frame being served (up to 20 ms).
+    private let block: UnsafeMutablePointer<Float>
     /// Opus decoder (render thread only); nil only if libopus failed to
     /// create one, in which case Opus frames are concealed.
     private let opus: OpusDecoderBox?
@@ -176,6 +189,11 @@ public final class PCMFrameReader: @unchecked Sendable {
     /// Codec of the last frame decoded (nil before the first): the stream
     /// the Opus decoder state belongs to.
     private var streamCodec: AudioCodec?
+    /// `block` holds the decoded frame whose first slot is `blockBase`,
+    /// `blockSlots` slots long.
+    private var blockValid = false
+    private var blockBase: UInt32 = 0
+    private var blockSlots = 0
 
     /// Remaining interleaved samples of the frame being played, published for
     /// the latency readout. Relaxed and approximate by design.
@@ -190,6 +208,7 @@ public final class PCMFrameReader: @unchecked Sendable {
     /// `AudioCodec` raw value of the last frame played; `UInt8.max` = none.
     private let lastCodec = Atomic<UInt8>(.max)
     private let lastPayloadBytes = Atomic<Int>(0)
+    private let lastFrameSlots = Atomic<Int>(1)
 
     public init(source: @escaping Source) {
         self.source = source
@@ -205,6 +224,8 @@ public final class PCMFrameReader: @unchecked Sendable {
         fadeTable = .allocate(capacity: Self.fadeFrames)
         seamTable = .allocate(capacity: Self.seamFrames)
         decayTable = .allocate(capacity: Self.concealDecayFrames)
+        block = .allocate(capacity: slot * OpusSettings.maxFrameSlots)
+        block.initialize(repeating: 0, count: slot * OpusSettings.maxFrameSlots)
         opus = try? OpusDecoderBox()
         for buffer in [current, skippedFrame, scratch] {
             buffer.initialize(repeating: 0, count: slot)
@@ -235,6 +256,7 @@ public final class PCMFrameReader: @unchecked Sendable {
         fadeTable.deallocate()
         seamTable.deallocate()
         decayTable.deallocate()
+        block.deallocate()
     }
 
     /// Fraction of the in-flight playout frame (0..<1, in frames) not yet
@@ -261,7 +283,9 @@ public final class PCMFrameReader: @unchecked Sendable {
     /// (relaxed snapshot).
     public var stream: PlayoutStream? {
         AudioCodec(rawValue: lastCodec.load(ordering: .relaxed)).map {
-            PlayoutStream(codec: $0, payloadBytes: lastPayloadBytes.load(ordering: .relaxed))
+            PlayoutStream(
+                codec: $0, payloadBytes: lastPayloadBytes.load(ordering: .relaxed),
+                frameSlots: lastFrameSlots.load(ordering: .relaxed))
         }
     }
 
@@ -291,6 +315,7 @@ public final class PCMFrameReader: @unchecked Sendable {
         currentIsAudio = false
         mode = .silent
         previousSequence = nil
+        blockValid = false
         history.update(repeating: 0, count: Self.historyFrames * Self.channels)
         historyWrite = 0
         pendingSamples.store(0, ordering: .relaxed)
@@ -335,7 +360,7 @@ public final class PCMFrameReader: @unchecked Sendable {
         case .silent:
             join = .fadeIn
         case .audio:
-            if frame.skippedByteCount > 0, let previous = previousSequence,
+            if frame.hasSkipped, let previous = previousSequence,
                 frame.sequence == previous &+ 2, !switchesStream, frame.skippedCodec == frame.codec
             {
                 join = .trim
@@ -360,7 +385,11 @@ public final class PCMFrameReader: @unchecked Sendable {
         if restartsOpus {
             opus?.reset()
         }
-        if join == .trim, !decode(frame.skippedCodec, skippedPayload, frame.skippedByteCount, into: skippedFrame) {
+        if join == .trim,
+            !render(
+                frame.skippedCodec, skippedPayload, frame.skippedByteCount, sequence: frame.sequence &- 1,
+                slots: frame.skippedFrameSlots, part: frame.skippedPart, into: skippedFrame)
+        {
             // The skipped frame continues the last output exactly; when it
             // cannot be decoded, conceal it instead (Opus: PLC, which keeps
             // the decoder in step).
@@ -368,7 +397,11 @@ public final class PCMFrameReader: @unchecked Sendable {
             startConcealment()
             generate(into: skippedFrame, frames: Self.fadeFrames)
         }
-        guard decode(frame.codec, payload, frame.byteCount, into: current) else {
+        guard
+            render(
+                frame.codec, payload, frame.byteCount, sequence: frame.sequence, slots: frame.frameSlots,
+                part: frame.part, into: current)
+        else {
             decodeErrors.add(1, ordering: .relaxed)
             if restartsOpus {
                 // The decoder was just reset: its PLC would be silence, so
@@ -419,8 +452,11 @@ public final class PCMFrameReader: @unchecked Sendable {
         hasStarted = true
         previousSequence = frame.sequence
         currentIsAudio = true
-        lastCodec.store(frame.codec.rawValue, ordering: .relaxed)
-        lastPayloadBytes.store(frame.byteCount, ordering: .relaxed)
+        if frame.part == 0, !frame.recovered {
+            lastCodec.store(frame.codec.rawValue, ordering: .relaxed)
+            lastPayloadBytes.store(frame.byteCount, ordering: .relaxed)
+            lastFrameSlots.store(frame.frameSlots, ordering: .relaxed)
+        }
     }
 
     private func conceal() {
@@ -634,6 +670,36 @@ public final class PCMFrameReader: @unchecked Sendable {
             history[index + 1] = frame[2 * i + 1]
             historyWrite = historyWrite + 1 == Self.historyFrames ? 0 : historyWrite + 1
         }
+    }
+
+    /// One slot of audio into `out`: a single-slot frame is decoded
+    /// directly; part 0 of a multi-slot frame decodes the whole frame into
+    /// `block` and serves its first slot, later parts are served from that
+    /// block. False when the payload is not a valid frame, or a later part's
+    /// first slot was never decoded (dropped by an overflow resync).
+    private func render(
+        _ codec: AudioCodec, _ bytes: UnsafeMutableRawBufferPointer, _ byteCount: Int, sequence: UInt32,
+        slots: Int, part: Int, into out: UnsafeMutablePointer<Float>
+    ) -> Bool {
+        guard slots > 1 else {
+            blockValid = false
+            return decode(codec, bytes, byteCount, into: out)
+        }
+        guard slots <= OpusSettings.maxFrameSlots, part < slots else { return false }
+        if part == 0 {
+            blockValid = false
+            let frames = slots * Self.slotFrames
+            guard codec == .opus, let opus, let base = bytes.baseAddress, byteCount > 0, byteCount <= bytes.count,
+                opus.decode(base, count: byteCount, into: block, maxFrames: frames) == frames
+            else { return false }
+            blockValid = true
+            blockBase = sequence
+            blockSlots = slots
+        } else if !blockValid || blockSlots != slots || blockBase &+ UInt32(part) != sequence {
+            return false
+        }
+        out.update(from: block + part * interleavedPerSlot, count: interleavedPerSlot)
+        return true
     }
 
     /// Decodes one frame of `codec` into `out` (one whole slot); false when

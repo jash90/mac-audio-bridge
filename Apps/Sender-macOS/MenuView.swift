@@ -13,9 +13,6 @@ struct MenuView: View {
     /// Text-field mirror of the manual host (persisted by the controller
     /// under the same `receiverHost` key).
     @AppStorage("receiverHost") private var manualHostText = ""
-    /// Codec / bitrate choice, persisted; the controller reads the same key
-    /// at launch and applies changes live.
-    @AppStorage(SenderController.qualityKey) private var quality = StreamQuality.default
     @State private var manualSectionExpanded = false
 
     var body: some View {
@@ -192,16 +189,29 @@ struct MenuView: View {
 
     // MARK: - Quality picker
 
+    /// The LAN quality and, separately, the Internet quality (used whenever
+    /// the stream runs the Internet profile), each with what it costs. Both
+    /// are persisted by the controller and can also be changed from the phone.
+    @ViewBuilder
     private var qualityPicker: some View {
-        Picker("Quality", selection: $quality) {
-            ForEach(StreamQuality.allCases, id: \.self) { quality in
+        Picker(
+            "Quality",
+            selection: Binding(get: { controller.quality }, set: { controller.setQuality($0) })
+        ) {
+            ForEach(StreamQuality.lanChoices, id: \.self) { quality in
                 Text(quality.displayName).tag(quality)
             }
         }
         .pickerStyle(.menu)
-        .onChange(of: quality) { _, newQuality in
-            controller.setQuality(newQuality)
+        Picker(
+            "Internet quality",
+            selection: Binding(get: { controller.internetQuality }, set: { controller.setInternetQuality($0) })
+        ) {
+            ForEach(InternetQuality.allCases, id: \.self) { quality in
+                Text(quality.menuName).tag(quality)
+            }
         }
+        .pickerStyle(.menu)
     }
 
     // MARK: - Manual address
@@ -274,7 +284,7 @@ struct MenuView: View {
             Text("Packets: \(controller.packetsPerSecond)/s")
             tailscaleStatus
             if controller.isStreaming {
-                Text("\(controller.streamProfile.effectiveQuality(controller.quality).displayName) — \(String(format: "%.0f", controller.kilobytesPerSecond)) kB/s")
+                Text("\(controller.streamProfile.encoding(lan: controller.quality, internet: controller.internetQuality).displayName) — \(String(format: "%.0f", controller.kilobytesPerSecond)) kB/s")
                 internetStatus
             }
             if controller.browserStatus == .localNetworkDenied {
@@ -303,7 +313,7 @@ struct MenuView: View {
         let endpoint = controller.endpointName
         Text("Path: \(controller.streamPath.displayName)\(endpoint.isEmpty || endpoint == controller.activeReceiver ? "" : " (\(endpoint))")")
         if controller.streamProfile == .wan {
-            Text("Internet profile: 20 ms packets, larger buffer")
+            Text("Internet profile: 20 ms Opus frames, 24 kbit/s backup copies, larger buffer")
         }
         if let note = controller.qualityNote {
             Text(note)

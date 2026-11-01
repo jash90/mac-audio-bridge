@@ -303,124 +303,158 @@ struct InternetSelectionTests {
 // MARK: - WAN profile: datagrams, quality, data rate
 
 struct WANProfileTests {
-    @Test("PCM is refused on WAN (Opus 128 instead, with a note); Opus is capped at 128")
+    @Test("PCM is never encoded on WAN: the Internet quality applies whatever the LAN pick")
     func pcmRefused() {
-        #expect(StreamProfile.wan.effectiveQuality(.pcm) == .opus128)
-        #expect(StreamProfile.wan.effectiveQuality(.opus192) == .opus128)
-        #expect(StreamProfile.wan.effectiveQuality(.opus128) == .opus128)
-        #expect(StreamProfile.lan.effectiveQuality(.pcm) == .pcm)
-        #expect(StreamProfile.wan.qualityNote(requested: .pcm)?.contains("PCM is not used") == true)
-        #expect(StreamProfile.wan.qualityNote(requested: .opus128) == nil)
-        #expect(StreamProfile.lan.qualityNote(requested: .pcm) == nil)
+        for lan in StreamQuality.allCases {
+            for internet in InternetQuality.allCases {
+                let encoding = StreamProfile.wan.encoding(lan: lan, internet: internet)
+                #expect(encoding.quality.codec == .opus)
+                #expect(encoding.quality == internet.quality)
+            }
+            #expect(StreamProfile.lan.effectiveQuality(lan: lan, internet: .floor) == lan)
+        }
+        #expect(StreamProfile.lan.qualityNote(lan: .pcm, internet: .standard) == nil)
+        #expect(StreamProfile.wan.qualityNote(lan: .pcm, internet: .high)?.contains("High") == true)
     }
 
-    @Test("Every datagram stays ≤ 1200 B at every profile × quality, PCM frames included")
+    @Test("Every datagram stays ≤ 1200 B at every profile × quality × frame duration, PCM frames included")
     func datagramBudget() {
+        var encodings = StreamQuality.allCases.map(StreamEncoding.lan)
+        encodings += InternetQuality.allCases.map(StreamEncoding.wan)
+        // Full-rate copies of 20 ms frames, the largest Opus layout possible.
+        encodings.append(StreamEncoding(quality: .opus192, frameSlots: 4))
         for profile in StreamProfile.allCases {
-            for requested in StreamQuality.allCases {
-                // The raw quality too: a PCM frame that slips into a WAN run.
-                for quality in Set([requested, profile.effectiveQuality(requested)]) {
-                    var packer = RedundancyPacker()
-                    packer.profile = profile
-                    let payload = quality.opusBitrate.map { $0 / 8 / 200 } ?? AudioFormat.pcm16FrameBytes
-                    var largest = 0
-                    for frame in 0..<300 {
-                        let out = packer.pack(
-                            AudioPacket(
-                                codec: quality.codec, sequence: UInt32(frame),
-                                sampleTime: UInt64(frame * AudioFormat.samplesPerFrame),
-                                payload: Data(count: payload)))
-                        largest = max(largest, out.map(\.count).max() ?? 0)
-                    }
-                    #expect(largest <= AudioFormat.maxDatagramBytes, "\(profile) \(quality): \(largest) B")
-                }
+            for encoding in encodings {
+                let estimate = StreamDataRate.estimate(encoding, profile: profile, path: .tailscaleRelay)
+                #expect(
+                    estimate.largestDatagram <= AudioFormat.maxDatagramBytes,
+                    "\(profile) \(encoding.displayName): \(estimate.largestDatagram) B")
             }
         }
     }
 
-    @Test("WAN layout: 4 primaries per datagram + the previous two datagrams' frames; flags on the oldest")
+    @Test("WAN layout: one 20 ms frame per datagram + low-rate copies of the previous two; wire round trip")
     func wanLayout() throws {
         var packer = RedundancyPacker()
         packer.profile = .wan
         var datagrams: [AudioDatagram] = []
-        for frame in 0..<40 {
+        for group in 0..<10 {
+            let sequence = UInt32(group * 4)
             let packet = AudioPacket(
-                codec: .opus, flags: frame == 0 ? [.discontinuity] : [], sequence: UInt32(frame),
-                sampleTime: UInt64(frame * AudioFormat.samplesPerFrame), payload: Data(repeating: UInt8(frame), count: 80))
+                codec: .opus, flags: group == 0 ? [.discontinuity] : [], sequence: sequence,
+                sampleTime: UInt64(sequence) * 240, payload: Data(repeating: UInt8(group), count: 240),
+                frameSlots: 4, copyPayload: Data(repeating: UInt8(100 + group), count: 60))
             let out = packer.pack(packet)
-            #expect(out.count == (frame % 4 == 3 ? 1 : 0))
+            #expect(out.count == 1)
             datagrams += try out.map { try AudioDatagram.decode($0) }
         }
-        #expect(datagrams.count == 10)
         let first = datagrams[0]
-        #expect(first.profile == .wan && first.primaryCount == 4)
+        #expect(first.profile == .wan && first.primaryCount == 1)
         #expect(first.flags == [.discontinuity])
-        let firstPackets = first.packets()
-        #expect(firstPackets.map(\.sequence) == [0, 1, 2, 3])
-        #expect(firstPackets.map(\.flags) == [[.discontinuity], [], [], []])
+        #expect(first.packets().map(\.sequence) == [0])
         let steady = datagrams[9]
-        #expect(steady.entries.map(\.offset) == Array(0...11).map(UInt8.init))
+        #expect(steady.entries.map(\.offset) == [0, 4, 8])
+        #expect(steady.entries.map(\.frameSlots) == [4, 4, 4])
+        #expect(steady.entries.map(\.lowRate) == [false, true, true])
         let packets = steady.packets()
-        #expect(packets.prefix(4).map(\.sequence) == [36, 37, 38, 39])
-        #expect(packets.prefix(4).allSatisfy { !$0.isRedundant })
-        #expect(packets.dropFirst(4).map(\.sequence) == [35, 34, 33, 32, 31, 30, 29, 28])
-        #expect(packets.dropFirst(4).allSatisfy { $0.isRedundant })
-        let payloadsMatch = packets.allSatisfy { $0.payload == Data(repeating: UInt8($0.sequence), count: 80) }
-        #expect(payloadsMatch)
-        #expect(steady.encoded().count == 24 + 12 * 83)
+        #expect(packets.map(\.sequence) == [36, 32, 28])
+        #expect(packets.map(\.sampleTime) == [UInt64(8640), 7680, 6720])
+        #expect(packets.map(\.isRedundant) == [false, true, true])
+        #expect(packets.map(\.isLowRateCopy) == [false, true, true])
+        #expect(packets[0].payload == Data(repeating: 9, count: 240))
+        #expect(packets[1].payload == Data(repeating: 108, count: 60))
+        #expect(packets[2].payload == Data(repeating: 107, count: 60))
+        #expect(steady.encoded().count == 24 + 3 + 240 + 2 * (3 + 60))
     }
 
-    @Test("A profile switch sends the held frames at once; sequences stay continuous")
+    @Test("Wire v6: frame duration and low-rate bits; reserved bits and 40 ms frames rejected; v4 and the mic's v5 refused")
+    func wireVersionSix() throws {
+        let datagram = AudioDatagram(
+            codec: .opus, flags: [], sequence: 100, sampleTime: 24_000, source: 7, primaryCount: 1, profile: .wan,
+            entries: [
+                .init(offset: 0, payload: Data(count: 160), frameSlots: 4),
+                .init(offset: 2, payload: Data(count: 30), frameSlots: 2, lowRate: true),
+                .init(offset: 5, payload: Data(count: 40)),
+            ])
+        var bytes = datagram.encoded()
+        #expect(bytes[4] == 6)
+        #expect(try AudioDatagram.decode(bytes) == datagram)
+        #expect(bytes[25] == 0x40 && bytes[26] == 160)  // slots code 2 → bits 13–14
+        var reserved = bytes
+        reserved[25] |= 0x08
+        #expect(throws: AudioPacketError.malformedEntries) { try AudioDatagram.decode(reserved) }
+        var fortyMs = bytes
+        fortyMs[25] |= 0x60
+        #expect(throws: AudioPacketError.malformedEntries) { try AudioDatagram.decode(fortyMs) }
+        bytes[4] = 4
+        #expect(throws: AudioPacketError.unsupportedVersion(4)) { try AudioDatagram.decode(bytes) }
+        bytes[4] = 5
+        #expect(throws: AudioPacketError.unsupportedVersion(5)) { try AudioDatagram.decode(bytes) }
+        // The playback stream never looks like a mic datagram (the Mac's
+        // socket tells them apart by the version byte).
+        #expect(!MicDatagram.isMicDatagram(datagram.encoded()))
+    }
+
+    @Test("A profile switch keeps sequences continuous across 5 ms and 20 ms frames")
     func profileSwitchFlushes() throws {
         var packer = RedundancyPacker()
-        packer.profile = .wan
         var sequences: [UInt32] = []
         func record(_ out: [Data]) throws {
             for data in out {
                 sequences += try AudioDatagram.decode(data).packets().filter { !$0.isRedundant }.map(\.sequence)
             }
         }
-        for frame in 0..<6 {
-            try record(packer.pack(AudioPacket(codec: .opus, sequence: UInt32(frame), sampleTime: 0, payload: Data(count: 80))))
+        for frame in 0..<4 {
+            try record(packer.pack(AudioPacket(codec: .opus, sequence: UInt32(frame), sampleTime: 0, payload: Data(count: 120))))
         }
-        #expect(packer.pendingCount == 2)
-        try record(packer.setProfile(.lan))
+        try record(packer.setProfile(.wan))
         #expect(packer.pendingCount == 0)
-        for frame in 6..<9 {
-            try record(packer.pack(AudioPacket(codec: .opus, sequence: UInt32(frame), sampleTime: 0, payload: Data(count: 80))))
+        for group in 0..<3 {
+            try record(
+                packer.pack(
+                    AudioPacket(
+                        codec: .opus, sequence: UInt32(4 + 4 * group), sampleTime: 0, payload: Data(count: 240),
+                        frameSlots: 4, copyPayload: Data(count: 60))))
         }
-        // A PCM frame in a WAN run is sent alone, after the held Opus frames.
-        _ = packer.setProfile(.wan)
-        try record(packer.pack(AudioPacket(codec: .opus, sequence: 9, sampleTime: 0, payload: Data(count: 80))))
-        try record(packer.pack(AudioPacket(codec: .pcm16, sequence: 10, sampleTime: 0, payload: Data(count: 960))))
-        #expect(sequences == Array(0...10))
+        // The remainder of a group cut short, then LAN again, then PCM.
+        try record(packer.pack(AudioPacket(codec: .opus, sequence: 16, sampleTime: 0, payload: Data(count: 60))))
+        try record(packer.setProfile(.lan))
+        try record(packer.pack(AudioPacket(codec: .opus, sequence: 17, sampleTime: 0, payload: Data(count: 120))))
+        try record(packer.pack(AudioPacket(codec: .pcm16, sequence: 18, sampleTime: 0, payload: Data(count: 960))))
+        #expect(sequences == [0, 1, 2, 3, 4, 8, 12, 16, 17, 18])
     }
 
     @Test("Data rate per profile (wire bytes incl. IP/UDP/WireGuard headers)")
     func dataRate() {
-        let cases: [(StreamQuality, StreamProfile, StreamPath)] = [
-            (.pcm, .lan, .local), (.opus192, .lan, .local), (.opus128, .lan, .local),
-            (.opus192, .lan, .tailscaleDirect), (.opus128, .wan, .tailscaleDirect),
-            (.opus128, .wan, .tailscaleRelay), (.pcm, .wan, .tailscaleDirect),
+        let cases: [(String, StreamEncoding, StreamProfile, StreamPath)] = [
+            ("pcm/lan/local", .lan(.pcm), .lan, .local), ("opus192/lan/local", .lan(.opus192), .lan, .local),
+            ("opus128/lan/local", .lan(.opus128), .lan, .local), ("opus96/lan/local", .lan(.opus96), .lan, .local),
+            ("opus192/lan/tailscale", .lan(.opus192), .lan, .tailscaleDirect),
+            ("standard/wan/tailscale", .wan(.standard), .wan, .tailscaleDirect),
+            ("standard/wan/relay", .wan(.standard), .wan, .tailscaleRelay),
+            ("high/wan/tailscale", .wan(.high), .wan, .tailscaleDirect),
         ]
         var results: [String: StreamDataRate.Estimate] = [:]
-        for (quality, profile, path) in cases {
-            let estimate = StreamDataRate.estimate(quality: quality, profile: profile, path: path)
-            results["\(quality.rawValue)/\(profile.statsName)/\(path.rawValue)"] = estimate
+        for (name, encoding, profile, path) in cases {
+            let estimate = StreamDataRate.estimate(encoding, profile: profile, path: path)
+            results[name] = estimate
             print(
-                "data rate \(quality.rawValue) \(profile.statsName) \(path.displayName): "
+                "data rate \(name): "
                     + "\(String(format: "%.0f", estimate.datagramsPerSecond)) datagrams/s, "
                     + "largest \(estimate.largestDatagram) B, \(String(format: "%.0f", estimate.kilobitsPerSecond)) kbit/s, "
                     + "\(String(format: "%.0f", estimate.megabytesPerHour)) MB/h")
             #expect(estimate.largestDatagram <= AudioFormat.maxDatagramBytes)
         }
-        let wan = results["opus128/wan/tailscaleDirect"]!
+        let wan = results["standard/wan/tailscale"]!
         #expect(wan.datagramsPerSecond == 50)
-        #expect(wan.megabytesPerHour <= 200)
-        #expect(results["pcm/wan/tailscaleDirect"]! == wan)  // PCM request → Opus 128
+        #expect(wan.megabytesPerHour <= 90)
+        #expect(results["high/wan/tailscale"]!.megabytesPerHour <= 102)
         #expect(results["pcm/lan/local"]!.megabytesPerHour > 1400)
-        // WAN saves more than half of LAN Opus 192 over the same tunnel.
-        #expect(wan.megabytesPerHour < results["opus192/lan/tailscaleDirect"]!.megabytesPerHour / 2)
+        // The study's LAN numbers: Opus 192 480 MB/h, Opus 96 264 MB/h.
+        #expect(abs(results["opus192/lan/local"]!.megabytesPerHour - 480) < 2)
+        #expect(abs(results["opus96/lan/local"]!.megabytesPerHour - 264) < 2)
+        // WAN Standard is less than a fifth of LAN Opus 192 over the same tunnel.
+        #expect(wan.megabytesPerHour < results["opus192/lan/tailscale"]!.megabytesPerHour / 5)
     }
 
     @Test("Data usage meter: session total and rolling MB/h")
@@ -457,7 +491,7 @@ struct WANProfileTests {
         var after = buffer.stats
         #expect(after.targetFrames == AudioFormat.frames(milliseconds: 140))
         #expect(after.depthFrames == before.depthFrames)
-        #expect(buffer.config.lossHorizonFrames == 13)
+        #expect(buffer.config.lossHorizonFrames == 14)
         // Fill deep (as a WAN stall would), then back to LAN: nothing is
         // dropped at once, the target clamps to the LAN ceiling.
         feed(100, at: &time)

@@ -88,6 +88,8 @@ extension SenderController {
             remoteStateChanged()
         case .setQuality(let newQuality):
             setQuality(newQuality)
+        case .setInternetQuality(let newQuality):
+            setInternetQuality(newQuality)
         case .media(let command):
             media.perform(command)
         case .micState(let state):
@@ -241,7 +243,8 @@ extension SenderController {
             profile: streamingToPhone ? streamProfile : nil,
             qualityNote: streamingToPhone ? qualityNote : nil,
             sessionBytes: streamingToPhone ? usageMeter.totalBytes : nil,
-            megabytesPerHour: streamingToPhone ? (megabytesPerHour * 10).rounded() / 10 : nil)
+            megabytesPerHour: streamingToPhone ? (megabytesPerHour * 10).rounded() / 10 : nil,
+            internetQuality: internetQuality)
     }
 
     private func problem(for hello: PhoneHello) -> String? {
