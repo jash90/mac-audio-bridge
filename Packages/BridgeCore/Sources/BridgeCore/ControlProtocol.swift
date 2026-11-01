@@ -17,7 +17,8 @@ import Foundation
 /// (the peer is told to update). Version 2 adds `media` / `nowPlaying`
 /// (see MediaControl.swift) and `SourceStatus.protocolVersion`; version 3
 /// adds the Internet-mode fields of hello / status (optional, so their
-/// envelopes stay `v: 1`). A malformed frame
+/// envelopes stay `v: 1`); version 4 adds the phone microphone (`micStart`
+/// / `micStop` Mac → phone, `micState` phone → Mac). A malformed frame
 /// is skipped (the length prefix keeps the stream in step); only an oversized
 /// or empty length is fatal, because the stream can no longer be trusted.
 ///
@@ -42,13 +43,19 @@ public enum ControlProtocol {
     public static let txtVersion = "2"
     /// Newest envelope version this build speaks (2: `media` / `nowPlaying`
     /// and `SourceStatus.protocolVersion`; 3: tailnet addresses, network and
-    /// path, profile and data usage in hello / status).
-    public static let version = 3
+    /// path, profile and data usage in hello / status; 4: the phone
+    /// microphone).
+    public static let version = 4
     /// Oldest envelope version still accepted.
     public static let minimumVersion = 1
     /// First version with playback control (`media` / `nowPlaying`): the
     /// phone sends `media` only to a Mac reporting at least this.
     public static let mediaVersion = 2
+    /// First version with the phone microphone: the phone sends `micState`
+    /// only to a Mac reporting at least this, and the Mac sends `micStart` /
+    /// `micStop` only to a phone that sent a `micState` (older peers close
+    /// the session on an envelope version they do not know).
+    public static let micVersion = 4
     /// TCP port the Mac's control listener binds first (any free port if
     /// taken; Bonjour carries the real one).
     public static let preferredPort: UInt16 = 49_001
@@ -184,6 +191,27 @@ public struct SourceStatus: Codable, Equatable, Sendable {
 
 extension StreamQuality: Codable {}
 
+/// The phone's microphone, as it reports it to the Mac it streams from
+/// (version 4, on change).
+public struct MicState: Codable, Equatable, Sendable {
+    /// "Talk through iPhone" is on and capture runs (armed in the foreground).
+    public var armed: Bool
+    /// Mic datagrams are going to this Mac (it asked with `micStart`).
+    public var sending: Bool
+    /// The phone's mute: frames carry silence.
+    public var muted: Bool
+    /// Why the mic cannot run (permission denied, needs the app in the
+    /// foreground to start), shown in the Mac menu.
+    public var problem: String?
+
+    public init(armed: Bool, sending: Bool, muted: Bool, problem: String? = nil) {
+        self.armed = armed
+        self.sending = sending
+        self.muted = muted
+        self.problem = problem
+    }
+}
+
 public enum ControlMessage: Equatable, Sendable {
     // Phone → Mac
     case hello(PhoneHello)
@@ -199,6 +227,8 @@ public enum ControlMessage: Equatable, Sendable {
     case setQuality(StreamQuality)
     /// Version 2: a playback command for the Mac's Now Playing app.
     case media(MediaCommand)
+    /// Version 4: the phone's microphone state.
+    case micState(MicState)
     // Mac → phone
     case status(SourceStatus)
     /// The Mac's user just selected our output (an explicit Mac-side action):
@@ -206,11 +236,17 @@ public enum ControlMessage: Equatable, Sendable {
     case claim
     /// Version 2: what plays on the Mac (nil: nothing).
     case nowPlaying(NowPlayingInfo?)
+    /// Version 4: an app opened the Mac's "iPhone Mic" — send mic audio on
+    /// the stream's UDP flow.
+    case micStart
+    /// Version 4: no app uses the mic any more (after a grace): stop sending.
+    case micStop
 
     /// The envelope version that introduced this message.
     public var requiredVersion: Int {
         switch self {
         case .media, .nowPlaying: ControlProtocol.mediaVersion
+        case .micState, .micStart, .micStop: ControlProtocol.micVersion
         default: 1
         }
     }
@@ -228,6 +264,9 @@ public enum ControlMessage: Equatable, Sendable {
         case .claim: "claim"
         case .media: "media"
         case .nowPlaying: "nowPlaying"
+        case .micState: "micState"
+        case .micStart: "micStart"
+        case .micStop: "micStop"
         }
     }
 
@@ -243,6 +282,7 @@ public enum ControlMessage: Equatable, Sendable {
         var status: SourceStatus?
         var media: MediaCommand?
         var nowPlaying: NowPlayingInfo?
+        var mic: MicState?
     }
 
     /// Only the version, decoded first so a newer envelope reports
@@ -263,7 +303,8 @@ public enum ControlMessage: Equatable, Sendable {
         case .status(let status): envelope.status = status
         case .media(let command): envelope.media = command
         case .nowPlaying(let info): envelope.nowPlaying = info
-        case .connect, .disconnect, .claim: break
+        case .micState(let state): envelope.mic = state
+        case .connect, .disconnect, .claim, .micStart, .micStop: break
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -320,6 +361,15 @@ public enum ControlMessage: Equatable, Sendable {
             return .media(command)
         case "nowPlaying":
             return .nowPlaying(envelope.nowPlaying)
+        case "micState":
+            guard envelope.v >= ControlProtocol.micVersion, let state = envelope.mic else { throw .malformed }
+            return .micState(state)
+        case "micStart":
+            guard envelope.v >= ControlProtocol.micVersion else { throw .malformed }
+            return .micStart
+        case "micStop":
+            guard envelope.v >= ControlProtocol.micVersion else { throw .malformed }
+            return .micStop
         default:
             throw .malformed
         }

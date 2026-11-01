@@ -271,6 +271,17 @@ final class SenderController: ObservableObject {
     let media = MacMediaControl()
     /// Hello per open control session (nil until the phone sent it).
     var sessions: [ControlServer.SessionID: PhoneHello?] = [:]
+    // Phone microphone (SenderController+Mic.swift).
+    let micEngine = MicEngine()
+    var micFeeder: MicFeeder?
+    var micDemand = MicDemand()
+    let micEvents = DeviceEventObserver()
+    var micObservedDeviceID: AudioObjectID?
+    /// Each phone's last reported mic (protocol version 4 phones only).
+    var micStates: [ControlServer.SessionID: MicState] = [:]
+    /// The phone that was sent `micStart` (nil = none).
+    var micRequestedSession: ControlServer.SessionID?
+    @Published var micStatus: MicMenuStatus = .off
     var lastSentStatus: [ControlServer.SessionID: (status: SourceStatus, at: TimeInterval)] = [:]
     /// Output switch memory + takeover detection.
     var outputModel: OutputRestoreModel
@@ -329,6 +340,7 @@ final class SenderController: ObservableObject {
                     isBuiltIn: false)
             })
         converter.qualityGate.value = quality
+        udpSender.setMicEngine(micEngine)
         tailscaleMonitor = Self.makeTailscaleMonitor(controller: self)
         ownTailnetAddresses = InterfaceAddresses.tailnet()
         // Bonjour browsing runs for the whole app lifetime, from launch.
@@ -541,6 +553,7 @@ final class SenderController: ObservableObject {
             if mode == .streaming { stopStreaming() }
             defaultOutputIsOurs = false
             outputDeviceName = BridgeDevice.defaultOutputDeviceID().flatMap(BridgeDevice.deviceName)
+            refreshMic()
             remoteStateChanged()
             return
         }
@@ -573,6 +586,7 @@ final class SenderController: ObservableObject {
             break
         }
         updateInternetPath(snapshot: nil)
+        refreshMic()
         remoteStateChanged()
     }
 
