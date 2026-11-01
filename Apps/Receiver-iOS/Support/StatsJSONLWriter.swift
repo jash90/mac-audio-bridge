@@ -95,7 +95,7 @@ struct StatsLine: Codable, Sendable {
 /// past the cap the oldest half of the lines is dropped. Encoding happens on
 /// the caller; only the resulting `Data` crosses to the queue.
 final class StatsJSONLWriter: @unchecked Sendable {
-    private let fileURL: URL
+    let fileURL: URL
     private let maxBytes: Int
     private let encoder: JSONEncoder
     /// All file access is confined to this queue.

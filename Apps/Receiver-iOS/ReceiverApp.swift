@@ -4,7 +4,7 @@ import SwiftUI
 struct ReceiverApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
         }
     }
 }

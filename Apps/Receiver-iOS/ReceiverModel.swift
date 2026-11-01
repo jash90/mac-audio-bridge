@@ -38,6 +38,16 @@ final class ReceiverModel: ObservableObject {
     @Published private(set) var streamProfile: StreamProfile = .lan
     @Published private(set) var sessionMegabytes: Double = 0
     @Published private(set) var megabytesPerHour: Double = 0
+    /// Network jitter and the relative packet-delay percentiles (ms).
+    @Published private(set) var jitterMilliseconds: Double = 0
+    @Published private(set) var delayP50Milliseconds: Double = 0
+    @Published private(set) var delayP95Milliseconds: Double = 0
+    @Published private(set) var delayP99Milliseconds: Double = 0
+    /// p95 packet delay, one sample per second, newest last (≤ 60).
+    @Published private(set) var delayHistory: [Double] = []
+    /// Loss and rebuffers over the last `recentWindow` seconds.
+    @Published private(set) var recentLossPercent: Double = 0
+    @Published private(set) var recentRebuffers = 0
 
     /// The Macs, the control connections and source arbitration.
     let sources: SourcesModel
@@ -61,6 +71,14 @@ final class ReceiverModel: ObservableObject {
     private var usageMeter = DataUsageMeter()
     private var countedDatagrams = 0
     private var countedBytes = 0
+    /// Per-second (lost, played, rebuffers) deltas for the recent window.
+    private var recentSeconds: [(lost: Int, played: Int, rebuffers: Int)] = []
+    private var lastCounters = (lost: 0, played: 0, rebuffers: 0)
+    private static let recentWindow = 10
+    private static let historyLength = 60
+
+    /// `Documents/stats.jsonl`, for "Share stats log".
+    var statsFileURL: URL { statsWriter.fileURL }
 
     init() {
         receiver = UDPReceiver(jitterBuffer: jitterBuffer)
@@ -91,15 +109,18 @@ final class ReceiverModel: ObservableObject {
     }
 
     /// Main-actor loop (the model is @MainActor, so the task inherits it):
-    /// refresh the UI state every tick and write one JSONL line every fourth
-    /// tick. Ticks where the task was resumed late self-correct on the next
-    /// tick — the jitter-buffer counters are cumulative, not per-tick.
+    /// refresh the UI state every second tick (2 Hz) and write one JSONL line
+    /// every fourth tick (1 Hz). Ticks where the task was resumed late
+    /// self-correct on the next tick — the jitter-buffer counters are
+    /// cumulative, not per-tick.
     private func startStatsLoop() {
         guard statsLoop == nil else { return }
         statsLoop = Task { [weak self] in
             while !Task.isCancelled {
-                self?.refreshStats()
                 if let self {
+                    if self.tick.isMultiple(of: 2) {
+                        self.refreshStats()
+                    }
                     self.tick += 1
                     if self.tick.isMultiple(of: 4) {
                         self.logStats()
@@ -120,7 +141,7 @@ final class ReceiverModel: ObservableObject {
         jitterBuffer.applyConfig(receiver.profile.jitterConfig(mode))
     }
 
-    /// Pulls latency and loss snapshots for the UI — called 4×/s by the
+    /// Pulls latency and loss snapshots for the UI — called 2×/s by the
     /// model's stats loop.
     func refreshStats() {
         let stats = jitterBuffer.stats
@@ -143,6 +164,10 @@ final class ReceiverModel: ObservableObject {
         rebufferCount = stats.rebuffers
         underrunCount = stats.underruns
         recoveredCount = stats.recovered
+        jitterMilliseconds = stats.jitterSeconds * 1000
+        delayP50Milliseconds = stats.delayP50Seconds * 1000
+        delayP95Milliseconds = stats.delayP95Seconds * 1000
+        delayP99Milliseconds = stats.delayP99Seconds * 1000
         let audio = playback.snapshot
         concealedCount = audio.concealment.concealedFrames
         codecDescription = audio.stream?.displayName
@@ -181,6 +206,25 @@ final class ReceiverModel: ObservableObject {
         megabytesPerHour = usageMeter.megabytesPerHour
     }
 
+    /// 1 Hz: the recent loss / rebuffer window and the delay history.
+    private func recordRecent(_ stats: JitterBufferStats) {
+        let delta = (
+            lost: max(stats.lost - lastCounters.lost, 0),
+            played: max(stats.played - lastCounters.played, 0),
+            rebuffers: max(stats.rebuffers - lastCounters.rebuffers, 0))
+        lastCounters = (stats.lost, stats.played, stats.rebuffers)
+        recentSeconds.append(delta)
+        if recentSeconds.count > Self.recentWindow { recentSeconds.removeFirst() }
+        let lost = recentSeconds.reduce(0) { $0 + $1.lost }
+        let slots = lost + recentSeconds.reduce(0) { $0 + $1.played }
+        recentLossPercent = slots > 0 ? Double(lost) / Double(slots) * 100 : 0
+        recentRebuffers = recentSeconds.reduce(0) { $0 + $1.rebuffers }
+        if streamPath != nil {
+            delayHistory.append(stats.delayP95Seconds * 1000)
+            if delayHistory.count > Self.historyLength { delayHistory.removeFirst() }
+        }
+    }
+
     /// Writes one JSON line of telemetry to `Documents/stats.jsonl` — called
     /// 1 Hz by the model's stats loop. The encode happens here; only `Data`
     /// crosses to the writer's utility queue.
@@ -188,6 +232,7 @@ final class ReceiverModel: ObservableObject {
         guard phase == .running else { return }
         recordUsage()
         let stats = jitterBuffer.stats
+        recordRecent(stats)
         let session = AVAudioSession.sharedInstance()
         let outputSeconds = session.outputLatency + session.ioBufferDuration
         let audio = playback.snapshot
@@ -277,127 +322,6 @@ final class ReceiverModel: ObservableObject {
             }
         }
         return nil
-    }
-}
-
-struct ContentView: View {
-    @StateObject private var model = ReceiverModel()
-    @AppStorage("latencyMode") private var latencyMode: JitterLatencyMode = .balanced
-    @AppStorage("detailsExpanded") private var detailsExpanded = false
-
-    var body: some View {
-        ScrollView {
-            VStack(spacing: 20) {
-                HStack(spacing: 10) {
-                    Image(systemName: "headphones")
-                        .font(.title2)
-                        .foregroundStyle(.tint)
-                    Text("Mac Audio Bridge")
-                        .font(.title2.bold())
-                }
-
-                SourcesView(model: model.sources)
-
-                if let path = model.streamPath {
-                    Text(streamSummary(path))
-                        .font(.footnote.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-
-                DisclosureGroup(isExpanded: $detailsExpanded) {
-                    VStack(spacing: 16) {
-                        address
-                        latencyPicker
-                        stats
-                    }
-                    .padding(.top, 12)
-                } label: {
-                    Text("Latency & details")
-                        .font(.headline)
-                }
-
-                if case .failed(let message) = model.phase {
-                    Text(message)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-                }
-            }
-            .padding(24)
-            .frame(maxWidth: .infinity)
-        }
-        .task {
-            model.setLatencyMode(latencyMode)
-            model.start()
-        }
-        .onChange(of: latencyMode) { _, mode in
-            model.setLatencyMode(mode)
-        }
-    }
-
-    /// "Tailscale direct · 12.3 MB · ≈199 MB/h · total ≈180 ms"
-    private func streamSummary(_ path: StreamPath) -> String {
-        "\(path.displayName) · \(String(format: "%.1f", model.sessionMegabytes)) MB · "
-            + "≈\(Int(model.megabytesPerHour.rounded())) MB/h · total ≈\(model.totalMilliseconds) ms"
-    }
-
-    private var latencyPicker: some View {
-        VStack(spacing: 4) {
-            Text("Latency mode")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Picker("Latency mode", selection: $latencyMode) {
-                ForEach(JitterLatencyMode.allCases, id: \.rawValue) { mode in
-                    Text(mode.displayName).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-        }
-    }
-
-    /// The Mac discovers this receiver over Bonjour; the IP stays below,
-    /// small, for debugging and the Mac's manual-address fallback.
-    private var address: some View {
-        ReceiverVisibilityView(ipAddress: model.ipAddress, isListening: model.phase == .running)
-    }
-
-    private var stats: some View {
-        VStack(spacing: 6) {
-            statRow("Codec", model.codecDescription ?? "—")
-            statRow("Path", model.streamPath?.displayName ?? "—")
-            statRow("Profile", model.streamProfile.displayName)
-            statRow("Data", String(format: "%.1f MB · ≈%.0f MB/h", model.sessionMegabytes, model.megabytesPerHour))
-            statRow("Buffer", "\(model.bufferMilliseconds) ms")
-            statRow("Target", "\(model.targetMilliseconds) ms")
-            statRow("Output", "\(model.outputMilliseconds) ms")
-            statRow("Total", "≈\(model.totalMilliseconds) ms (+ network)")
-            statRow("Lost", String(format: "%.1f %%", model.lostPercent))
-            statRow("Late", "\(model.lateCount)")
-            statRow("Rebuffers", "\(model.rebufferCount)")
-            statRow("Underruns", "\(model.underrunCount)")
-            statRow("Recovered", "\(model.recoveredCount)")
-            statRow("Concealed", "\(model.concealedCount) × \(AudioFormat.frameDurationMs) ms")
-            statRow("Malformed", "\(model.malformedCount)")
-            statRow("Other Macs (dropped)", "\(model.foreignCount)")
-            statRow(
-                "Audio engine",
-                "\(model.engineRunning ? "running" : "stopped") (restarts \(model.engineRestarts))")
-            if let route = model.outputRoute {
-                statRow("Route", route)
-            }
-        }
-        .font(.callout.monospacedDigit())
-    }
-
-    private func statRow(_ label: String, _ value: String) -> some View {
-        HStack {
-            Text(label)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Text(value)
-        }
-        .frame(maxWidth: 260)
     }
 }
 
