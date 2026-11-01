@@ -13,8 +13,8 @@ settings:
     DEVELOPMENT_TEAM: H2X8YGN869
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "6.0"
-    MARKETING_VERSION: "0.5.0"
-    CURRENT_PROJECT_VERSION: "5"
+    MARKETING_VERSION: "0.7.0"
+    CURRENT_PROJECT_VERSION: "7"
 targets:
   Sender:
     type: application
