@@ -2,16 +2,18 @@
 # Builds a signed, notarized and stapled Mac sender release:
 # build/MacAudioBridge-Sender-<version>.dmg with "Mac Audio Bridge.app",
 # an /Applications link, the HAL driver, "Install Driver.command" and
-# INSTALL.txt (Polish, for the person installing it).
+# INSTALL.txt (English, for the person installing it).
 #
-# Usage: ./scripts/release-sender.sh 0.5.0
+# Usage: ./scripts/release-sender.sh 0.7.0
 #
 # Signing: Developer ID Application, hardened runtime, secure timestamp,
 # no get-task-allow. The app gets no extra entitlements: it is not
 # sandboxed (network needs nothing), Core Audio process taps are gated by
 # the System Audio Recording permission (NSAudioCaptureUsageDescription),
 # not by com.apple.security.device.audio-input, and the app never opens a
-# microphone (the driver has output streams only).
+# microphone: "Talk through iPhone" plays the iPhone's mic audio into the
+# driver's "Mac Audio Bridge Mic Feed" output, which the driver loops back to
+# its "iPhone Mic" input for call apps.
 #
 # Notarization uses the notarytool keychain profile in $NOTARY_PROFILE
 # (default "vpn-time"). Override the identity with $SIGN_IDENTITY (SHA-1).
@@ -133,8 +135,9 @@ cat >"$STAGE/Install Driver.command" <<'EOF'
 set -euo pipefail
 cd "$(dirname "$0")"
 HAL="/Library/Audio/Plug-Ins/HAL"
-echo "Instalacja sterownika Mac Audio Bridge."
-echo "Podaj hasło administratora tego Maca (nie widać go podczas pisania)."
+echo "Installing the Mac Audio Bridge audio driver."
+echo "Enter this Mac's administrator password (it is not shown as you type)."
+echo "Sound on this Mac drops for a few seconds while the driver reloads."
 echo ""
 sudo rm -rf "$HAL/MacAudioBridge.driver"
 sudo ditto MacAudioBridge.driver "$HAL/MacAudioBridge.driver"
@@ -142,38 +145,46 @@ sudo xattr -dr com.apple.quarantine "$HAL/MacAudioBridge.driver" 2>/dev/null || 
 # coreaudiod restarts on its own and loads the new driver.
 sudo killall coreaudiod
 echo ""
-echo "Gotowe. Za kilka sekund w Ustawieniach > Dźwięk pojawi się"
-echo "wyjście \"iPhone (Mac Audio Bridge)\". Możesz zamknąć to okno."
-read -r -p "Naciśnij Enter, aby zakończyć..." _ || true
+echo "Done. In a few seconds System Settings > Sound shows the output"
+echo "\"iPhone (Mac Audio Bridge)\" and the input \"iPhone Mic (Mac Audio Bridge)\"."
+echo "You can close this window."
+read -r -p "Press Enter to finish..." _ || true
 EOF
 chmod +x "$STAGE/Install Driver.command"
 codesign --force --timestamp --sign "$SIGN_IDENTITY" \
     --identifier dev.jash90.MacAudioBridge.InstallDriver "$STAGE/Install Driver.command"
 
 cat >"$STAGE/INSTALL.txt" <<EOF
-Mac Audio Bridge $VERSION - instalacja na Macu
-==============================================
+Mac Audio Bridge $VERSION - installing on a Mac
+===============================================
 
-1. Otwórz ten obraz dysku (już to zrobiłeś, jeśli to czytasz).
+1. Open this disk image (done, if you are reading this).
 
-2. Kliknij dwukrotnie "Install Driver.command".
-   Otworzy się Terminal i poprosi o hasło administratora.
-   Jeśli macOS zablokuje plik: kliknij go prawym przyciskiem,
-   wybierz Otwórz i potwierdź.
+2. Double-click "Install Driver.command".
+   Terminal opens and asks for the administrator password.
+   If macOS blocks the file: right-click it, choose Open and confirm.
+   Updating from an older version? Install the driver again: this
+   release adds the "iPhone Mic (Mac Audio Bridge)" input. Sound on
+   the Mac drops for a few seconds while the driver reloads.
 
-3. Przeciągnij "Mac Audio Bridge.app" na folder Applications.
+3. Drag "Mac Audio Bridge.app" onto the Applications folder.
+   If an older version is there, choose Replace (quit the old app
+   from the menu bar first).
 
-4. Otwórz aplikację z folderu Aplikacje (ikona pojawi się
-   na pasku menu). Na pytania odpowiedz Pozwól:
-   - Sieć lokalna: iPhone znajduje tego Maca i nim steruje.
-   - Nagrywanie dźwięku systemowego: pojawia się przy pierwszym
-     przesyłaniu dźwięku.
-   Pominięte? Ustawienia systemowe > Prywatność i ochrona.
+4. Open the app from Applications (its icon appears in the menu bar).
+   Answer Allow when macOS asks:
+   - Local Network: the iPhone finds this Mac and controls it.
+   - System Audio Recording: asked the first time audio is sent.
+   Missed one? System Settings > Privacy & Security.
 
-5. Na iPhonie otwórz Mac Audio Bridge i wybierz tego Maca
-   w sekcji Sources.
+5. On the iPhone open Mac Audio Bridge and pick this Mac under Sources.
 
-Aplikacja na iPhonie musi być w tej samej wersji ($VERSION).
+Talking in calls through the iPhone microphone:
+   - On the iPhone turn on "Talk through iPhone".
+   - In Meet, Teams or another call app choose the microphone
+     "iPhone Mic (Mac Audio Bridge)".
+
+Every Mac and the iPhone app must run the same version ($VERSION).
 EOF
 
 log "Creating $DMG..."
