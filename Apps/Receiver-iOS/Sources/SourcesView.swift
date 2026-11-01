@@ -104,6 +104,7 @@ private struct SourceRow: View {
 
     @ViewBuilder
     private func activeControls(_ status: SourceStatus) -> some View {
+        playbackControls
         HStack(spacing: 12) {
             Button {
                 model.setMuted(!status.muted, for: source.id)
@@ -135,6 +136,54 @@ private struct SourceRow: View {
             Label("Disconnect", systemImage: "xmark.circle")
         }
         .buttonStyle(.bordered)
+    }
+
+    /// What plays on the Mac + previous / play-pause / next (protocol v2).
+    @ViewBuilder
+    private var playbackControls: some View {
+        if let track = model.activeNowPlaying {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text([track.title, track.artist].compactMap { $0 }.joined(separator: " — "))
+                        .font(.subheadline)
+                        .lineLimit(2)
+                    if let app = track.app {
+                        Text(app)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if !track.canControl {
+                        Text("Allow Accessibility for Mac Audio Bridge on the Mac to control playback")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+                Spacer(minLength: 4)
+                if model.activeCanControl {
+                    Button {
+                        model.media(.previousTrack)
+                    } label: {
+                        Image(systemName: "backward.fill")
+                    }
+                    .accessibilityLabel("Previous")
+                    Button {
+                        model.media(.togglePlayPause)
+                    } label: {
+                        Image(systemName: track.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.title3)
+                            .frame(width: 28)
+                    }
+                    .accessibilityLabel(track.isPlaying ? "Pause" : "Play")
+                    Button {
+                        model.media(.nextTrack)
+                    } label: {
+                        Image(systemName: "forward.fill")
+                    }
+                    .accessibilityLabel("Next")
+                }
+            }
+            .buttonStyle(.borderless)
+        }
     }
 
     private func qualityBinding(_ status: SourceStatus) -> Binding<StreamQuality> {

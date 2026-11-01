@@ -26,6 +26,12 @@ malformed frame is skipped; a zero or oversized length closes the connection.
 | phone → Mac | `setVolume` / `setMuted` / `setQuality` | virtual-device volume/mute, codec (synced with the menu) |
 | Mac → phone | `status{…}` | on change + every 2 s: streaming to you, playing, output name, volume, mute, quality, problem |
 | Mac → phone | `claim` | the Mac's user selected our output: the phone switches to this Mac |
+| phone → Mac | `media{media}` (v2) | `play` / `pause` / `togglePlayPause` / `nextTrack` / `previousTrack` for the Mac's Now Playing app |
+| Mac → phone | `nowPlaying{nowPlaying?}` (v2) | on change (throttled, max 2/s; position advancing is not a change, a seek is) and after hello: title, artist, album, app, isPlaying, duration, elapsed, artwork (≤ 24 KB JPEG), canControl; absent = nothing plays |
+
+Version 2 (M9): `v` is the version that introduced each message, so version 1 messages still
+go out as `v:1` and a v1 Mac (Sender 0.5.0) keeps working with a v2 phone. `status` carries
+`protocolVersion` (absent = 1); the phone sends `media` only to a Mac that reported 2 or later.
 
 ## Arbitration (`SourceArbiter`, phone side, pure and tested)
 
@@ -52,9 +58,29 @@ reader crossfades (the M2.8 fade, no click). Non-active Macs get no keepalives.
 
 ## Phone extras
 
-Now Playing / lock screen shows the active Mac's name; play/pause there unmute/mute that Mac.
-Media keys sent to the Mac (play/pause/next) are not implemented: posting system media-key
-events needs the Accessibility permission on the Mac.
+Now Playing / lock screen shows the active Mac's name. With a v2 Mac that reports what plays it
+shows the Mac's track (title, "artist · Mac name", app as album, artwork, position) and
+`playbackRate` follows the Mac's play state; play / pause / toggle / next / previous from the
+lock screen, Control Center, AirPods and the active row's buttons go to the Mac
+(`MediaControlRouter`). Otherwise (nothing known, v1 Mac) play / pause unmute / mute that Mac
+and next / previous are disabled.
+
+## Playback control on the Mac (M9)
+
+- **Commands**: `MRMediaRemoteSendCommand` from the private MediaRemote.framework (dlopen).
+  Probed on macOS 27.0.1: sending still works for an unentitled, non-sandboxed app (pause/play
+  of a browser video round-tripped) and needs no permission; only *reading* Now Playing is
+  blocked since 15.4. Fallback if sending ever fails: system media-key events posted with
+  `CGEvent.post` — needs Accessibility; the menu then shows "Playback control: needs
+  Accessibility — Open Settings" and the phone falls back to mute.
+- **Now Playing info**: the vendored [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter)
+  v0.7.7 (BSD-3-Clause, `ThirdParty/mediaremote-adapter`, `vendor.sh` pins the commit). The
+  entitled `/usr/bin/perl` runs `mediaremote-adapter.pl` from the app's Resources and loads
+  `MediaRemoteAdapter.framework` (built by the `MediaRemoteAdapter` target, embedded, not
+  linked) — `stream` prints JSON lines that `MediaRemoteAdapterStream` (BridgeCore) merges.
+  No permission needed. `NowPlayingMonitor` restarts the child with a backoff.
+- Pausing leaves the stream running: the virtual device keeps the stream alive and sends
+  silence, no reconnect, the M2.8 fades are unchanged.
 
 ## Trust assumption
 

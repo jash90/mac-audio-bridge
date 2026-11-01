@@ -195,6 +195,8 @@ final class SenderController: ObservableObject {
     /// Name this Mac is advertised under (Bonjour may rename on a conflict).
     var advertisedName = SourceIdentity.computerName()
     var controlServer: ControlServer?
+    /// Playback control from the phone + what plays here (M9).
+    let media = MacMediaControl()
     /// Hello per open control session (nil until the phone sent it).
     var sessions: [ControlServer.SessionID: PhoneHello?] = [:]
     var lastSentStatus: [ControlServer.SessionID: (status: SourceStatus, at: TimeInterval)] = [:]
@@ -256,6 +258,9 @@ final class SenderController: ObservableObject {
         let server = Self.makeControlServer(controller: self, serviceName: advertisedName)
         controlServer = server
         server.start()
+        media.start { [weak self] info in
+            self?.broadcastNowPlaying(info)
+        }
         // Main-actor task loop (the class is @MainActor, so the task inherits
         // the main actor): one immediate pass — streaming starts within this
         // first evaluate when our device is the default output and a receiver

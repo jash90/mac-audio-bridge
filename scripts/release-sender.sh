@@ -95,6 +95,9 @@ check_version "$DRIVER"
 # defaults: hardened runtime, timestamp, exactly the entitlements file.
 log "Signing app and driver..."
 codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$DRIVER"
+# Nested code first: the app's seal covers the embedded adapter framework.
+codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" \
+    "$APP/Contents/Frameworks/MediaRemoteAdapter.framework"
 codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" \
     --entitlements "$ENTITLEMENTS" "$APP"
 for bundle in "$APP" "$DRIVER"; do

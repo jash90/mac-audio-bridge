@@ -54,6 +54,9 @@ extension SenderController {
             lastSentStatus[id] = nil
             sendPendingClaim()
             remoteStateChanged(force: true)
+            if case .some(let info) = media.currentForNewPhone {
+                controlServer?.send(.nowPlaying(info), to: id)
+            }
             return
         }
         guard let session = sessions[id], let hello = session else { return }
@@ -78,7 +81,9 @@ extension SenderController {
             remoteStateChanged()
         case .setQuality(let newQuality):
             setQuality(newQuality)
-        case .hello, .status, .claim:
+        case .media(let command):
+            media.perform(command)
+        case .hello, .status, .claim, .nowPlaying:
             break  // phone → Mac only / Mac → phone only
         }
     }
@@ -164,6 +169,15 @@ extension SenderController {
             controlServer?.send(.claim, to: id)
         }
         pendingClaimSince = nil
+    }
+
+    // MARK: - Now Playing
+
+    /// Sends what plays on this Mac to every phone that said hello.
+    func broadcastNowPlaying(_ info: NowPlayingInfo?) {
+        for (id, hello) in sessions where hello != nil {
+            controlServer?.send(.nowPlaying(info), to: id)
+        }
     }
 
     // MARK: - Status reports

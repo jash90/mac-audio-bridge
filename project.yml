@@ -24,8 +24,15 @@ targets:
         excludes:
           - "Info.plist"
           - "Sender.entitlements"
+      # Run by /usr/bin/perl to read Now Playing (see NowPlayingMonitor).
+      - path: ThirdParty/mediaremote-adapter/bin/mediaremote-adapter.pl
+        buildPhase: resources
     dependencies:
       - package: BridgeCore
+      # Loaded by the adapter script inside perl, never linked into the app.
+      - target: MediaRemoteAdapter
+        link: false
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.jash90.MacAudioBridge.Sender
@@ -35,6 +42,39 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: Apps/Sender-macOS/Sender.entitlements
         ENABLE_HARDENED_RUNTIME: YES
+  # Vendored ungive/mediaremote-adapter v0.7.7 (BSD-3-Clause), built as in
+  # its CMakeLists.txt: ARC, default symbol visibility (the perl script finds
+  # its functions by name), Foundation + AppKit + UniformTypeIdentifiers.
+  MediaRemoteAdapter:
+    type: framework
+    platform: macOS
+    sources:
+      - path: ThirdParty/mediaremote-adapter/src
+        excludes:
+          - "test/*.m"
+      - path: ThirdParty/mediaremote-adapter/include
+        headerVisibility: public
+    dependencies:
+      - sdk: Foundation.framework
+      - sdk: AppKit.framework
+      - sdk: UniformTypeIdentifiers.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.jash90.MacAudioBridge.MediaRemoteAdapter
+        PRODUCT_NAME: MediaRemoteAdapter
+        GENERATE_INFOPLIST_FILE: YES
+        CLANG_ENABLE_OBJC_ARC: YES
+        GCC_SYMBOLS_PRIVATE_EXTERN: NO
+        DEFINES_MODULE: NO
+        SKIP_INSTALL: YES
+        HEADER_SEARCH_PATHS: ["$(PROJECT_DIR)/ThirdParty/mediaremote-adapter/src", "$(PROJECT_DIR)/ThirdParty/mediaremote-adapter/include"]
+        ARCHS: [arm64, x86_64]
+        ONLY_ACTIVE_ARCH: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        # Known benign warnings in the unmodified upstream sources (K&R-style
+        # `()` prototypes, one unused local in get.m).
+        CLANG_WARN_STRICT_PROTOTYPES: NO
+        WARNING_CFLAGS: ["$(inherited)", "-Wno-strict-prototypes", "-Wno-unused-variable"]
   Receiver:
     type: application
     platform: iOS
