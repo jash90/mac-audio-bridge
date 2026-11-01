@@ -4,7 +4,12 @@ import SwiftUI
 struct ReceiverApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            // DesignLab mockups (`-DesignLab A|B|C`); the real UI otherwise.
+            if let designLab = DesignLabLaunch.current {
+                DesignLabRoot(launch: designLab)
+            } else {
+                ContentView()
+            }
         }
     }
 }
