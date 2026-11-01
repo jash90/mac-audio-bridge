@@ -10,8 +10,24 @@ let package = Package(
     products: [
         .library(name: "BridgeCore", targets: ["BridgeCore"]),
     ],
+    dependencies: [
+        // Vendored libopus 1.5.2 (see ThirdParty/opus/Package.swift).
+        .package(path: "../../ThirdParty/opus"),
+    ],
     targets: [
-        .target(name: "BridgeCore"),
+        // Non-variadic ctl wrappers so Swift can configure libopus.
+        .target(
+            name: "COpusShim",
+            dependencies: [.product(name: "COpus", package: "opus")],
+            cSettings: [.unsafeFlags(["-Wall", "-Wextra"])]
+        ),
+        .target(
+            name: "BridgeCore",
+            dependencies: [
+                .product(name: "COpus", package: "opus"),
+                "COpusShim",
+            ]
+        ),
         .testTarget(name: "BridgeCoreTests", dependencies: ["BridgeCore"]),
     ]
 )

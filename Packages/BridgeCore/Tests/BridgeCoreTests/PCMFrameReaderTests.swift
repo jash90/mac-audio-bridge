@@ -2,222 +2,243 @@ import Testing
 import Foundation
 @testable import BridgeCore
 
-struct PCMFrameReaderTests {
-    // MARK: - Helpers
+// MARK: - Shared helpers
 
-    /// Interleaved samples per playout frame (480 frames × 2 channels).
-    private static let samplesPerFrame =
-        AudioFormat.samplesPerFrame * AudioFormat.channelCount
+/// Interleaved samples per 5 ms playout slot (240 frames × 2 channels).
+let readerSlotSamples = AudioFormat.samplesPerFrame * AudioFormat.channelCount
 
-    /// Serves preset outputs one per call, then `.buffering` forever (like a
-    /// live jitter buffer). `@unchecked Sendable` so it can back the
-    /// `@Sendable` reader source; tests are single-threaded.
-    private final class OutputSequence: @unchecked Sendable {
-        private var outputs: [JitterBufferOutput]
-        private var index = 0
+/// Little-endian Int16 payload bytes for interleaved `samples`.
+func pcm16Payload(_ samples: [Int16]) -> Data {
+    var data = Data(capacity: samples.count * 2)
+    for value in samples {
+        let bits = UInt16(bitPattern: value).littleEndian
+        data.append(UInt8(bits & 0xFF))
+        data.append(UInt8(bits >> 8))
+    }
+    return data
+}
 
-        init(_ outputs: [JitterBufferOutput]) {
-            self.outputs = outputs
-        }
+/// Interleaved stereo Int16 sine for slot `slot` (sample-time continuous),
+/// both channels equal.
+func sineSlot(_ slot: Int, frequency: Double, amplitude: Double = 0.5) -> [Int16] {
+    var samples = [Int16](repeating: 0, count: readerSlotSamples)
+    for frame in 0..<AudioFormat.samplesPerFrame {
+        let n = Double(slot * AudioFormat.samplesPerFrame + frame)
+        let value = Int16((amplitude * sin(2 * Double.pi * frequency * n / AudioFormat.sampleRate) * 32767).rounded())
+        samples[2 * frame] = value
+        samples[2 * frame + 1] = value
+    }
+    return samples
+}
 
-        var consumed: Int { index }
+/// Largest sample-to-sample step on either channel of interleaved `output`.
+func maxStep(_ output: [Float]) -> Float {
+    var worst: Float = 0
+    var index = 2
+    while index < output.count {
+        worst = max(worst, abs(output[index] - output[index - 2]))
+        index += 1
+    }
+    return worst
+}
 
-        func next() -> JitterBufferOutput {
-            guard index < outputs.count else { return .buffering }
-            defer { index += 1 }
-            return outputs[index]
-        }
+/// Largest step of the pure sine itself (amplitude × 2 sin(π f / fs)).
+func sineMaxStep(frequency: Double, amplitude: Double = 0.5) -> Float {
+    Float(amplitude * 2 * sin(Double.pi * frequency / AudioFormat.sampleRate))
+}
+
+/// Scripted playout slots for a reader under test.
+enum ScriptedSlot {
+    case frame(UInt32, [Int16], skipped: [Int16]? = nil)
+    case lost
+    case underrun
+    case buffering
+}
+
+/// Serves scripted slots like the jitter buffer's realtime pop, then
+/// `.buffering` forever. Single-threaded tests only.
+final class ScriptedSource: @unchecked Sendable {
+    private var slots: [ScriptedSlot]
+    private var index = 0
+
+    init(_ slots: [ScriptedSlot]) {
+        self.slots = slots
     }
 
-    /// Interleaved little-endian Int16 payload bytes for `samples`.
-    private func payload(_ samples: [Int16]) -> Data {
-        var data = Data(capacity: samples.count * MemoryLayout<Int16>.size)
-        for value in samples {
-            let littleEndianValue = UInt16(bitPattern: value).littleEndian
-            withUnsafeBytes(of: littleEndianValue) { bytes in
-                data.append(contentsOf: bytes)
+    var consumed: Int { index }
+
+    func next(_ payload: UnsafeMutableRawBufferPointer, _ skipped: UnsafeMutableRawBufferPointer) -> PlayoutSlot {
+        guard index < slots.count else { return .buffering }
+        defer { index += 1 }
+        switch slots[index] {
+        case .frame(let sequence, let samples, let skippedSamples):
+            let bytes = pcm16Payload(samples)
+            bytes.copyBytes(to: payload)
+            var skippedCount = 0
+            if let skippedSamples {
+                let skippedBytes = pcm16Payload(skippedSamples)
+                skippedBytes.copyBytes(to: skipped)
+                skippedCount = skippedBytes.count
             }
+            return .frame(
+                PlayoutFrame(
+                    sequence: sequence,
+                    sampleTime: UInt64(sequence) * UInt64(AudioFormat.samplesPerFrame),
+                    codec: .pcm16, flags: [], byteCount: bytes.count,
+                    skippedByteCount: skippedCount, recovered: false))
+        case .lost:
+            return .lost(sequence: 0)
+        case .underrun:
+            return .underrun
+        case .buffering:
+            return .buffering
         }
-        return data
     }
+}
 
-    /// A PCM16 packet whose payload decodes to `samples`.
-    private func packet(sequence: UInt32, samples: [Int16]) -> AudioPacket {
-        AudioPacket(
-            codec: .pcm16,
-            sequence: sequence,
-            sampleTime: UInt64(sequence) * UInt64(AudioFormat.samplesPerFrame),
-            payload: payload(samples))
-    }
+func makeReader(_ source: ScriptedSource) -> PCMFrameReader {
+    PCMFrameReader(source: { payload, skipped in source.next(payload, skipped) })
+}
 
-    /// Distinct, deterministic samples for frame `frameIndex`.
-    private func ramp(_ frameIndex: Int) -> [Int16] {
-        (0..<Self.samplesPerFrame).map { i in Int16(frameIndex * 100 + i) }
-    }
-
-    /// What the reader must produce for `samples` (Int16 LE → Float).
-    private func floats(from samples: [Int16]) -> [Float] {
-        samples.map { Float($0) / 32768 }
-    }
-
-    /// Reads exactly `sampleCount` samples from `reader`.
-    private func read(_ reader: PCMFrameReader, sampleCount: Int) -> [Float] {
-        var out = [Float](repeating: 0, count: sampleCount)
-        out.withUnsafeMutableBufferPointer { buffer in
-            buffer.baseAddress.map { reader.read(into: $0, sampleCount: sampleCount) }
+/// Reads `slots` whole slots from `reader` in render quanta of `quantum`
+/// interleaved samples.
+func render(_ reader: PCMFrameReader, slots: Int, quantum: Int = 2 * 256) -> [Float] {
+    let total = slots * readerSlotSamples
+    var output = [Float](repeating: .nan, count: total)
+    output.withUnsafeMutableBufferPointer { buffer in
+        var offset = 0
+        while offset < total {
+            let chunk = min(quantum, total - offset)
+            reader.read(into: buffer.baseAddress! + offset, sampleCount: chunk)
+            offset += chunk
         }
-        return out
     }
+    return output
+}
 
-    // MARK: - Arbitrary-size reads and continuity
+func floats(_ samples: [Int16]) -> [Float] {
+    samples.map { Float($0) / 32768 }
+}
+
+func rms(_ values: ArraySlice<Float>) -> Float {
+    guard !values.isEmpty else { return 0 }
+    return sqrt(values.reduce(0) { $0 + $1 * $1 } / Float(values.count))
+}
+
+// MARK: - Tests
+
+struct PCMFrameReaderTests {
+    private func slot(_ output: [Float], _ index: Int) -> ArraySlice<Float> {
+        output[(index * readerSlotSamples)..<((index + 1) * readerSlotSamples)]
+    }
 
     @Test(
-        "Reads of any size are sample-exact across frame boundaries",
-        arguments: [1, 256, 480, 1000]
+        "Contiguous frames play bit-exact after the initial fade-in, for any render quantum",
+        arguments: [2 * 64, 2 * 256, 2 * 341, 2 * 1024]
     )
-    func readsOfAnySizeAreSampleExact(readFrames: Int) {
-        let packets = (0..<5).map { packet(sequence: UInt32($0), samples: ramp($0)) }
-        let expected = packets.flatMap { floats(from: ramp(Int($0.sequence))) }
-        let sequence = OutputSequence(packets.map { .packet($0) })
-        let reader = PCMFrameReader(source: sequence.next)
-
-        var got: [Float] = []
-        while got.count < expected.count {
-            got.append(contentsOf: read(reader, sampleCount: readFrames * 2))
+    func contiguousFramesAreExact(quantum: Int) {
+        let frames = (0..<12).map { sineSlot($0, frequency: 1000) }
+        let reader = makeReader(ScriptedSource(frames.enumerated().map { .frame(UInt32($0.offset), $0.element) }))
+        let output = render(reader, slots: 12, quantum: quantum)
+        for index in 1..<12 {
+            #expect(Array(slot(output, index)) == floats(frames[index]))
         }
-
-        #expect(Array(got.prefix(expected.count)) == expected)
-        // Exactly one source pop per playout frame consumed.
-        #expect(sequence.consumed == packets.count)
+        // The first slot fades in from silence instead of starting at full level.
+        #expect(abs(output[0]) < 0.001)
+        #expect(maxStep(output) <= sineMaxStep(frequency: 1000) * 1.05)
     }
 
     @Test("Partial reads expose the unplayed remainder of the frame")
-    func partialReadReportsPendingFrames() {
-        let reader = PCMFrameReader(
-            source: OutputSequence([.packet(packet(sequence: 0, samples: ramp(0)))]).next)
-        _ = read(reader, sampleCount: Self.samplesPerFrame / 2)
-
-        #expect(reader.partiallyPlayedFrames == 0.5)
-
-        _ = read(reader, sampleCount: Self.samplesPerFrame / 2)
-        #expect(reader.partiallyPlayedFrames == 0)
+    func partialReadsExposeRemainder() {
+        let reader = makeReader(ScriptedSource([.frame(0, sineSlot(0, frequency: 1000))]))
+        var buffer = [Float](repeating: 0, count: readerSlotSamples / 4)
+        buffer.withUnsafeMutableBufferPointer { reader.read(into: $0.baseAddress!, sampleCount: $0.count) }
+        #expect(abs(reader.partiallyPlayedFrames - 0.75) < 1e-9)
     }
 
-    // MARK: - Loss concealment
+    @Test("A single lost slot is concealed at full level, continuously")
+    func singleLossIsConcealedAtFullLevel() {
+        var script: [ScriptedSlot] = (0..<10).map { .frame(UInt32($0), sineSlot($0, frequency: 1000)) }
+        script.append(.lost)
+        script += (11..<20).map { .frame(UInt32($0), sineSlot($0, frequency: 1000)) }
+        let reader = makeReader(ScriptedSource(script))
+        let output = render(reader, slots: 20)
+        let sineRMS = Float(0.5 / 2.0.squareRoot())
+        #expect(rms(slot(output, 10)) > 0.9 * sineRMS)
+        #expect(maxStep(Array(output[readerSlotSamples...])) <= sineMaxStep(frequency: 1000) * 1.2)
+        let stats = reader.stats
+        #expect(stats.concealedFrames == 1)
+        #expect(stats.concealments == 1)
+        #expect(stats.fadeIns == 1)
+        #expect(stats.fadeOuts == 0)
+    }
 
-    @Test("A lost frame replays the last good frame with a linear fade")
-    func lossReplaysLastGoodFrameWithFade() {
-        let good = ramp(0)
-        let sequence = OutputSequence([
-            .packet(packet(sequence: 0, samples: good)),
-            .lost(sequence: 1),
-        ])
-        let reader = PCMFrameReader(source: sequence.next)
-
-        _ = read(reader, sampleCount: Self.samplesPerFrame)
-        // Read the concealed frame in two halves to prove the fade continues
-        // across read boundaries.
-        let firstHalf = read(reader, sampleCount: Self.samplesPerFrame / 2)
-        let secondHalf = read(reader, sampleCount: Self.samplesPerFrame / 2)
-        let concealed = firstHalf + secondHalf
-
-        let expected = floats(from: good).enumerated().map { index, value in
-            value * (1 - Float(index) / Float(Self.samplesPerFrame))
+    @Test("A long underrun fades out to exact silence and fades back in without a step")
+    func longUnderrunFadesOutAndIn() {
+        var script: [ScriptedSlot] = (0..<20).map { .frame(UInt32($0), sineSlot($0, frequency: 440)) }
+        script += Array(repeating: .underrun, count: 40)  // 200 ms
+        script += (20..<40).map { .frame(UInt32($0), sineSlot($0, frequency: 440)) }
+        let reader = makeReader(ScriptedSource(script))
+        let output = render(reader, slots: 80)
+        // 50 ms of concealment (hold + decay) = 10 slots, then true silence.
+        for index in 31..<60 {
+            #expect(slot(output, index).allSatisfy { $0 == 0 })
         }
-        #expect(concealed == expected)
+        // Concealment is audible right after the gap starts (no hard hole).
+        #expect(rms(slot(output, 20)) > 0.25)
+        #expect(maxStep(Array(output[readerSlotSamples...])) <= sineMaxStep(frequency: 440) * 1.3)
+        let stats = reader.stats
+        #expect(stats.fadeOuts == 1)
+        #expect(stats.fadeIns == 1)
+        #expect(stats.concealedFrames == 40)
     }
 
-    @Test("A second consecutive loss is silence")
-    func secondConsecutiveLossIsSilence() {
-        let sequence = OutputSequence([
-            .packet(packet(sequence: 0, samples: ramp(0))),
-            .lost(sequence: 1),
-            .lost(sequence: 2),
-            .packet(packet(sequence: 3, samples: ramp(3))),
-        ])
-        let reader = PCMFrameReader(source: sequence.next)
-
-        _ = read(reader, sampleCount: Self.samplesPerFrame)  // good frame
-        _ = read(reader, sampleCount: Self.samplesPerFrame)  // faded replay
-        let silence = read(reader, sampleCount: Self.samplesPerFrame)
-        #expect(silence == Array(repeating: Float(0), count: Self.samplesPerFrame))
-
-        let resumed = read(reader, sampleCount: Self.samplesPerFrame)
-        #expect(resumed == floats(from: ramp(3)))
+    @Test("Buffering before the first frame is silence and nothing is counted")
+    func initialBufferingIsSilence() {
+        let reader = makeReader(ScriptedSource([.buffering, .buffering, .frame(0, sineSlot(0, frequency: 1000))]))
+        let output = render(reader, slots: 3)
+        #expect(output[0..<(2 * readerSlotSamples)].allSatisfy { $0 == 0 })
+        #expect(reader.stats == ConcealmentStats())
     }
 
-    @Test("A loss with no last good frame is silence")
-    func lossWithoutHistoryIsSilence() {
-        let reader = PCMFrameReader(
-            source: OutputSequence([.lost(sequence: 0)]).next)
-        let out = read(reader, sampleCount: Self.samplesPerFrame)
-        #expect(out == Array(repeating: Float(0), count: Self.samplesPerFrame))
+    @Test("A trimmed frame is crossfaded into its successor across the slot")
+    func trimIsCrossfaded() {
+        // 440 Hz: the skipped frame and its successor are out of phase, so a
+        // hard splice would click.
+        var script: [ScriptedSlot] = (0..<10).map { .frame(UInt32($0), sineSlot($0, frequency: 440)) }
+        script.append(.frame(11, sineSlot(11, frequency: 440), skipped: sineSlot(10, frequency: 440)))
+        script += (12..<20).map { .frame(UInt32($0), sineSlot($0, frequency: 440)) }
+        let reader = makeReader(ScriptedSource(script))
+        let output = render(reader, slots: 19)
+        // Starts exactly like the skipped frame, ends exactly like frame 11.
+        let crossfaded = Array(slot(output, 10))
+        let skipped = floats(sineSlot(10, frequency: 440))
+        let next = floats(sineSlot(11, frequency: 440))
+        #expect(abs(crossfaded[0] - skipped[0]) < 1e-3)
+        #expect(abs(crossfaded[readerSlotSamples - 1] - next[readerSlotSamples - 1]) < 1e-3)
+        #expect(Array(slot(output, 11)) == floats(sineSlot(12, frequency: 440)))
+        #expect(maxStep(Array(output[readerSlotSamples...])) <= sineMaxStep(frequency: 440) * 1.2)
+        #expect(reader.stats.crossfades == 1)
     }
 
-    @Test("Buffering outputs silence and does not arm concealment")
-    func bufferingOutputsSilence() {
-        let sequence = OutputSequence([
-            .buffering,
-            .lost(sequence: 0),
-            .packet(packet(sequence: 1, samples: ramp(1))),
-        ])
-        let reader = PCMFrameReader(source: sequence.next)
-
-        let silence = read(reader, sampleCount: Self.samplesPerFrame)
-        #expect(silence == Array(repeating: Float(0), count: Self.samplesPerFrame))
-
-        // No last good frame existed before the loss: still silence.
-        let lost = read(reader, sampleCount: Self.samplesPerFrame)
-        #expect(lost == Array(repeating: Float(0), count: Self.samplesPerFrame))
-
-        let resumed = read(reader, sampleCount: Self.samplesPerFrame)
-        #expect(resumed == floats(from: ramp(1)))
+    @Test("A jump without the skipped frame (overflow resync) is crossfaded too")
+    func jumpIsCrossfaded() {
+        var script: [ScriptedSlot] = (0..<10).map { .frame(UInt32($0), sineSlot($0, frequency: 440)) }
+        script += (17..<27).map { .frame(UInt32($0), sineSlot($0, frequency: 440)) }
+        let reader = makeReader(ScriptedSource(script))
+        let output = render(reader, slots: 20)
+        #expect(maxStep(Array(output[readerSlotSamples...])) <= sineMaxStep(frequency: 440) * 1.3)
+        #expect(reader.stats.crossfades == 1)
     }
 
-    @Test("A skipped frame is spliced with a short ramp from the last output sample")
-    func skippedFrameIsSpliced() {
-        let first = ramp(0)
-        let third = ramp(20)
-        let sequence = OutputSequence([
-            .packet(packet(sequence: 0, samples: first)),
-            .packet(packet(sequence: 2, samples: third)),  // frame 1 trimmed
-        ])
-        let reader = PCMFrameReader(source: sequence.next)
-        _ = read(reader, sampleCount: Self.samplesPerFrame)
-        let spliced = read(reader, sampleCount: Self.samplesPerFrame)
-
-        let decoded = floats(from: third)
-        let lastLeft = Float(first[Self.samplesPerFrame - 2]) / 32768
-        let rampSamples = PCMFrameReader.spliceRampFrames * 2
-        // The first sample starts next to the previous output, then the ramp
-        // converges monotonically onto the decoded audio.
-        #expect(abs(spliced[0] - lastLeft) < abs(decoded[0] - lastLeft))
-        #expect(Array(spliced[rampSamples...]) == Array(decoded[rampSamples...]))
-    }
-
-    @Test("Contiguous packets are not altered by the splice ramp")
-    func contiguousPacketsAreUntouched() {
-        let sequence = OutputSequence([
-            .packet(packet(sequence: 7, samples: ramp(0))),
-            .packet(packet(sequence: 8, samples: ramp(30))),
-        ])
-        let reader = PCMFrameReader(source: sequence.next)
-        _ = read(reader, sampleCount: Self.samplesPerFrame)
-        #expect(read(reader, sampleCount: Self.samplesPerFrame) == floats(from: ramp(30)))
-    }
-
-    @Test("Reset clears the concealment history")
-    func resetClearsHistory() {
-        let sequence = OutputSequence([
-            .packet(packet(sequence: 0, samples: ramp(0))),
-            .lost(sequence: 1),
-        ])
-        let reader = PCMFrameReader(source: sequence.next)
-
-        _ = read(reader, sampleCount: Self.samplesPerFrame)
+    @Test("Reset returns to silence: the next frame fades in")
+    func resetFadesInAgain() {
+        let source = ScriptedSource((0..<4).map { .frame(UInt32($0), sineSlot($0, frequency: 1000)) })
+        let reader = makeReader(source)
+        _ = render(reader, slots: 2)
         reader.reset()
-
-        let out = read(reader, sampleCount: Self.samplesPerFrame)
-        #expect(out == Array(repeating: Float(0), count: Self.samplesPerFrame))
+        let output = render(reader, slots: 2)
+        #expect(abs(output[0]) < 0.001)
+        #expect(Array(slot(output, 1)) == floats(sineSlot(3, frequency: 1000)))
     }
 }

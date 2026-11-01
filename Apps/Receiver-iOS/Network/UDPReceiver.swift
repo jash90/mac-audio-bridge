@@ -17,47 +17,67 @@ private let receiverKeepaliveEnabled = true
 /// Listens for UDP datagrams on port 49000 (any free port if that one is
 /// taken — Bonjour carries the real port) and advertises the listener as the
 /// Bonjour service `_macaudiobridge._udp` named after the device ("iPhone
-/// 7KQ2", see `ReceiverIdentity`) with TXT `v=1`, so the Mac finds it by name
+/// 7KQ2", see `ReceiverIdentity`) with TXT `v=2`, so the Mac finds it by name
 /// and re-resolves it when the Wi-Fi address changes. A failed listener is
 /// recreated (same name, same port), so a sender keeps working across it.
 ///
-/// Each datagram is one `AudioPacket` (10 ms of interleaved little-endian
-/// Int16 PCM); decoded packets are inserted into the jitter buffer stamped
-/// with a monotonic arrival time. Datagrams that fail `AudioPacket.decode`, or
-/// that carry an unexpected codec or payload size, are dropped and counted as
-/// malformed. Start/stop run on the main actor, callbacks are confined to one
+/// Each datagram is one `AudioDatagram` (5 ms frames — interleaved
+/// little-endian Int16 PCM, or one Opus packet per entry: a primary and/or
+/// redundant copies); every frame is inserted into the jitter buffer stamped
+/// with a monotonic arrival time, undecoded (the playout reader decodes Opus
+/// in playout order). Datagrams that fail `AudioDatagram.decode`, or that
+/// carry an unexpected payload size for their codec, are dropped and counted
+/// as malformed. Start/stop run on the main actor, callbacks are confined to one
 /// serial queue.
+///
+/// Exactly one source plays: every datagram carries its Mac's source tag
+/// and passes the `SourceGate` (mode set by the main actor from the
+/// `SourceArbiter`). Datagrams of other sources are dropped and counted;
+/// the first datagram of a newly admitted source has its primary marked as a
+/// discontinuity, so the jitter buffer resets and the reader crossfades.
 final class UDPReceiver: @unchecked Sendable {
     static let port: UInt16 = ReceiverService.preferredPort
     private static let listenerRestartDelay: TimeInterval = 2
     /// Sender flows that delivered nothing for this long are closed (a
     /// sender that reconnected arrives as a new flow from a new port).
     private static let idlePeerTimeout: TimeInterval = 30
-    /// Expected payload of one PCM16 stereo frame: 480 frames × 2 channels × 2 bytes.
-    private static let expectedPayloadBytes =
-        AudioFormat.samplesPerFrame * AudioFormat.channelCount * MemoryLayout<Int16>.size
-    /// Keepalive cadence, and how recently the last packet must have arrived
-    /// for keepalives to keep flowing ("while playing").
-    private static let keepaliveInterval: TimeInterval = 0.020
+    /// Expected payload of one PCM16 stereo frame: 240 frames × 2 channels × 2 bytes.
+    private static let expectedPayloadBytes = AudioFormat.pcm16FrameBytes
+    /// Accepted Opus packet sizes: one byte up to what a jitter-buffer slot holds.
+    private static let opusPayloadBytes = 1...min(OpusSettings.maxPacketBytes, JitterBuffer.maxFramePayloadBytes)
+    /// How recently the last packet must have arrived for keepalives to
+    /// keep flowing ("while playing"). The cadence follows the stream
+    /// profile: 20 ms on the LAN (radio wake-ups), 200 ms over the Internet
+    /// (liveness only — every byte counts on cellular).
     private static let keepaliveActivityWindow: TimeInterval = 1.0
-    /// 16-byte datagram, "MABK" magic + zeros. The sender drains and ignores
-    /// everything that is not a valid audio packet.
-    private static let keepalivePayload: Data = {
-        var data = Data(count: 16)
-        data[0] = 0x4D
-        data[1] = 0x41
-        data[2] = 0x42
-        data[3] = 0x4B
-        return data
-    }()
 
     private let jitterBuffer: JitterBuffer
-    private let queue = DispatchQueue(label: "dev.jash90.MacAudioBridge.udp-receiver")
+    /// User-interactive: arrival timestamps are taken here, and a throttled
+    /// queue would add its own scheduling jitter to every delay sample.
+    private let queue = DispatchQueue(label: "dev.jash90.MacAudioBridge.udp-receiver", qos: .userInteractive)
     private let logger = Logger(subsystem: "dev.jash90.MacAudioBridge", category: "udp-receiver")
     private let malformedDatagrams = Atomic<Int>(0)
+    /// Datagrams dropped because they came from a non-active source.
+    private let foreignDatagrams = Atomic<Int>(0)
+    /// Source filter; locked briefly on the receive queue and by `setGateMode`.
+    private let gate = Mutex(SourceGate())
+    /// Called on the receive queue when the gate adopted a stream by itself
+    /// (nothing was active). Set before `start`, never swapped afterwards.
+    var onSourceAdopted: (@Sendable (UInt32) -> Void)?
     /// Arrival-clock epoch. `ContinuousClock` never goes backwards, which the
     /// jitter buffer's interarrival estimates rely on.
     private let clockStart = ContinuousClock.now
+    /// Latency mode the WAN / LAN jitter configs are built for (main actor writes).
+    private let latencyMode = Mutex(JitterLatencyMode.balanced)
+    /// The stream profile the sender marks its datagrams with (raw value).
+    private let profileValue = Atomic<UInt8>(StreamProfile.lan.rawValue)
+    /// Keepalive flags (expensive path), set from the network monitor.
+    private let keepaliveFlags = Atomic<UInt8>(0)
+    /// Accepted audio datagrams and their UDP payload bytes, since launch.
+    private let acceptedDatagrams = Atomic<Int>(0)
+    private let acceptedBytes = Atomic<Int>(0)
+    /// Address class of the sender whose datagrams were accepted last.
+    private let senderKind = Mutex<NetworkAddressKind?>(nil)
 
     /// An accepted sender connection, whether its path is ready (keepalive
     /// sends are dropped until it is), and when it last delivered a packet
@@ -65,8 +85,11 @@ final class UDPReceiver: @unchecked Sendable {
     private struct Peer {
         let connection: NWConnection
         let acceptedAt: TimeInterval
+        let kind: NetworkAddressKind?
         var isReady = false
         var lastPacketArrival: TimeInterval?
+        /// Source tag of the audio this flow carries (its Mac).
+        var sourceTag: UInt32?
     }
 
     /// Posts advertisement state to the main actor in FIFO order.
@@ -86,6 +109,15 @@ final class UDPReceiver: @unchecked Sendable {
     /// consecutive packets since the last `takeMaxInterArrivalGapSeconds`.
     private var lastPacketArrival: TimeInterval?
     private var maxInterArrivalGap: TimeInterval = 0
+    /// Follows the profile mark of the newest datagram only (stragglers of
+    /// the previous profile do not flip it back).
+    private var profileFollower = ProfileFollower()
+    private var keepaliveInterval = StreamProfile.lan.keepaliveInterval
+    /// Source tag of the datagram `ingest` accepted last.
+    private var lastIngestedTag: UInt32 = 0
+    /// Mic datagrams handed to a flow / dropped for want of one.
+    private let micSent = Atomic<Int>(0)
+    private let micMisses = Atomic<Int>(0)
 
     init(jitterBuffer: JitterBuffer) {
         self.jitterBuffer = jitterBuffer
@@ -98,6 +130,47 @@ final class UDPReceiver: @unchecked Sendable {
     /// Datagrams dropped since launch because they were not a valid audio packet.
     var malformedCount: Int {
         malformedDatagrams.load(ordering: .relaxed)
+    }
+
+    /// Datagrams dropped since launch because another source is active.
+    var foreignCount: Int {
+        foreignDatagrams.load(ordering: .relaxed)
+    }
+
+    /// The stream profile of the current stream (from the datagram marks).
+    var profile: StreamProfile {
+        StreamProfile(rawValue: profileValue.load(ordering: .relaxed)) ?? .lan
+    }
+
+    /// Accepted audio datagrams / UDP payload bytes since launch.
+    var datagramCount: Int { acceptedDatagrams.load(ordering: .relaxed) }
+    var byteCount: Int { acceptedBytes.load(ordering: .relaxed) }
+
+    /// Address class of the sender currently streaming (nil before any).
+    var currentSenderKind: NetworkAddressKind? { senderKind.withLock { $0 } }
+
+    /// Latency mode for profile retunes; the caller applies it to the buffer.
+    func setLatencyMode(_ mode: JitterLatencyMode) {
+        latencyMode.withLock { $0 = mode }
+    }
+
+    /// Tells the sender (in every keepalive) that this phone is on an
+    /// expensive path (cellular / hotspot), which selects the WAN profile.
+    func setExpensivePath(_ expensive: Bool) {
+        let flags: ReceiverKeepalive.Flags = expensive ? [.expensivePath] : []
+        keepaliveFlags.store(flags.rawValue, ordering: .relaxed)
+    }
+
+    /// Which source tags are let through (from the arbiter, main actor).
+    func setGateMode(_ mode: SourceGateMode) {
+        gate.withLock { $0.setMode(mode) }
+    }
+
+    /// Seconds since the last accepted audio datagram (nil = none yet).
+    func secondsSinceLastAudio() -> TimeInterval? {
+        queue.sync {
+            lastPacketArrival.map { elapsedSeconds() - $0 }
+        }
     }
 
     func start() throws {
@@ -234,7 +307,8 @@ final class UDPReceiver: @unchecked Sendable {
     private func accept(_ connection: NWConnection) {
         connection.stateUpdateHandler = Self.makePeerStateHandler(receiver: self, connection: connection)
         connection.start(queue: queue)
-        peers.append(Peer(connection: connection, acceptedAt: elapsedSeconds()))
+        peers.append(Peer(
+            connection: connection, acceptedAt: elapsedSeconds(), kind: Self.addressKind(connection.endpoint)))
         receiveLoop(on: connection)
     }
 
@@ -272,7 +346,18 @@ final class UDPReceiver: @unchecked Sendable {
     ) {
         if let data, isComplete, ingest(data) {
             let arrival = lastPacketArrival
-            updatePeer(for: connection) { $0.lastPacketArrival = arrival }
+            var kind: NetworkAddressKind?
+            let tag = lastIngestedTag
+            updatePeer(for: connection) {
+                $0.lastPacketArrival = arrival
+                $0.sourceTag = tag
+                kind = $0.kind
+            }
+            if kind != nil, kind != currentSenderKind {
+                senderKind.withLock { $0 = kind }
+            }
+            acceptedDatagrams.wrappingAdd(1, ordering: .relaxed)
+            acceptedBytes.wrappingAdd(data.count, ordering: .relaxed)
         }
         if let error {
             logger.error("Receive failed: \(error.localizedDescription, privacy: .public)")
@@ -282,26 +367,67 @@ final class UDPReceiver: @unchecked Sendable {
         receiveLoop(on: connection)
     }
 
-    /// Decodes and buffers one datagram; true when it was a valid packet.
+    /// Decodes one datagram and buffers every frame it carries (the primary
+    /// and any redundant copies); true when it was a valid audio datagram.
+    /// The inter-arrival gap tracks datagrams carrying a primary only.
     @discardableResult
     private func ingest(_ data: Data) -> Bool {
-        let packet: AudioPacket
+        let datagram: AudioDatagram
         do {
-            packet = try AudioPacket.decode(data)
+            datagram = try AudioDatagram.decode(data)
         } catch {
             countMalformed()
             return false
         }
-        guard packet.codec == .pcm16, packet.payload.count == Self.expectedPayloadBytes else {
+        let validSizes: Bool
+        switch datagram.codec {
+        case .pcm16:
+            validSizes = datagram.entries.allSatisfy { $0.payload.count == Self.expectedPayloadBytes }
+        case .opus:
+            validSizes = datagram.entries.allSatisfy { Self.opusPayloadBytes.contains($0.payload.count) }
+        }
+        guard validSizes else {
             countMalformed()
             return false
         }
-        let arrival = elapsedSeconds()
-        if let last = lastPacketArrival {
-            maxInterArrivalGap = max(maxInterArrivalGap, arrival - last)
+        let admission = gate.withLock { $0.admit(tag: datagram.source, hasPrimary: datagram.hasPrimary) }
+        guard case .accept(let newStream, let adopted) = admission else {
+            foreignDatagrams.wrappingAdd(1, ordering: .relaxed)
+            return false
         }
-        lastPacketArrival = arrival
-        jitterBuffer.insert(packet, arrivalTime: arrival)
+        if adopted {
+            onSourceAdopted?(datagram.source)
+        }
+        lastIngestedTag = datagram.source
+        let arrival = elapsedSeconds()
+        var packets = datagram.packets()
+        if newStream {
+            // Another Mac's stream (or the first one): a fresh sequence
+            // space — reset the buffer (once: on the oldest primary of the
+            // group), crossfade at the reader.
+            if let index = packets.firstIndex(where: { !$0.isRedundant }) {
+                packets[index].flags.insert(.discontinuity)
+            }
+            profileFollower.reset()
+        }
+        if let profile = profileFollower.observe(datagram.profile, sequence: datagram.sequence) {
+            // LAN ↔ WAN: retune in place (no reset, no audible switch),
+            // before this datagram's frames go in.
+            let mode = latencyMode.withLock { $0 }
+            jitterBuffer.retune(profile.jitterConfig(mode))
+            profileValue.store(profile.rawValue, ordering: .relaxed)
+            setKeepaliveInterval(profile.keepaliveInterval)
+            logger.info("Stream profile: \(profile.displayName, privacy: .public)")
+        }
+        if packets.contains(where: { !$0.isRedundant }) {
+            if let last = lastPacketArrival {
+                maxInterArrivalGap = max(maxInterArrivalGap, arrival - last)
+            }
+            lastPacketArrival = arrival
+        }
+        for packet in packets {
+            jitterBuffer.insert(packet, arrivalTime: arrival)
+        }
         return true
     }
 
@@ -309,18 +435,50 @@ final class UDPReceiver: @unchecked Sendable {
         malformedDatagrams.wrappingAdd(1, ordering: .relaxed)
     }
 
+    // MARK: - Microphone
+
+    /// Sends the phone's mic datagrams back on the flow of the Mac with
+    /// source tag `tag` (the reply direction of its stream, like the
+    /// keepalives: no new port, works through NAT and Tailscale). Dropped
+    /// when that Mac is not streaming to us right now.
+    func sendMic(_ datagrams: [Data], toSource tag: UInt32) {
+        queue.async { [self] in
+            let flow = peers
+                .filter { $0.isReady && $0.sourceTag == tag }
+                .max { ($0.lastPacketArrival ?? 0) < ($1.lastPacketArrival ?? 0) }
+            guard let flow else {
+                micMisses.wrappingAdd(datagrams.count, ordering: .relaxed)
+                return
+            }
+            for datagram in datagrams {
+                flow.connection.send(content: datagram, completion: .contentProcessed { _ in })
+            }
+            micSent.wrappingAdd(datagrams.count, ordering: .relaxed)
+        }
+    }
+
+    /// Mic datagrams sent / dropped (no flow to that Mac) since launch.
+    var micSentCount: Int { micSent.load(ordering: .relaxed) }
+    var micMissCount: Int { micMisses.load(ordering: .relaxed) }
+
     // MARK: - Radio keepalive
 
     private func startKeepaliveTimer() {
         guard receiverKeepaliveEnabled, keepaliveTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(
-            deadline: .now() + Self.keepaliveInterval,
-            repeating: Self.keepaliveInterval
+            deadline: .now() + keepaliveInterval,
+            repeating: keepaliveInterval
         )
         timer.setEventHandler(handler: Self.makeKeepaliveHandler(receiver: self))
         timer.resume()
         keepaliveTimer = timer
+    }
+
+    private func setKeepaliveInterval(_ interval: TimeInterval) {
+        guard interval != keepaliveInterval else { return }
+        keepaliveInterval = interval
+        keepaliveTimer?.schedule(deadline: .now() + interval, repeating: interval)
     }
 
     /// Sends one keepalive per ready peer that delivered packets within the
@@ -333,12 +491,14 @@ final class UDPReceiver: @unchecked Sendable {
         guard let lastArrival = lastPacketArrival,
             now - lastArrival < Self.keepaliveActivityWindow
         else { return }
+        let payload = ReceiverKeepalive.encode(
+            ReceiverKeepalive.Flags(rawValue: keepaliveFlags.load(ordering: .relaxed)))
         for peer in peers where peer.isReady {
             guard let peerArrival = peer.lastPacketArrival,
                 now - peerArrival < Self.keepaliveActivityWindow
             else { continue }
             peer.connection.send(
-                content: Self.keepalivePayload,
+                content: payload,
                 completion: .contentProcessed { _ in
                     // Errors surface through the state handler; per-datagram
                     // logging would spam.
@@ -430,6 +590,21 @@ final class UDPReceiver: @unchecked Sendable {
     nonisolated private static func makeKeepaliveHandler(receiver: UDPReceiver) -> @Sendable () -> Void {
         { [weak receiver] in
             receiver?.sendKeepaliveIfStreaming()
+        }
+    }
+
+    /// Address class of a sender flow's remote endpoint.
+    nonisolated private static func addressKind(_ endpoint: NWEndpoint) -> NetworkAddressKind? {
+        guard case .hostPort(let host, _) = endpoint else { return nil }
+        switch host {
+        case .ipv4(let address):
+            return NetworkAddress.kind(ipv4: [UInt8](address.rawValue))
+        case .ipv6(let address):
+            return NetworkAddress.kind(ipv6: [UInt8](address.rawValue))
+        case .name(let name, _):
+            return NetworkAddress.kind(name)
+        @unknown default:
+            return nil
         }
     }
 

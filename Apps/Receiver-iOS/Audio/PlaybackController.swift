@@ -32,6 +32,15 @@ enum AudioSystemEvent: Sendable {
 /// - runs a watchdog (`PlaybackWatchdog`, 4 Hz) that restarts the engine when
 ///   packets arrived but nothing was played for 1 s, whatever the cause.
 ///
+/// Capture ("Talk through iPhone"): `setCaptureEnabled` fades the output
+/// out, rebuilds the engine with or without the input (the category switch
+/// `.playback` ↔ `.playAndRecord` needs it) and starts it again. A route
+/// change that flips the need for echo cancellation (AirPods in / out)
+/// rebuilds too. iOS refuses to start recording from the background, so a
+/// restart there that fails with the input falls back to playback only and
+/// reports the capture as suspended (`onCaptureSuspended`); the phone's mic
+/// model re-arms when the app is in the foreground again.
+///
 /// Framework callbacks are created in `nonisolated` factories, capture only
 /// Sendable state and hop to the main actor, where all state lives. The
 /// supervision loop is owned here, not by any view.
@@ -46,6 +55,9 @@ final class PlaybackController {
         var ioBufferMilliseconds: Double
         var routeChanges: Int
         var interruptions: Int
+        var concealment: ConcealmentStats
+        /// Codec / frame size of the stream being played.
+        var stream: PlayoutStream?
     }
 
     private let jitterBuffer: JitterBuffer
@@ -68,6 +80,17 @@ final class PlaybackController {
     private var rateWindowRenderCalls = 0
     private var lastReceived = 0
     private var lastArrivalAt: TimeInterval?
+    /// Capture was on but had to be dropped (background restart failed).
+    private(set) var captureSuspended = false
+    /// Called when capture is dropped for that reason.
+    var onCaptureSuspended: (() -> Void)?
+    /// Voice processing of the running engine, and the last start's input
+    /// rate (nil = no capture).
+    var voiceProcessingActive: Bool { output.voiceProcessingActive }
+    var captureContext: MicCaptureContext { output.captureContext }
+    var captureRunning: Bool { output.captureEnabled && output.isRunning }
+    /// Wait for the 10 ms output fade before tearing the engine down.
+    private static let fadeOutDelay: Duration = .milliseconds(30)
 
     /// Supervision cadence: 250 ms.
     private static let superviseInterval: Duration = .milliseconds(250)
@@ -101,7 +124,9 @@ final class PlaybackController {
             sessionSampleRate: session.sampleRate,
             ioBufferMilliseconds: session.ioBufferDuration * 1000,
             routeChanges: routeChanges,
-            interruptions: interruptions)
+            interruptions: interruptions,
+            concealment: output.concealmentStats,
+            stream: output.playoutStream)
     }
 
     /// Installs the observers and the supervision loop (once) and starts the
@@ -115,6 +140,45 @@ final class PlaybackController {
             deliver: Self.makeDeliver(to: self))
         startEngine(reason: "launch")
         startSuperviseLoop()
+    }
+
+    // MARK: - Capture
+
+    /// Arms (true) or disarms the microphone: fade out, rebuild with the new
+    /// session category, start. Returns whether capture runs afterwards
+    /// (false when it was refused — playback then continues without it).
+    @discardableResult
+    func setCaptureEnabled(_ enabled: Bool, reason: String) async -> Bool {
+        if enabled == output.captureEnabled, !captureSuspended, output.isRunning {
+            return enabled
+        }
+        captureSuspended = false
+        if output.isRunning {
+            output.beginFadeOut()
+            try? await Task.sleep(for: Self.fadeOutDelay)
+        }
+        output.setCaptureEnabled(enabled)
+        output.rebuildEngine()
+        startEngine(reason: reason)
+        return output.captureEnabled && output.isRunning
+    }
+
+    /// Fade, rebuild and start with the current settings (voice processing
+    /// follows the new route).
+    private func rebuildForRoute() {
+        guard pendingRecovery == nil else { return }
+        pendingRecovery = Task { [weak self] in
+            guard let self else { return }
+            self.output.beginFadeOut()
+            try? await Task.sleep(for: Self.fadeOutDelay)
+            self.pendingRecovery = nil
+            guard self.output.needsVoiceProcessingChange else {
+                if !self.output.isRunning { self.startEngine(reason: "route change") }
+                return
+            }
+            self.output.rebuildEngine()
+            self.startEngine(reason: "route change: echo cancellation \(AudioOutput.outputIsBuiltIn() ? "on" : "off")")
+        }
     }
 
     // MARK: - Events (main actor)
@@ -145,7 +209,11 @@ final class PlaybackController {
             // Keep playing on whatever the new route is (restart if the
             // change stopped the engine; a format change also posts a
             // configuration change, handled below).
-            scheduleRecovery(reason: "route change")
+            if output.needsVoiceProcessingChange {
+                rebuildForRoute()
+            } else {
+                scheduleRecovery(reason: "route change")
+            }
         case .mediaServicesLost:
             logger.error("media services were lost")
         case .mediaServicesReset:
@@ -190,8 +258,30 @@ final class PlaybackController {
     }
 
     /// (Re)starts the engine; on failure logs and leaves the retry to the
-    /// watchdog and the next system event.
+    /// watchdog and the next system event. A start that fails with capture
+    /// on (recording cannot start in the background) retries without it, so
+    /// playback never dies for the mic.
     private func startEngine(reason: String) {
+        if output.captureEnabled {
+            do {
+                try output.start()
+            } catch {
+                logger.error(
+                    "engine start with capture failed (\(reason, privacy: .public)): \(error.localizedDescription, privacy: .public); playback only")
+                output.setCaptureEnabled(false)
+                output.rebuildEngine()
+                captureSuspended = true
+                onCaptureSuspended?()
+                startEngine(reason: reason + " (without mic)")
+                return
+            }
+            if hasStartedOnce { engineRestarts += 1 }
+            hasStartedOnce = true
+            isInterrupted = false
+            logger.notice(
+                "engine started with capture (\(reason, privacy: .public)); voice processing \(self.output.voiceProcessingActive), route \(Self.describeCurrentRoute(), privacy: .public)")
+            return
+        }
         do {
             let report = try output.start()
             if hasStartedOnce {
@@ -245,6 +335,11 @@ final class PlaybackController {
         if stats.received != lastReceived {
             lastReceived = stats.received
             lastArrivalAt = now
+        }
+        // A route change whose rebuild was coalesced away: flip echo
+        // cancellation now.
+        if output.needsVoiceProcessingChange, output.isRunning, pendingRecovery == nil {
+            rebuildForRoute()
         }
 
         let verdict = watchdog.evaluate(

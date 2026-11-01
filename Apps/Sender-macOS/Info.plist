@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>LSUIElement</key>
@@ -27,9 +27,10 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_macaudiobridge._udp</string>
+		<string>_macaudiosrc._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Mac Audio Bridge uses the local network to find your iPhone and stream audio to it.</string>
+	<string>Mac Audio Bridge uses the local network to find your iPhone, stream audio to it, and let the iPhone control the stream.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Mac Audio Bridge streams your Mac's audio to your iPhone.</string>
 </dict>

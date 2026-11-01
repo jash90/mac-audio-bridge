@@ -42,7 +42,7 @@ struct AudioPacketTests {
         )
         let decoded = try AudioPacket.decode(packet.encoded())
         #expect(decoded == packet)
-        #expect(decoded.encoded().count == AudioPacket.headerSize)
+        #expect(decoded.encoded().count == AudioPacket.headerSize + AudioDatagram.entryHeaderSize)
     }
 
     @Test("Decode accepts a Data slice with non-zero startIndex")
@@ -77,8 +77,8 @@ struct AudioPacketTests {
     @Test("Decode rejects an unsupported version")
     func decodeRejectsUnsupportedVersion() {
         var bytes = [UInt8](referencePacket().encoded())
-        bytes[4] = 2
-        #expect(throws: AudioPacketError.unsupportedVersion(2)) {
+        bytes[4] = 1  // the 10 ms single-frame protocol
+        #expect(throws: AudioPacketError.unsupportedVersion(1)) {
             try AudioPacket.decode(Data(bytes))
         }
     }
@@ -97,14 +97,76 @@ struct AudioPacketTests {
         let packet = referencePacket()
         #expect([UInt8](packet.encoded()) == [
             0x4D, 0x41, 0x42, 0x41,  // magic "MABA"
-            0x01,  // version
+            0x06,  // version
             0x01,  // opus
-            0x01,  // discontinuity flag
-            0x00,  // reserved
+            0x01,  // discontinuity flag, one primary, LAN profile
+            0x01,  // one entry
             0xDE, 0xAD, 0xBE, 0xEF,  // sequence
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,  // sampleTime
+            0x00, 0x00, 0x00, 0x00,  // source tag (untagged)
+            0x00, 0x00, 0x02,  // entry: offset 0, length 2
             0xAA, 0xBB,  // payload
         ])
+    }
+
+    @Test("A multi-frame datagram carries the primary and earlier frames by offset")
+    func multiFrameDatagramRoundTrip() throws {
+        let frames = (0..<4).map { index in
+            AudioPacket(
+                codec: .opus, sequence: 100 + UInt32(index),
+                sampleTime: UInt64(100 + index) * UInt64(AudioFormat.samplesPerFrame),
+                payload: Data(repeating: UInt8(index), count: 3 + index))
+        }
+        var primary = frames[3]
+        primary.flags = [.discontinuity]
+        let datagram = AudioDatagram(primary: primary, redundant: [frames[2], frames[0]])
+        let decoded = try AudioDatagram.decode(datagram.encoded())
+        let packets = decoded.packets()
+        #expect(packets.count == 3)
+        #expect(packets[0] == primary)
+        var copy2 = frames[2]
+        copy2.isRedundant = true
+        var copy0 = frames[0]
+        copy0.isRedundant = true
+        #expect(packets[1] == copy2)
+        #expect(packets[2] == copy0)
+        #expect(try AudioPacket.decode(datagram.encoded()) == primary)
+    }
+
+    @Test("A redundancy-only datagram has no primary frame")
+    func redundancyOnlyDatagram() throws {
+        let datagram = AudioDatagram(
+            codec: .pcm16, flags: [], sequence: 10, sampleTime: 10 * UInt64(AudioFormat.samplesPerFrame),
+            entries: [.init(offset: 3, payload: Data([1, 2]))])
+        let packets = try AudioDatagram.decode(datagram.encoded()).packets()
+        #expect(packets.map(\.sequence) == [7])
+        #expect(packets[0].isRedundant)
+        #expect(packets[0].sampleTime == 7 * UInt64(AudioFormat.samplesPerFrame))
+        #expect(throws: AudioPacketError.noPrimaryFrame) {
+            try AudioPacket.decode(datagram.encoded())
+        }
+    }
+
+    @Test("Malformed entries are rejected: truncated, trailing bytes, repeated offset, none")
+    func malformedEntriesAreRejected() {
+        let good = [UInt8](AudioDatagram(primary: referencePacket(), redundant: []).encoded())
+        #expect(throws: AudioPacketError.malformedEntries) {
+            try AudioDatagram.decode(Data(good.dropLast()))
+        }
+        #expect(throws: AudioPacketError.malformedEntries) {
+            try AudioDatagram.decode(Data(good + [0x00]))
+        }
+        var none = good
+        none[7] = 0
+        #expect(throws: AudioPacketError.malformedEntries) {
+            try AudioDatagram.decode(Data(none.prefix(AudioDatagram.headerSize)))
+        }
+        let twice = AudioDatagram(
+            codec: .pcm16, flags: [], sequence: 5, sampleTime: 0,
+            entries: [.init(offset: 1, payload: Data([1])), .init(offset: 1, payload: Data([2]))])
+        #expect(throws: AudioPacketError.malformedEntries) {
+            try AudioDatagram.decode(twice.encoded())
+        }
     }
 
     @Test(

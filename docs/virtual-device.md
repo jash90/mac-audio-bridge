@@ -30,7 +30,10 @@ Three pieces cooperate:
    also rules out any feedback from the aggregate's own IO. The tap feeds a private
    aggregate device whose **main (clock) sub-device is the virtual device**, with
    `tapautostart` so IO waits for the first audio. From there the M2.5/M2.6
-   pipeline is unchanged: SPSC ring → 10 ms PCM16 frames → UDP.
+   pipeline is unchanged: SPSC ring → 5 ms frames encoded in the menu's quality
+   (Opus 192 / 128 kbit/s CBR, or PCM16) → UDP (≤ 1200 B datagrams; Opus datagrams
+   carry the previous 4 frames, PCM16 frames are repeated 15 ms later; see
+   `AudioRedundancy`). The iPhone decodes per frame, following each frame's codec.
 
 3. **Auto start/stop + volume** (`Apps/Sender-macOS/SenderController.swift`). The
    sender listens for `kAudioHardwarePropertyDefaultOutputDevice` (system) and

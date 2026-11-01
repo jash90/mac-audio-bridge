@@ -54,6 +54,40 @@ final class FrameStats: @unchecked Sendable {
     }
 }
 
+/// The stream profile (LAN / WAN) the packer marks and lays out datagrams
+/// with — set on the main actor, read per frame on the converter queue.
+final class ProfileGate: @unchecked Sendable {
+    private let raw = Atomic<UInt8>(StreamProfile.lan.rawValue)
+
+    var value: StreamProfile {
+        get { StreamProfile(rawValue: raw.load(ordering: .relaxed)) ?? .lan }
+        set { raw.store(newValue.rawValue, ordering: .relaxed) }
+    }
+}
+
+/// Holds the `RedundancyPacker` for the converter's frame callback. Only
+/// touched on the converter queue (the callback's only caller); a fresh box
+/// per streaming run.
+final class RedundancyPackerBox: @unchecked Sendable {
+    private var packer = RedundancyPacker()
+    private let profileGate: ProfileGate
+
+    /// `sourceTag` goes into every datagram, so the phone can tell this
+    /// Mac's stream from another Mac's.
+    init(sourceTag: UInt32, profileGate: ProfileGate) {
+        packer.sourceTag = sourceTag
+        self.profileGate = profileGate
+    }
+
+    /// A profile switch first sends the frames held for an incomplete WAN
+    /// group, so the sequence stays continuous across the switch.
+    func pack(_ frame: AudioPacket) -> [Data] {
+        let flushed = packer.setProfile(profileGate.value)
+        let packed = packer.pack(frame)
+        return flushed.isEmpty ? packed : flushed + packed
+    }
+}
+
 /// One second of sender telemetry, appended as a JSON line to
 /// `~/Library/Logs/MacAudioBridge/sender-stats.jsonl`.
 private struct SenderStatsLine: Codable, Sendable {
@@ -91,6 +125,30 @@ private struct SenderStatsLine: Codable, Sendable {
     var link: String
     /// Connections recreated by the keepalive timeout since launch.
     var reconnects: Int
+    /// Codec of the frames sent in the last second: "opus" / "pcm16" ("" =
+    /// none sent).
+    var codec: String
+    /// Audio payload bitrate of that codec, bit/s (Opus CBR target, or
+    /// 1536000 for PCM16; 0 = none sent).
+    var bitrate: Int
+    /// Mean payload bytes per 5 ms frame (Opus 192: 120, Opus 128: 80,
+    /// PCM16: 960).
+    var avgPayloadBytes: Double
+    /// p99 of the per-frame encode time in the last second, ms.
+    var encodeMsP99: Double
+    /// Where the audio travels: "Wi-Fi", "Tailscale direct", "Tailscale
+    /// relay", "Tailscale", "Internet" ("" = not streaming).
+    var path: String
+    /// Stream profile: "lan" / "wan".
+    var profile: String
+    /// Concrete address streamed to (Bonjour service, or the tailnet IP the
+    /// failover picked).
+    var endpoint: String
+    /// Wire bytes this streaming session (payload + IP/UDP/WireGuard
+    /// header estimate per datagram).
+    var bytesTotal: Int
+    /// ≈ MB per hour at the rate of the last 10 s.
+    var mbPerHour: Double
 }
 
 /// Owns tap → frame converter → UDP sender and drives them from the virtual
@@ -128,7 +186,7 @@ final class SenderController: ObservableObject {
     @Published private(set) var packetsPerSecond = 0
     @Published private(set) var currentSequence: UInt32 = 0
     @Published private(set) var captureWarning: String?
-    @Published private(set) var failureMessage: String?
+    @Published var failureMessage: String?
     /// Receiver currently streamed to (service name or host; "" when idle).
     @Published private(set) var activeReceiver = ""
     /// Bonjour receivers currently visible, sorted.
@@ -145,9 +203,101 @@ final class SenderController: ObservableObject {
     @Published private(set) var manualAddressEnabled: Bool
     /// The manual host as typed (persisted under `receiverHost`).
     @Published private(set) var manualHost: String
+    /// Codec / bitrate picked in the menu (persisted under `streamQuality`).
+    @Published private(set) var quality: StreamQuality
+    /// The Internet profile's quality (persisted under `internetQuality`).
+    @Published private(set) var internetQuality: InternetQuality
+    /// Bytes sent per second (all datagrams), in kB/s, for the menu.
+    @Published private(set) var kilobytesPerSecond: Double = 0
 
-    private var selection: ReceiverSelection
-    private var activeTarget: ReceiverTarget?
+    // MARK: Internet mode state (see SenderController+Internet.swift)
+
+    @Published var streamProfile: StreamProfile = .lan
+    @Published var streamPath: StreamPath = .local
+    /// Why the encoded quality differs from the pick (WAN cap).
+    @Published var qualityNote: String?
+    @Published var sessionMegabytes: Double = 0
+    @Published var megabytesPerHour: Double = 0
+    /// The concrete endpoint in use ("" = none): the service name or the
+    /// tailnet address the failover picked.
+    @Published var endpointName = ""
+    @Published var tailscaleState: TailscaleMonitor.State = .unknown
+    /// iOS peers of the tailnet (from `tailscale status`).
+    @Published var tailscalePeers: [TailscaleStatus.Peer] = []
+    /// Receivers whose tailnet addresses are known, sorted.
+    @Published var remoteReceivers: [String] = []
+    /// Host chosen explicitly in the menu (typed address / Tailscale peer).
+    @Published var storedHost: String?
+    @Published var controlPort: UInt16?
+    var tailscaleStatus: TailscaleStatus?
+    var tailscaleMonitor: TailscaleMonitor?
+    /// Receiver service → its tailnet addresses (from the phone's hello),
+    /// persisted under `tailnetAddressesKey`.
+    var tailnetBook: [String: [String]] = [:]
+    /// Receiver service → its phone reports an expensive path.
+    var phoneExpensive: [String: Bool] = [:]
+    /// Address kind of each control session's peer.
+    var sessionKinds: [ControlServer.SessionID: NetworkAddressKind] = [:]
+    var failover: PathFailover?
+    /// The logical target `failover` belongs to.
+    var failoverTarget: ReceiverTarget?
+    /// The concrete target the UDP sender is pointed at.
+    var concreteTarget: ReceiverTarget?
+    /// Reconnect count seen at the last failover check.
+    var lastReconnects = 0
+    var usageMeter = DataUsageMeter()
+    let profileGate = ProfileGate()
+    var ownTailnetAddresses: [String] = []
+    var menuOpen = false
+    static let tailnetAddressesKey = "tailnetAddresses"
+    static let storedHostKey = "receiverChosenHost"
+
+    // MARK: Remote control state (see SenderController+Remote.swift)
+
+    /// Phone currently controlling the stream (its control session targets
+    /// the receiver we stream to) — "Controlled from iPhone …".
+    @Published var controllingPhone: String?
+    /// The Mac that took the phone over from us — "iPhone used by …".
+    @Published var usedBy: String?
+    /// Released by the phone while there was no other output to switch to:
+    /// the output stays ours but streaming is paused until an explicit
+    /// action (menu "Resume", phone connect, re-selecting the output).
+    @Published var releasedHold = false
+    @Published var controlServerStatus: ControlServer.Status = .starting
+    /// Name of the current default output device (for the phone).
+    var outputDeviceName: String?
+    /// Name this Mac is advertised under (Bonjour may rename on a conflict).
+    var advertisedName = SourceIdentity.computerName()
+    var controlServer: ControlServer?
+    /// Playback control from the phone + what plays here (M9).
+    let media = MacMediaControl()
+    /// Hello per open control session (nil until the phone sent it).
+    var sessions: [ControlServer.SessionID: PhoneHello?] = [:]
+    // Phone microphone (SenderController+Mic.swift).
+    let micEngine = MicEngine()
+    var micFeeder: MicFeeder?
+    var micDemand = MicDemand()
+    let micEvents = DeviceEventObserver()
+    var micObservedDeviceID: AudioObjectID?
+    /// Each phone's last reported mic (protocol version 4 phones only).
+    var micStates: [ControlServer.SessionID: MicState] = [:]
+    /// The phone that was sent `micStart` (nil = none).
+    var micRequestedSession: ControlServer.SessionID?
+    @Published var micStatus: MicMenuStatus = .off
+    var lastSentStatus: [ControlServer.SessionID: (status: SourceStatus, at: TimeInterval)] = [:]
+    /// Output switch memory + takeover detection.
+    var outputModel: OutputRestoreModel
+    /// Set when the user selected our output on the Mac; the claim goes to
+    /// the phone once streaming to it has started (expires after 10 s).
+    var pendingClaimSince: TimeInterval?
+    /// The next "became ours" transition is ours (phone connect), not a
+    /// user action: no claim until this uptime.
+    var suppressClaimUntil: TimeInterval = 0
+    static let rememberedOutputUIDKey = "rememberedOutputUID"
+    static let rememberedOutputNameKey = "rememberedOutputName"
+
+    var selection: ReceiverSelection
+    private(set) var activeTarget: ReceiverTarget?
     private var browser: ReceiverBrowser?
 
     /// The 1 Hz state loop, owned by the controller itself: the menu's
@@ -159,6 +309,10 @@ final class SenderController: ObservableObject {
     private static let hostKey = "receiverHost"
     private static let serviceNameKey = "receiverServiceName"
     private static let manualAddressEnabledKey = "manualAddressEnabled"
+    /// Shared with the menu's `@AppStorage("streamQuality")`.
+    static let qualityKey = "streamQuality"
+    /// Shared with the menu's `@AppStorage("internetQuality")`.
+    static let internetQualityKey = "internetQuality"
 
     init() {
         // Persisted choices — read here so streaming can start at launch
@@ -170,14 +324,43 @@ final class SenderController: ObservableObject {
             .trimmingCharacters(in: .whitespaces)
         manualAddressEnabled = manualEnabled
         manualHost = host
+        quality = defaults.string(forKey: Self.qualityKey).flatMap(StreamQuality.init(rawValue:))
+            .flatMap { StreamQuality.lanChoices.contains($0) ? $0 : nil } ?? .default
+        internetQuality = defaults.string(forKey: Self.internetQualityKey).flatMap(InternetQuality.init(rawValue:))
+            ?? .default
+        let book = (defaults.dictionary(forKey: Self.tailnetAddressesKey) as? [String: [String]]) ?? [:]
+        let chosenHost = defaults.string(forKey: Self.storedHostKey)
+        tailnetBook = book
+        storedHost = chosenHost
+        remoteReceivers = book.keys.sorted()
         selection = ReceiverSelection(
             storedSelection: storedService,
             manualHost: manualEnabled ? host : "",
+            storedHost: chosenHost,
+            remoteReachable: Set(book.keys),
             now: Self.uptime())
+        outputModel = OutputRestoreModel(
+            bridgeUID: BridgeDevice.uid,
+            remembered: defaults.string(forKey: Self.rememberedOutputUIDKey).map { uid in
+                OutputDeviceInfo(
+                    uid: uid, name: defaults.string(forKey: Self.rememberedOutputNameKey) ?? uid,
+                    isBuiltIn: false)
+            })
+        converter.encodingGate.value = .lan(quality)
+        udpSender.setMicEngine(micEngine)
+        tailscaleMonitor = Self.makeTailscaleMonitor(controller: self)
+        ownTailnetAddresses = InterfaceAddresses.tailnet()
         // Bonjour browsing runs for the whole app lifetime, from launch.
         let browser = Self.makeBrowser(controller: self)
         self.browser = browser
         browser.start()
+        // Phones find this Mac as a source and control it from launch on.
+        let server = Self.makeControlServer(controller: self, serviceName: advertisedName)
+        controlServer = server
+        server.start()
+        media.start { [weak self] info in
+            self?.broadcastNowPlaying(info)
+        }
         // Main-actor task loop (the class is @MainActor, so the task inherits
         // the main actor): one immediate pass — streaming starts within this
         // first evaluate when our device is the default output and a receiver
@@ -194,10 +377,11 @@ final class SenderController: ObservableObject {
     deinit {
         stateLoop?.cancel()
         browser?.stop()
+        controlServer?.stop()
     }
 
     private let tap = DeviceAudioTap()
-    private let converter = FrameConverter()
+    let converter = FrameConverter()
     private let udpSender = UDPSender()
     private let frameStats = FrameStats()
     private let captureWarningMailbox = WarningMailbox()
@@ -220,11 +404,33 @@ final class SenderController: ObservableObject {
     /// Device ID the current listener registrations are bound to (device IDs
     /// change when coreaudiod restarts, e.g. on driver install/uninstall).
     private var observedDeviceID: AudioObjectID?
-    private var previousDeviceID: AudioObjectID?
 
     var isStreaming: Bool { mode == .streaming }
     /// Device volume as a whole percent for the menu.
     var volumePercent: Int { Int((deviceVolume * 100).rounded()) }
+    // MARK: - Stream quality
+
+    /// The user picked a quality in the menu: applies from the next frame,
+    /// also mid-stream (the receiver follows each frame's codec), and is
+    /// persisted.
+    func setQuality(_ newQuality: StreamQuality) {
+        guard newQuality != quality, StreamQuality.lanChoices.contains(newQuality) else { return }
+        quality = newQuality
+        UserDefaults.standard.set(newQuality.rawValue, forKey: Self.qualityKey)
+        applyEffectiveQuality()
+        remoteStateChanged()
+    }
+
+    /// The Internet quality was picked (menu or phone): applies from the next
+    /// frame while the stream runs the Internet profile, and is persisted.
+    func setInternetQuality(_ newQuality: InternetQuality) {
+        guard newQuality != internetQuality else { return }
+        internetQuality = newQuality
+        UserDefaults.standard.set(newQuality.rawValue, forKey: Self.internetQualityKey)
+        applyEffectiveQuality()
+        remoteStateChanged()
+    }
+
     // MARK: - Receiver selection
 
     /// The user picked a receiver in the menu (nil = automatic). Persisted by
@@ -236,6 +442,8 @@ final class SenderController: ObservableObject {
         } else {
             UserDefaults.standard.removeObject(forKey: Self.serviceNameKey)
         }
+        UserDefaults.standard.removeObject(forKey: Self.storedHostKey)
+        storedHost = nil
         selection.select(name, now: Self.uptime())
         evaluate()
     }
@@ -284,31 +492,61 @@ final class SenderController: ObservableObject {
     }
 
     /// Monotonic seconds for the selection's grace timing.
-    private static func uptime() -> TimeInterval {
+    static func uptime() -> TimeInterval {
         ProcessInfo.processInfo.systemUptime
     }
 
     // MARK: - Output-device actions
 
-    /// Makes "iPhone (Mac Audio Bridge)" the default output, remembering the
+    /// Makes "iPhone (Mac Audio Bridge)" the default output (an explicit
+    /// Mac-side action: the phone switches to this Mac), remembering the
     /// device used before so `switchBackToPreviousOutput` can restore it.
     func useIPhoneAsOutput() {
         guard let deviceID = BridgeDevice.deviceID(),
             let currentDefault = BridgeDevice.defaultOutputDeviceID(),
             currentDefault != deviceID
         else { return }
-        previousDeviceID = currentDefault
-        previousDeviceName = BridgeDevice.deviceName(currentDefault)
-        hasPreviousDevice = true
+        observeOutput(BridgeDevice.outputDeviceInfo(currentDefault))
         _ = BridgeDevice.setDefaultOutputDevice(deviceID)
         evaluate()
     }
 
-    /// Restores the output device used before ours was selected.
+    /// Restores the output device used before ours was selected (or the
+    /// built-in output when that one is gone).
     func switchBackToPreviousOutput() {
-        guard let previous = previousDeviceID else { return }
-        _ = BridgeDevice.setDefaultOutputDevice(previous)
+        _ = restorePreviousOutput()
         evaluate()
+    }
+
+    /// Switches the default output to `outputModel.restoreTarget`; false
+    /// when there is no other output device.
+    func restorePreviousOutput() -> Bool {
+        let available = BridgeDevice.outputDevices()
+        guard let target = outputModel.restoreTarget(available: available.map(\.info)),
+            let id = available.first(where: { $0.info.uid == target.uid })?.id
+        else { return false }
+        return BridgeDevice.setDefaultOutputDevice(id)
+    }
+
+    /// Feeds the default output into the switch model; persists the
+    /// remembered device and reacts to takeovers. Returns the transition.
+    @discardableResult
+    func observeOutput(_ device: OutputDeviceInfo?) -> OutputRestoreModel.Transition {
+        let before = outputModel.remembered
+        let transition = outputModel.observeDefaultOutput(device)
+        if let remembered = outputModel.remembered, remembered != before {
+            UserDefaults.standard.set(remembered.uid, forKey: Self.rememberedOutputUIDKey)
+            UserDefaults.standard.set(remembered.name, forKey: Self.rememberedOutputNameKey)
+        }
+        if previousDeviceName != outputModel.remembered?.name {
+            previousDeviceName = outputModel.remembered?.name
+        }
+        if !hasPreviousDevice {
+            // The model always has a fallback (built-in) to switch back to.
+            hasPreviousDevice = true
+        }
+        handleOutputTransition(transition)
+        return transition
     }
 
     // MARK: - Automatic start/stop
@@ -331,6 +569,9 @@ final class SenderController: ObservableObject {
         guard let deviceID else {
             if mode == .streaming { stopStreaming() }
             defaultOutputIsOurs = false
+            outputDeviceName = BridgeDevice.defaultOutputDeviceID().flatMap(BridgeDevice.deviceName)
+            refreshMic()
+            remoteStateChanged()
             return
         }
 
@@ -339,17 +580,17 @@ final class SenderController: ObservableObject {
 
         // Keep "previous device" meaningful: whenever the user routes the
         // output to something that is not ours, that becomes the device to
-        // switch back to.
-        if let defaultID, defaultID != deviceID, defaultID != previousDeviceID {
-            previousDeviceID = defaultID
-            previousDeviceName = BridgeDevice.deviceName(defaultID)
-            hasPreviousDevice = true
-        }
+        // switch back to. A switch to ours is a takeover (claim).
+        let defaultInfo = defaultID.flatMap(BridgeDevice.outputDeviceInfo)
+        outputDeviceName = defaultInfo?.name
+        observeOutput(defaultInfo)
 
         updateVolume(deviceID: deviceID)
 
+        // A release with nowhere to switch to keeps the output but pauses.
+        let shouldStream = defaultOutputIsOurs && !releasedHold
         let target = selection.target
-        switch (defaultOutputIsOurs, target, mode) {
+        switch (shouldStream, target, mode) {
         case (true, let target?, .waiting):
             startStreaming(target: target, deviceID: deviceID)
         case (true, let target?, .streaming) where target != activeTarget:
@@ -361,12 +602,37 @@ final class SenderController: ObservableObject {
         default:
             break
         }
+        updateInternetPath(snapshot: nil)
+        refreshMic()
+        remoteStateChanged()
     }
 
+    /// The logical target (receiver) changed: a fresh failover for it, then
+    /// the concrete endpoint goes to the UDP sender.
     private func setActiveTarget(_ target: ReceiverTarget?) {
         activeTarget = target
         activeReceiver = target?.displayName ?? ""
-        udpSender.setTarget(target)
+        if target != failoverTarget {
+            failoverTarget = target
+            failover = makeFailover(for: target)
+            lastReconnects = udpSender.linkSnapshot().reconnects
+        }
+        applyConcreteTarget()
+    }
+
+    /// Points the UDP sender at the failover's current path.
+    func applyConcreteTarget() {
+        let concrete = resolveConcreteTarget()
+        guard concrete != concreteTarget else { return }
+        concreteTarget = concrete
+        endpointName = concrete?.displayName ?? ""
+        udpSender.setTarget(concrete)
+    }
+
+    var linkSnapshot: UDPSender.LinkSnapshot { udpSender.linkSnapshot() }
+
+    func setLivenessTimeout(_ seconds: TimeInterval) {
+        udpSender.setLivenessTimeout(seconds)
     }
 
     private func startStreaming(target: ReceiverTarget, deviceID: AudioObjectID) {
@@ -394,13 +660,24 @@ final class SenderController: ObservableObject {
         }
 
         tapSampleRate = tap.sampleRate
+        converter.audibility.reset()
         captureWarning = nil
         failureMessage = nil
         frameStats.reset()
         // Both callbacks run on the converter queue: they are @Sendable, capture
         // only Sendable state (no self), and never touch UI state directly.
+        usageMeter.reset()
+        sessionMegabytes = 0
+        megabytesPerHour = 0
+        let packer = RedundancyPackerBox(sourceTag: SourceIdentity.tag, profileGate: profileGate)
         converter.onFrame = { [udpSender, frameStats] packet in
-            udpSender.send(packet.encoded())
+            // Primary datagram first (Opus: carrying the previous 4 frames),
+            // then any redundancy-only datagram (PCM16's delayed copy, see
+            // AudioRedundancy); every datagram stays ≤ 1200 B (no IP
+            // fragmentation).
+            for datagram in packer.pack(packet) {
+                udpSender.send(datagram)
+            }
             frameStats.record(sequence: packet.sequence)
         }
         converter.onCaptureStalled = { [captureWarningMailbox] in
@@ -420,6 +697,10 @@ final class SenderController: ObservableObject {
         udpSender.cancel()
         activeTarget = nil
         activeReceiver = ""
+        failover = nil
+        failoverTarget = nil
+        concreteTarget = nil
+        endpointName = ""
         link = nil
         tap.stop()
         if let activity = streamingActivity {
@@ -428,6 +709,7 @@ final class SenderController: ObservableObject {
         }
         tapSampleRate = nil
         packetsPerSecond = 0
+        kilobytesPerSecond = 0
         currentSequence = 0
         captureWarning = nil
         mode = .waiting
@@ -439,7 +721,7 @@ final class SenderController: ObservableObject {
     /// converter's gain (mute → zeros). The volume keys and the menu-bar
     /// slider change the device control, the listener calls `evaluate`, and
     /// the new gain applies from the next drain tick.
-    private func updateVolume(deviceID: AudioObjectID) {
+    func updateVolume(deviceID: AudioObjectID) {
         let volume = BridgeDevice.volumeScalar(deviceID) ?? 1
         let muted = BridgeDevice.isMuted(deviceID) ?? false
         deviceVolume = volume
@@ -526,7 +808,9 @@ final class SenderController: ObservableObject {
         if link != snapshot.link {
             link = snapshot.link
         }
-        logStats(link: snapshot)
+        updateInternetPath(snapshot: snapshot)
+        refreshInternetHousekeeping()
+        logStats(link: udpSender.linkSnapshot())
     }
 
     /// Appends one JSON line of sender telemetry to
@@ -541,6 +825,20 @@ final class SenderController: ObservableObject {
         let capturedSamples = ring.storedSampleCount + ring.droppedSampleCount
         let droppedSamples = ring.droppedSampleCount
         let sent = udpSender.takeSentCounts()
+        kilobytesPerSecond = mode == .streaming ? Double(sent.bytes) / 1000 : 0
+        if mode == .streaming {
+            usageMeter.record(datagrams: sent.datagrams, payloadBytes: sent.bytes, path: streamPath)
+            sessionMegabytes = usageMeter.totalMegabytes
+            megabytesPerHour = usageMeter.megabytesPerHour
+        }
+        let encoder = converter.encoderStats.take()
+        let codecBitrate: Int
+        switch encoder.codec {
+        case .opus?:
+            codecBitrate = streamProfile.effectiveQuality(lan: quality, internet: internetQuality).opusBitrate ?? 0
+        case .pcm16?: codecBitrate = StreamQuality.pcm.payloadBitrate
+        case nil: codecBitrate = 0
+        }
         let line = SenderStatsLine(
             mode: mode == .streaming ? "streaming" : "waiting",
             defaultOutputIsOurs: defaultOutputIsOurs,
@@ -558,7 +856,16 @@ final class SenderController: ObservableObject {
             keepaliveAgeMs: snapshot.keepaliveAge.map { ($0 * 1000).rounded() } ?? -1,
             connectionState: snapshot.connectionState,
             link: snapshot.link?.rawValue ?? "",
-            reconnects: snapshot.reconnects)
+            reconnects: snapshot.reconnects,
+            codec: encoder.codec.map(StreamQuality.statsName) ?? "",
+            bitrate: codecBitrate,
+            avgPayloadBytes: (encoder.averagePayloadBytes * 10).rounded() / 10,
+            encodeMsP99: (encoder.encodeMsP99 * 1000).rounded() / 1000,
+            path: mode == .streaming ? streamPath.displayName : "",
+            profile: streamProfile.statsName,
+            endpoint: endpointName,
+            bytesTotal: usageMeter.totalBytes,
+            mbPerHour: usageMeter.megabytesPerHour)
         lastRingWriteCalls = writeCalls
         lastRingCapturedSamples = capturedSamples
         lastRingDroppedSamples = droppedSamples
