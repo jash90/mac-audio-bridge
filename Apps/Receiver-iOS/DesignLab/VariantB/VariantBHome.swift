@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Variant B — "Control panel". Dense and glanceable for a power user: a tab
-/// bar (Now / Sources / Details), the Now tab is a grid of link-quality
+/// Variant B — "Control panel". Dense and glanceable for a power user: a
+/// bottom tab bar (Now / Sources / Details / Settings), the Now tab is a grid of link-quality
 /// tiles with live numbers, every control one tap away.
 struct VariantBRoot: View {
     @ObservedObject var store: LabStore
@@ -25,6 +25,9 @@ struct VariantBRoot: View {
             }
             Tab("Details", systemImage: "chart.xyaxis.line", value: LabScreen.details) {
                 NavigationStack { VariantBDetails(store: store) }
+            }
+            Tab("Settings", systemImage: "gearshape", value: LabScreen.settings) {
+                NavigationStack { LabSettingsForm(store: store, showsDelay: false) }
             }
         }
     }

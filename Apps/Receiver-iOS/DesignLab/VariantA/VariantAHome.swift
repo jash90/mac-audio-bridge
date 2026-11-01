@@ -1,36 +1,59 @@
 import SwiftUI
 
 /// Variant A — "Now Playing first". Calm, music-app-like: the big player
-/// card is the screen, the link is one plain sentence under it, Sources and
-/// Details are sheets.
+/// card is the Now tab, the link is one plain sentence under it. Sources,
+/// Details and Settings (delay, quality, mic, data) are tabs in the bottom
+/// Liquid Glass tab bar.
 struct VariantAHome: View {
     @ObservedObject var store: LabStore
-    @Environment(\.labScrollAnchor) private var scrollAnchor
-    @State private var showsSources: Bool
-    @State private var showsDetails: Bool
-    @State private var sourcesDetent: PresentationDetent = .large
+    @State private var tab: LabScreen
 
     init(store: LabStore, initialScreen: LabScreen) {
         self.store = store
-        _showsSources = State(initialValue: initialScreen == .sources)
-        _showsDetails = State(initialValue: initialScreen == .details)
+        _tab = State(initialValue: initialScreen)
     }
+
+    var body: some View {
+        TabView(selection: $tab) {
+            Tab("Now", systemImage: "play.circle.fill", value: LabScreen.home) {
+                VariantANow(store: store, tab: $tab)
+            }
+            Tab("Sources", systemImage: "laptopcomputer.and.iphone", value: LabScreen.sources) {
+                NavigationStack {
+                    LabSourcesList(store: store)
+                        .navigationTitle("Sources")
+                }
+            }
+            Tab("Details", systemImage: "waveform.path.ecg", value: LabScreen.details) {
+                NavigationStack { VariantADetails(store: store) }
+            }
+            Tab("Settings", systemImage: "gearshape", value: LabScreen.settings) {
+                NavigationStack { LabSettingsForm(store: store) }
+            }
+        }
+    }
+}
+
+/// The Now tab: player, link sentence, mic.
+struct VariantANow: View {
+    @ObservedObject var store: LabStore
+    @Binding var tab: LabScreen
+    @Environment(\.labScrollAnchor) private var scrollAnchor
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 20) {
+                VStack(spacing: 18) {
                     if store.isConnected {
                         VariantAPlayer(store: store)
-                        VariantAConnectionCard(store: store) { showsDetails = true }
-                        VariantALatencyCard(store: store)
+                        VariantAConnectionCard(store: store) { tab = .details }
                         VariantAMicCard(store: store)
                     } else {
-                        VariantAEmptyState(store: store) { showsSources = true }
+                        VariantAEmptyState(store: store) { tab = .sources }
                     }
                 }
                 .padding(.horizontal, 20)
-                .padding(.bottom, 32)
+                .padding(.bottom, 24)
             }
             .defaultScrollAnchor(scrollAnchor)
             .background { VariantABackdrop(connected: store.isConnected) }
@@ -39,29 +62,13 @@ struct VariantAHome: View {
                 ToolbarItem(placement: .principal) {
                     sourcePill
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showsDetails = true
-                    } label: {
-                        Image(systemName: "waveform.path.ecg")
-                    }
-                    .accessibilityLabel("Details")
-                    .disabled(!store.isConnected)
-                }
-            }
-            .sheet(isPresented: $showsSources) {
-                VariantASourcesSheet(store: store)
-                    .presentationDetents([.medium, .large], selection: $sourcesDetent)
-            }
-            .sheet(isPresented: $showsDetails) {
-                VariantADetails(store: store)
             }
         }
     }
 
     private var sourcePill: some View {
         Button {
-            showsSources = true
+            tab = .sources
         } label: {
             HStack(spacing: 6) {
                 LabStatusDot(color: store.isConnected ? .green : .gray, size: 7)
@@ -355,24 +362,6 @@ struct VariantAEmptyState: View {
             Label("Don't see your Mac? Open Mac Audio Bridge on it.", systemImage: "info.circle")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-        }
-    }
-}
-
-struct VariantASourcesSheet: View {
-    @ObservedObject var store: LabStore
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            LabSourcesList(store: store)
-                .navigationTitle("Sources")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Done") { dismiss() }
-                    }
-                }
         }
     }
 }
