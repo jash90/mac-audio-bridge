@@ -6,7 +6,7 @@ import Foundation
 /// no new port, discovery or firewall rule and works over Tailscale.
 public enum MicFormat {
     /// Stream id in the mic datagram header (the Mac → phone playback stream
-    /// is stream 0, carried by `AudioDatagram` version 4).
+    /// is stream 0, carried by `AudioDatagram` version 6).
     public static let streamID: UInt8 = 1
     public static let sampleRate: Double = 48_000
     public static let frameDurationMs = 10
@@ -61,7 +61,7 @@ public struct MicDatagramFlags: OptionSet, Sendable, Hashable {
 ///       23      1   reserved (0)
 ///       24      …   entries: back offset k (1), length (2), payload
 ///
-/// The playback stream (Mac → phone) stays `AudioDatagram` version 4, which
+/// The playback stream (Mac → phone) is `AudioDatagram` version 6, which
 /// rejects version 5; the Mac's keepalive-reading socket tells the two
 /// directions apart by the version byte, and keepalives by size and magic.
 public struct MicDatagram: Sendable, Equatable {
